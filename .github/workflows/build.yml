@@ -1,0 +1,64 @@
+name: Build Zalat
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install requirements
+        run: pip install -r requirements.txt
+
+      - name: Stamp version
+        shell: pwsh
+        run: |
+          $d = (Get-Date).AddHours(3).ToString("yyyy-MM-dd HH:mm")
+          $n = 36 + ${{ github.run_number }}     # بنكمّل الترقيم من الـ repository القديم (آخر نسخة هناك 1.36)
+          (Get-Content Warehouse_app.py -Raw -Encoding utf8) -replace 'APP_BUILD = 0                 # BUILD_NUMBER', "APP_BUILD = $n" -replace 'APP_BUILD_DATE = ""           # BUILD_DATE', "APP_BUILD_DATE = `"$d`"" | Set-Content Warehouse_app.py -Encoding utf8NoBOM -NoNewline
+          (Get-Content installer_zalat.iss -Raw -Encoding utf8) -replace 'AppVersion=1.0', "AppVersion=2.1.$n" | Set-Content installer_zalat.iss -Encoding utf8 -NoNewline
+          Select-String -Path Warehouse_app.py -Pattern '^APP_BUILD'
+
+      - name: Build Zalat exe
+        run: pyinstaller --noconfirm --onefile --windowed --name Zalat --add-data "ui;ui" --collect-all webview --hidden-import clr --hidden-import psycopg2 --collect-submodules google.auth --collect-submodules google.oauth2 zalat_ui.py
+
+      - name: Get SumatraPDF (direct print dialog)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force tools | Out-Null
+          try {
+            Invoke-WebRequest "https://www.sumatrapdfreader.org/dl/rel/3.5.2/SumatraPDF-3.5.2-64.zip" -OutFile sumatra.zip
+            Expand-Archive sumatra.zip -DestinationPath sumatra -Force
+            Copy-Item (Get-ChildItem sumatra -Filter *.exe -Recurse | Select-Object -First 1).FullName tools\SumatraPDF.exe
+          } catch { Write-Host "Sumatra download failed: $_" }
+          if (!(Test-Path tools\SumatraPDF.exe)) { choco install sumatrapdf.portable -y --no-progress; Copy-Item (Get-ChildItem "$env:ChocolateyInstall\lib\sumatrapdf.portable" -Filter SumatraPDF*.exe -Recurse | Select-Object -First 1).FullName tools\SumatraPDF.exe }
+          Get-Item tools\SumatraPDF.exe
+
+      - name: Build Zalat installer
+        run: '& "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" installer_zalat.iss'
+
+      - uses: actions/upload-artifact@v5
+        continue-on-error: true          # لو مساحة Actions اتملت، النسخة لسه بتنزل في الـ Release
+        with:
+          name: Zalat-Setup
+          path: Output/Zalat-Setup.exe
+          retention-days: 3
+
+      - name: Publish release (direct download link)
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $n = 36 + ${{ github.run_number }}
+          gh release create "V2.1.$n" Output/Zalat-Setup.exe --title "Zalat V2.1.$n" --notes "Zalat V2.1.$n" --latest --repo "${{ github.repository }}"

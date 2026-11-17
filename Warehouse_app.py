@@ -1,0 +1,9161 @@
+# -*- coding: utf-8 -*-
+"""
+برنامج مخازن ومبيعات لويندوز — النسخة الأونلاين.
+التخزين: SQLite على الجهاز، أو سيرفر PostgreSQL على الشبكة (أكتر من جهاز على نفس الداتا).
+المتابعة من الموبايل: تقارير وتنبيهات Telegram + مزامنة Google Sheets.
+
+اتفاقية الرصيد: الرصيد الموجب = على العميل (مدين) ، السالب = للمورد (دائن)
+  مدين: فواتير المبيعات + مرتجعات المشتريات + المبالغ المدفوعة (دفع)
+  دائن: فواتير المشتريات + مرتجعات المبيعات + المبالغ المحصّلة (تحصيل)
+"""
+import os, sys, sqlite3, webbrowser, hashlib, hmac, secrets, base64, re, zipfile
+import xml.etree.ElementTree as ET
+from datetime import date, datetime, timedelta
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog, simpledialog
+
+APP_DATA_DIR = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "WarehouseOnline")   # النسخة الأونلاين ليها مجلد لوحدها
+OFFLINE_DB_PATH = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "WarehouseDesktop", "warehouse.db")   # داتا النسخة الأوفلاين (للنقل بس)
+PRINT_DIR = os.path.join(APP_DATA_DIR, "printouts")
+os.makedirs(PRINT_DIR, exist_ok=True)
+DB_PATH = os.path.join(APP_DATA_DIR, "warehouse.db")
+
+KINDS = ("مبيعات", "مشتريات", "مرتجع مبيعات", "مرتجع مشتريات")
+WAGE_CATS = ("يوميات", "تشوين")   # بتتحسب جوه المرتبات وبتظهر بين قوسين: «مرتبات (يوميات)»
+SIGN = {"مشتريات": 1, "مرتجع مبيعات": 1, "مبيعات": -1, "مرتجع مشتريات": -1}      # أثر الفاتورة على المخزون
+DEBIT_KINDS = ("مبيعات", "مرتجع مشتريات")                                          # فواتير تزيد الرصيد (مدين)
+PAID_KIND = {"مبيعات": "تحصيل", "مشتريات": "دفع", "مرتجع مبيعات": "دفع", "مرتجع مشتريات": "تحصيل"}
+PREFIX = {"مبيعات": "م", "مشتريات": "ش", "مرتجع مبيعات": "رم", "مرتجع مشتريات": "رش"}
+PAID_LABEL = {"مبيعات": "المحصّل الآن من العميل", "مشتريات": "المدفوع الآن للمورد",
+              "مرتجع مبيعات": "المدفوع الآن للعميل (رد نقدي)", "مرتجع مشتريات": "المحصّل الآن من المورد (رد نقدي)"}
+
+# صافي الفاتورة = مجموع البنود - الخصم (يُستخدم مع الاسم المستعار i لجدول invoices)
+NET_SQL = "(COALESCE((SELECT SUM(qty*price) FROM invoice_lines WHERE invoice_id=i.id),0)-COALESCE(i.discount,0))"
+SIGNED_SALES_SQL = f"CASE i.kind WHEN 'مبيعات' THEN {NET_SQL} WHEN 'مرتجع مبيعات' THEN -{NET_SQL} ELSE 0 END"
+# المرتجع المعلَّم «هالك» لا يرجع للمخزن
+PAYTYPE_KINDS = ("مبيعات", "مشتريات")   # نقدي / آجل
+
+class CreditLimitExceeded(Exception):
+    def __init__(self, name, limit, before, after):
+        super().__init__(name); self.name, self.limit, self.before, self.after = name, limit, before, after
+
+INV_QTY_SQL = "COALESCE((SELECT SUM(qty) FROM invoice_lines WHERE invoice_id=i.id),0)"
+BAGS_PER_TON = 20      # الطن = 20 شيكارة
+_IS_TON = "(unit LIKE '%طن%')"
+_IS_BAG = "(unit LIKE '%شيك%' OR unit LIKE '%شك%')"
+# كمية الفاتورة بالشيكارة (الطن ×20، وأي وحدة تانية زي ما هي) وبالطن (الشيكارة ÷20، والوحدات التانية مش بتتحسب)
+INV_BAGS_SQL = f"COALESCE((SELECT SUM(CASE WHEN {_IS_TON} THEN qty*{BAGS_PER_TON} ELSE qty END) FROM invoice_lines WHERE invoice_id=i.id),0)"
+INV_TONS_SQL = f"COALESCE((SELECT SUM(CASE WHEN {_IS_TON} THEN qty WHEN {_IS_BAG} THEN qty/{BAGS_PER_TON}.0 ELSE 0 END) FROM invoice_lines WHERE invoice_id=i.id),0)"
+# التارجت بيتحسب على شكاير الدقيق بس: الصنف المعلّم «في التارجت»، ولو مش متحدد = اللي اسمه فيه «دقيق» أو «خباز»
+TARGET_ITEM_SQL = "COALESCE((SELECT it.in_target FROM items it WHERE it.id=invoice_lines.item_id), CASE WHEN item_name LIKE '%دقيق%' OR item_name LIKE '%خباز%' THEN 1 ELSE 0 END)=1"
+TGT_BAGS_SQL = f"COALESCE((SELECT SUM(CASE WHEN {_IS_TON} THEN qty*{BAGS_PER_TON} ELSE qty END) FROM invoice_lines WHERE invoice_id=i.id AND {TARGET_ITEM_SQL}),0)"
+TGT_TONS_SQL = f"COALESCE((SELECT SUM(CASE WHEN {_IS_TON} THEN qty WHEN {_IS_BAG} THEN qty/{BAGS_PER_TON}.0 ELSE qty/{BAGS_PER_TON}.0 END) FROM invoice_lines WHERE invoice_id=i.id AND {TARGET_ITEM_SQL}),0)"
+# الكمية اللي العمولة بتتحسب عليها: حسب وحدة عمولة المندوب وقت الفاتورة
+COMM_QTY_SQL = f"(CASE WHEN COALESCE(i.rep_unit,'')='طن' THEN {INV_TONS_SQL} ELSE {INV_BAGS_SQL} END)"
+# عمولة الفاتورة: الجديدة (comm_by_item=1) = كمية كل صنف × عمولة الصنف (جنيه على الوحدة، الافتراضي 1)
+# القديمة = الكمية × عمولة المندوب اللي كانت ساعتها (زي ما هي — مش بتتغير)
+COMM_AMT_SQL = (f"(CASE WHEN COALESCE(i.comm_by_item,0)=1 THEN COALESCE((SELECT SUM(qty*COALESCE(comm,0)) FROM invoice_lines WHERE invoice_id=i.id),0) "
+                f"ELSE {COMM_QTY_SQL}*COALESCE(i.rep_rate,0) END)")
+COMM_UNITS = ("شيكارة", "طن")
+
+def qty_text(bags, tons):
+    """«5 طن (100 شيكارة)»."""
+    return f"{fmt(tons)} طن ({fmt(bags)} شيكارة)"
+STOCK_CASE = "CASE i.kind WHEN 'مشتريات' THEN l.qty WHEN 'مرتجع مبيعات' THEN (CASE WHEN COALESCE(l.damaged,0)=1 THEN 0 ELSE l.qty END) WHEN 'مبيعات' THEN -l.qty WHEN 'مرتجع مشتريات' THEN -l.qty ELSE 0 END"
+
+# شعار شركة زلط الافتراضي (PNG) — ممكن تستبدله من الإعدادات
+DEFAULT_LOGO_B64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAfQAAAGSCAMAAAAipcP/AAABgFBMVEXi7PPa6PKYtc4SR3Hm8vrY8/2nucoYWYixxdQpV3QaY5LL"
+    "2eYQOFcpZYwZU3inh03t59eUrca21uhPdo/I09u1lliUp7XFqW0kSmqumGxyl60kXIXx8fESPWRyhZPPtXbHto4yYnq6o3DDzNWo"
+    "s7vTx61Ha4WOm6Zpi6RMZHVue4a3qIi55PVZgpqjrLWuzeKIk5uVe03YxY/l28eCjJUXQluYw9ibg1UlRVt4orkKLEqdsL5Vh6Sb"
+    "iGZpc3ziyoqjjWXk1rZ2p8VMW2nm0ZBjbHXIvKWifkU5c5Lc0rW40d3CrYa9spWXyuS8oV17tNMcaqGrnILYwHz58NoiPVZZlLIH"
+    "JDwjbKEVToDCoV5LVFyb0+7BnloBHTt2kZ2ifj42eKPd49xScX5JfaRonMKNe2LgzK2Gbka38f/Az+EAH0E9gadETFZemcKfknOI"
+    "vOIdYH0dcKggP2QtUF9foMKgr8TAn2He0ZkAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABa/mdSAAAAgHRSTlP/////////////////"
+    "////////////////////AP//////////////////////////////////////////////////////////////////////////////"
+    "//////////////////////////////////////////8AAAAAAAAAAC7IGaoAAH/RSURBVHja7b2HY9u4sjcKSCBNmpKitowsrbVW"
+    "JEuW+65LbK+Tk3KSk7L1bDntfuf2+/Xv9ff+/YcZFAIkSEm27CReY7M2LbGA+GEGM4Mp5PNMY7wRGrUD3vz5GpwJJwfwn2jus3ST"
+    "Hzi+z57svMGMZt12oUtzu2x/nXu5eVrqysIr8vszx0nOFlECWGYRJi7EoyH2uiSbPjCbeKvSLbeip2qkSvdNjEcQDCMX7iSNOKNN"
+    "DnjJNXR3d0T9uwQ1oiR/lHxO7yyNuwk647OCRkGpdE8sd2cyc3pv0xTqxCbzKGg07sfqrrF5v20zeWIv5vckfidBHwUWsRMDcxrc"
+    "Y35HUedLu4E6MTG/H587DLuBugCdcJ7PWbs/9x1Q1Etk+aVKfvOoCAWnLLEr/nVu6ZvD49s3WUS3nA3LHDfz/YaP2lsCOopwpTh7"
+    "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"
+    "020AAAAASUVORK5CYII="
+)
+
+# نسخ صغيرة ناعمة من الشعار الافتراضي للشاشة
+DEFAULT_LOGO_SMALL = {
+    90: "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",
+    70: "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",
+    48: "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",
+}
+LOGO_PATH = os.path.join(APP_DATA_DIR, "logo.png")
+
+def logo_bytes():
+    """الشعار الحالي: اللي اخترته من الإعدادات، وإلا الافتراضي."""
+    return base64.b64decode(DEFAULT_LOGO_B64)   # الشعار ثابت (مرخّص) ومش بيتغيّر من البرنامج
+
+def logo_data_uri():
+    return "data:image/png;base64," + base64.b64encode(logo_bytes()).decode()
+
+def logo_img_tag(css="height:22mm"):
+    return f'<img class="logo" src="{logo_data_uri()}" style="{css}">'
+
+# ======================================================================
+# قاعدة البيانات: SQLite (جهاز واحد) أو PostgreSQL (أكتر من جهاز على الشبكة)
+# الاختيار محفوظ في db_config.json جوه مجلد البرنامج على كل جهاز.
+# ======================================================================
+import json, threading, time
+from decimal import Decimal
+try:
+    import psycopg2
+except Exception:          # البرنامج يفضل يشتغل على SQLite حتى لو المكتبة مش موجودة
+    psycopg2 = None
+
+DB_CONFIG_PATH = os.path.join(APP_DATA_DIR, "db_config.json")
+DB_DEFAULTS = {"mode": "sqlite", "host": "", "port": 5432, "dbname": "warehouse", "user": "postgres", "password": "", "backup_dir": "", "web_enabled": False, "web_port": 8780, "cloud_dir": "", "cloud_off": False, "cloud_every": 10}
+
+def load_db_config():
+    cfg = dict(DB_DEFAULTS)
+    try:
+        with open(DB_CONFIG_PATH, encoding="utf-8") as f: data = json.load(f)
+        cfg.update({k: v for k, v in data.items() if k in DB_DEFAULTS})
+        if data.get("password_b64"): cfg["password"] = base64.b64decode(data["password_b64"]).decode("utf-8")
+    except Exception: pass
+    return cfg
+
+def save_db_config(cfg):
+    data = {k: cfg.get(k, v) for k, v in DB_DEFAULTS.items() if k != "password"}
+    data["password_b64"] = base64.b64encode((cfg.get("password") or "").encode("utf-8")).decode("ascii")
+    os.makedirs(APP_DATA_DIR, exist_ok=True)
+    tmp = DB_CONFIG_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f: json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, DB_CONFIG_PATH)
+    DB_CFG.clear(); DB_CFG.update(load_db_config())
+
+DB_CFG = load_db_config()
+_TLS = threading.local()     # لكل thread اتصاله (الشاشة + المزامنة في الخلفية)
+
+def using_pg():
+    return DB_CFG.get("mode") == "postgres" and not getattr(_TLS, "sqlite_path", None)
+
+def server_label():
+    return f"{DB_CFG.get('host')}:{DB_CFG.get('port')}/{DB_CFG.get('dbname')}" if DB_CFG.get("mode") == "postgres" else "على الجهاز ده بس (SQLite)"
+
+DBIntegrityError = (sqlite3.IntegrityError,) + ((psycopg2.IntegrityError,) if psycopg2 else ())
+DBConnectionError = ((psycopg2.OperationalError, psycopg2.InterfaceError) if psycopg2 else ())
+
+class DBUnavailable(Exception):
+    """السيرفر مش متاح (الجهاز الأساسي مقفول أو الشبكة فاصلة)."""
+
+def _pg_connect(cfg=None, dbname=None):
+    if psycopg2 is None: raise DBUnavailable("مكتبة PostgreSQL (psycopg2) مش موجودة في النسخة دي من البرنامج")
+    cfg = cfg or DB_CFG
+    return psycopg2.connect(host=cfg.get("host") or "127.0.0.1", port=int(cfg.get("port") or 5432), dbname=dbname or cfg.get("dbname") or "warehouse",
+                            user=cfg.get("user") or "postgres", password=cfg.get("password") or "", connect_timeout=5,
+                            application_name=("WarehouseDesktop - " + (os.environ.get("COMPUTERNAME") or __import__("socket").gethostname()))[:60], client_encoding="UTF8",
+                            keepalives=1, keepalives_idle=30, keepalives_interval=10, keepalives_count=3)
+
+def pg_ensure_database(cfg):
+    """يتأكد إن قاعدة البيانات موجودة على السيرفر، ولو مش موجودة يعملها (UTF8)."""
+    try:
+        _pg_connect(cfg).close(); return False
+    except psycopg2.OperationalError as e:
+        if "does not exist" not in str(e): raise
+    con = _pg_connect(cfg, dbname="postgres"); con.autocommit = True
+    try:
+        name = cfg.get("dbname") or "warehouse"
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name): raise ValueError("اسم قاعدة البيانات لازم يكون حروف إنجليزي وأرقام بس")
+        con.cursor().execute(f"CREATE DATABASE {name} WITH TEMPLATE template0 ENCODING 'UTF8' LC_COLLATE 'C' LC_CTYPE 'C'")
+    finally: con.close()
+    return True
+
+# ---------- ترجمة SQL بتاع SQLite لـ PostgreSQL ----------
+_SQL_CACHE = {}
+_NO_ID_TABLES = {"counters"}
+_STR_RE = re.compile(r"'(?:[^']|'')*'")
+_USER_RE = re.compile(r'(?<![\w"])user(?![\w"])')      # عمود user كلمة محجوزة في PostgreSQL
+def pg_col(c): return '"user"' if c == "user" else c
+
+def pg_sql(sql):
+    """يرجع (sql المترجم، هل فيه RETURNING id)."""
+    hit = _SQL_CACHE.get(sql)
+    if hit: return hit
+    out, pos = [], 0
+    def code(t): return _USER_RE.sub('"user"', t.replace("%", "%%").replace("?", "%s"))
+    for m in _STR_RE.finditer(sql):          # النصوص بين ' ' متتغيرش
+        out.append(code(sql[pos:m.start()])); out.append(m.group(0).replace("%", "%%")); pos = m.end()
+    out.append(code(sql[pos:]))
+    s = "".join(out).strip().rstrip(";")
+    up = s.upper()
+    if up.startswith(("CREATE TABLE", "ALTER TABLE")):
+        s = re.sub(r"\bINTEGER PRIMARY KEY\b", "SERIAL PRIMARY KEY", s)
+        s = re.sub(r"\bREAL\b", "DOUBLE PRECISION", s)
+        s = s.replace("number TEXT UNIQUE", "number TEXT")      # الترقيم اليومي: الرقم مميز داخل (النوع + اليوم)
+    if re.match(r"INSERT\s+OR\s+IGNORE\s+INTO", s, re.I):
+        s = re.sub(r"INSERT\s+OR\s+IGNORE\s+INTO", "INSERT INTO", s, count=1, flags=re.I) + " ON CONFLICT DO NOTHING"
+    s = s.replace("MAX(last,excluded.last)", "GREATEST(counters.last,excluded.last)")
+    ret = False
+    m = re.match(r"INSERT\s+INTO\s+(\w+)", s, re.I)
+    if m and m.group(1).lower() not in _NO_ID_TABLES and " RETURNING " not in s.upper():
+        s += " RETURNING id"; ret = True
+    _SQL_CACHE[sql] = (s, ret)
+    return s, ret
+
+def _pgval(v):
+    if isinstance(v, Decimal): return int(v) if v == v.to_integral_value() else float(v)
+    return v
+
+class PgRow:
+    """صف بيتقري بالاسم أو بالرقم زي sqlite3.Row."""
+    __slots__ = ("_v", "_k")
+    def __init__(self, v, k): self._v = v; self._k = k
+    def __getitem__(self, i):
+        if isinstance(i, str):
+            try: return self._v[self._k[i.lower()]]
+            except KeyError: raise IndexError(f"No item with that key: {i}")
+        return self._v[i]
+    def __iter__(self): return iter(self._v)
+    def __len__(self): return len(self._v)
+    def keys(self): return sorted(self._k, key=self._k.get)
+    def __repr__(self): return f"PgRow{self._v!r}"
+
+class PgCursor:
+    def __init__(self, cur=None, rows=None, lastrowid=None):
+        self._cur, self._rows, self.lastrowid = cur, rows, lastrowid
+        self._k = None
+        if cur is not None and cur.description:
+            self._k = {}
+            for i, d in enumerate(cur.description): self._k.setdefault(d.name.lower(), i)
+    def _wrap(self, r): return PgRow(tuple(_pgval(x) for x in r), self._k)
+    def fetchone(self):
+        if self._rows is not None: return self._rows.pop(0) if self._rows else None
+        if self._k is None: return None
+        r = self._cur.fetchone(); return self._wrap(r) if r is not None else None
+    def fetchall(self):
+        if self._rows is not None: rows, self._rows = self._rows, []; return rows
+        if self._k is None: return []
+        return [self._wrap(r) for r in self._cur.fetchall()]
+    def __iter__(self): return iter(self.fetchall())
+
+class PgConn:
+    """اتصال PostgreSQL بنفس واجهة sqlite3 اللي البرنامج متعود عليها."""
+    def __init__(self, raw): self.raw = raw; self.row_factory = None; self.last_used = time.time(); self.cache = {}
+    def execute(self, sql, params=()):
+        st = sql.strip()
+        if st[:6].upper() == "PRAGMA":
+            m = re.match(r"PRAGMA\s+table_info\((\w+)\)", st, re.I)
+            if not m: return PgCursor(rows=[])
+            cur = self.raw.cursor()
+            cur.execute("SELECT ordinal_position-1, column_name, data_type, CASE WHEN is_nullable='NO' THEN 1 ELSE 0 END, column_default, 0 "
+                        "FROM information_schema.columns WHERE table_schema=current_schema() AND table_name=%s ORDER BY ordinal_position", (m.group(1).lower(),))
+            return PgCursor(cur)
+        s, ret = pg_sql(sql)
+        if self.cache and s[:6].upper() in ("INSERT", "UPDATE", "DELETE", "ALTER ", "CREATE"): self.cache.clear()
+        cur = self.raw.cursor()
+        cur.execute(s, tuple(int(p) if isinstance(p, bool) else p for p in params) if params is not None else ())
+        self.last_used = time.time()
+        if ret:
+            r = cur.fetchone() if cur.description else None
+            return PgCursor(rows=[], lastrowid=r[0] if r else None)
+        return PgCursor(cur)
+    def executemany(self, sql, seq):
+        self.cache.clear()
+        s, ret = pg_sql(sql)
+        if ret: s = s[: -len(" RETURNING id")]
+        cur = self.raw.cursor()
+        from psycopg2.extras import execute_batch
+        execute_batch(cur, s, [tuple(p) for p in seq], page_size=500)
+        return PgCursor(rows=[])
+    def executescript(self, script):
+        body, pos, parts = script, 0, []
+        buf = ""
+        for m in _STR_RE.finditer(body):          # تقسيم على ; اللي برّه النصوص
+            buf += body[pos:m.start()].replace(";", "\x00") + m.group(0); pos = m.end()
+        buf += body[pos:].replace(";", "\x00")
+        for stmt in buf.split("\x00"):
+            if stmt.strip(): self.execute(stmt)
+    def commit(self): self.cache.clear(); self.raw.commit()
+    def rollback(self): self.cache.clear(); self.raw.rollback()
+    def close(self):
+        try: self.raw.close()
+        except Exception: pass
+    def backup(self, dest):
+        export_to_sqlite(self, dest)
+
+def _pg_state():
+    st = getattr(_TLS, "pg", None)
+    if st is None: st = _TLS.pg = {"con": None, "depth": 0}
+    return st
+
+def _pg_shared():
+    """اتصال واحد مفتوح لكل thread (أسرع بكتير من فتح اتصال جديد مع كل عملية)."""
+    st = _pg_state(); con = st["con"]
+    if con is not None:
+        if con.raw.closed: con = None
+        elif time.time() - con.last_used > 60:          # فاضي من فترة: نتأكد إن الاتصال لسه شغال
+            try: con.raw.cursor().execute("SELECT 1"); con.raw.rollback()
+            except Exception: con.close(); con = None
+    if con is None:
+        try: con = PgConn(_pg_connect())
+        except Exception as e: raise DBUnavailable(pg_error_text(e)) from e
+        st["con"] = con
+    return con
+
+def pg_error_text(e):
+    t = str(e)
+    if "password authentication failed" in t: return "اسم المستخدم أو كلمة السر بتاعة PostgreSQL غلط"
+    if "Connection refused" in t or "could not connect" in t or "timeout expired" in t or "No route" in t or "could not translate host" in t:
+        return f"مش قادر يوصل للسيرفر ({DB_CFG.get('host')}:{DB_CFG.get('port')}).\nاتأكد إن الجهاز الأساسي شغال، وإن الجهازين على نفس الشبكة."
+    if "no pg_hba.conf entry" in t: return "السيرفر رافض الاتصال من الجهاز ده (لازم تضيف الشبكة في ملف pg_hba.conf على الجهاز الأساسي)"
+    return t.strip()
+
+def pg_reset_connection():
+    st = _pg_state()
+    if st["con"] is not None: st["con"].close()
+    st["con"] = None; st["depth"] = 0
+
+def raw_db():
+    if using_pg():
+        try: return PgConn(_pg_connect())
+        except Exception as e: raise DBUnavailable(pg_error_text(e)) from e
+    con = sqlite3.connect(getattr(_TLS, "sqlite_path", None) or DB_PATH)
+    con.row_factory = sqlite3.Row
+    con.execute("PRAGMA foreign_keys=ON")
+    con.execute("PRAGMA busy_timeout=5000")
+    return con
+
+class db:
+    """اتصال بقاعدة البيانات: يحفظ عند النجاح، يتراجع عند الخطأ.
+    على PostgreSQL: الاتصال مشترك، والحفظ بيحصل مرة واحدة في آخر أكبر with."""
+    def __enter__(self):
+        self.pg = using_pg()
+        if self.pg:
+            st = _pg_state()
+            self.con = _pg_shared() if st["depth"] == 0 else st["con"]
+            st["depth"] += 1
+            return self.con
+        self.con = raw_db(); return self.con
+    def __exit__(self, exc_type, exc, tb):
+        if self.pg:
+            st = _pg_state(); st["depth"] -= 1
+            if st["depth"] <= 0:
+                st["depth"] = 0
+                try:
+                    if exc_type is None: self.con.commit()
+                    else: self.con.rollback()
+                except Exception:
+                    pg_reset_connection()
+                    if exc_type is None: raise
+            if exc_type is not None and DBConnectionError and issubclass(exc_type, DBConnectionError):
+                pg_reset_connection()
+                raise DBUnavailable(pg_error_text(exc)) from exc
+            return False
+        try:
+            if exc_type is None: self.con.commit()
+            else: self.con.rollback()
+        finally:
+            self.con.close()
+        return False
+
+def db_lock(c, key=1):
+    """على PostgreSQL: يمنع جهازين يحفظوا فواتير في نفس اللحظة (القفل بيتفك لوحده مع الحفظ)."""
+    if isinstance(c, PgConn): c.execute("SELECT pg_advisory_xact_lock(?)", (key,))
+
+class sqlite_target:
+    """يخلّي init_db والـ db() يشتغلوا على ملف SQLite معيّن (للنسخ الاحتياطي والنقل)."""
+    def __init__(self, path): self.path = path
+    def __enter__(self): self.old = getattr(_TLS, "sqlite_path", None); _TLS.sqlite_path = self.path
+    def __exit__(self, *a): _TLS.sqlite_path = self.old; return False
+
+# ---------- نقل الداتا بين SQLite و PostgreSQL ----------
+def _sqlite_tables_ordered(scon):
+    """أسماء الجداول مترتبة بحيث الجدول الأب ييجي قبل الجداول اللي بتشاور عليه."""
+    names = [r[0] for r in scon.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")]
+    deps = {n: {r[2] for r in scon.execute(f"PRAGMA foreign_key_list({n})") if r[2] != n and r[2] in names} for n in names}
+    order, done = [], set()
+    while len(order) < len(names):
+        ready = [n for n in names if n not in done and deps[n] <= done] or [n for n in names if n not in done][:1]
+        for n in ready: order.append(n); done.add(n)
+    fks = {n: [(r[3], r[2], r[4]) for r in scon.execute(f"PRAGMA foreign_key_list({n})")] for n in names}
+    return order, fks
+
+def _cols(con, table):
+    return [r[1] for r in con.execute(f"PRAGMA table_info({table})")]
+
+def copy_database(src, dst, progress=None):
+    """ينسخ كل الصفوف من src لـ dst (واحد فيهم SQLite والتاني PostgreSQL أو SQLite). dst لازم يكون فيه الجداول (init_db)."""
+    s_sqlite = isinstance(src, sqlite3.Connection); d_pg = isinstance(dst, PgConn)
+    meta = src if s_sqlite else dst
+    order, fks = _sqlite_tables_ordered(meta)
+    if d_pg:
+        types = {}
+        for r in dst.execute("SELECT table_name, column_name, data_type, is_nullable FROM information_schema.columns WHERE table_schema=current_schema()").fetchall():
+            types[(r[0], r[1])] = (r[2], r[3] == "NO")
+    # الجداول بتتفضى بالعكس (الأبناء الأول)
+    for t in reversed(order):
+        if t in _cols_cache_names(dst): dst.execute(f"DELETE FROM {t}")
+    ids = {}
+    report = []
+    for t in order:
+        if t not in _cols_cache_names(dst) or t not in _cols_cache_names(src): continue
+        cols = [c for c in _cols(src, t) if c in set(_cols(dst, t))]
+        rows = [tuple(r) for r in src.execute(f"SELECT {','.join(cols)} FROM {t} ORDER BY " + ("id" if "id" in cols else cols[0])).fetchall()]
+        fixed = 0
+        if d_pg:
+            conv = []
+            for ci, cname in enumerate(cols):
+                ty, notnull = types.get((t, cname), ("text", False))
+                if ty in ("double precision", "integer", "bigint", "real", "numeric", "smallint"): conv.append((ci, ty, notnull))
+            if conv:
+                out = []
+                for r in rows:
+                    r = list(r)
+                    for ci, ty, notnull in conv:
+                        v = r[ci]
+                        if isinstance(v, str):
+                            try: v = float(v.replace(",", "")) if v.strip() else None
+                            except ValueError: v = None
+                            if v is not None and ty in ("integer", "bigint", "smallint"): v = int(round(v))
+                            if v is None and notnull: v = 0
+                            r[ci] = v; fixed += 1
+                        elif isinstance(v, float) and ty in ("integer", "bigint", "smallint"):
+                            r[ci] = int(round(v))
+                    out.append(tuple(r))
+                rows = out
+        # صفوف بتشاور على حاجة اتمسحت: العمود يتساب فاضي، ولو مينفعش يبقى فاضي الصف ميتنقلش
+        dropped = 0
+        for col, parent, pcol in fks.get(t, []):
+            if col not in cols or parent not in ids: continue
+            ci = cols.index(col); good = ids[parent]
+            nullable = True
+            if d_pg: nullable = not types.get((t, col), ("", False))[1]
+            out = []
+            for r in rows:
+                if r[ci] is not None and r[ci] not in good:
+                    if nullable: r = r[:ci] + (None,) + r[ci + 1:]; fixed += 1
+                    else: dropped += 1; continue
+                out.append(r)
+            rows = out
+        if "id" in cols: ids[t] = {r[cols.index("id")] for r in rows}
+        if rows:
+            ph = ",".join("?" * len(cols))
+            if d_pg:
+                from psycopg2.extras import execute_values
+                execute_values(dst.raw.cursor(), f"INSERT INTO {t}({','.join(map(pg_col, cols))}) VALUES %s", rows, page_size=1000)
+            else:
+                dst.executemany(f"INSERT INTO {t}({','.join(cols)}) VALUES({ph})", rows)
+        if d_pg and "id" in cols:
+            dst.execute(f"SELECT setval(pg_get_serial_sequence('{t}','id'), COALESCE((SELECT MAX(id) FROM {t}),0)+1, false)")
+        report.append((t, len(rows), fixed, dropped))
+        if progress: progress(t, len(rows))
+    return report
+
+def _cols_cache_names(con):
+    if isinstance(con, PgConn):
+        return {r[0] for r in con.execute("SELECT table_name FROM information_schema.tables WHERE table_schema=current_schema()").fetchall()}
+    return {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+
+def export_to_sqlite(pgcon, dest):
+    """نسخة احتياطية من السيرفر في ملف SQLite عادي (يتفتح بالبرنامج الأوفلاين كمان)."""
+    path = dest if isinstance(dest, str) else None
+    if path is None:      # اتبعت اتصال sqlite3: نكتب في ملف مؤقت وننسخه جواه
+        import tempfile
+        fd, tmp = tempfile.mkstemp(suffix=".db"); os.close(fd); os.remove(tmp)
+        export_to_sqlite(pgcon, tmp)
+        s = sqlite3.connect(tmp)
+        try: s.backup(dest)
+        finally: s.close(); os.remove(tmp)
+        return
+    if os.path.exists(path): os.remove(path)
+    with sqlite_target(path): init_db()
+    s = sqlite3.connect(path)
+    try:
+        s.execute("PRAGMA foreign_keys=OFF")
+        copy_database(pgcon, s)
+        s.commit()
+    finally: s.close()
+
+def import_sqlite_to_pg(sqlite_path, progress=None):
+    """نقل كل الداتا من ملف SQLite (الجهاز ده) للسيرفر. لازم السيرفر يكون فاضي."""
+    s = sqlite3.connect(sqlite_path)
+    with sqlite_target(sqlite_path): init_db()      # يحدّث الملف القديم لآخر شكل قبل النقل
+    pg = raw_db()
+    try:
+        report = copy_database(s, pg, progress)
+        pg.commit()
+    except Exception:
+        pg.rollback(); raise
+    finally:
+        pg.close(); s.close()
+    return report
+
+def pg_is_empty():
+    with db() as c:
+        n = sum(c.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] for t in ("invoices", "items", "parties", "payments", "employees"))
+    return n == 0
+
+def now_ts():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+def fmt_time(ts):
+    """تحويل وقت مخزّن إلى نظام 12 ساعة (مثال: 02:35 م)."""
+    if not ts: return ""
+    try: t = datetime.strptime(str(ts)[:19], "%Y-%m-%d %H:%M:%S")
+    except ValueError: return ""
+    return t.strftime("%I:%M ") + ("ص" if t.hour < 12 else "م")
+
+EMP_KINDS = ("موظف", "عامل", "مندوب")
+EMP_LEFT = "اللي سابوا الشغل"
+OFFICE = "مكتب"
+DEFAULT_COMPANY = "شركة زلط"
+# ===== الترخيص: النسخة دي مرخّصة لشركة زلط بس — الاسم والشعار ثابتين ومحدش يقدر يغيّرهم من البرنامج =====
+LICENSED_COMPANY = "شركة زلط"
+LICENSED_TAGLINE = "للتوريدات العمومية"
+DEVELOPER_MARK = "By Ali ElMenshawy"
+# رقم النسخة: الـ build على GitHub بيكتب الرقم والتاريخ هنا لوحده
+APP_BUILD = 0                 # BUILD_NUMBER
+APP_BUILD_DATE = ""           # BUILD_DATE
+
+def version_text():
+    return f"النسخة V2.1.{APP_BUILD}" + (f" — {APP_BUILD_DATE}" if APP_BUILD_DATE else "") if APP_BUILD else "نسخة تجريبية (مش من GitHub)"
+
+def check_app_version():
+    """بيسجل أحدث نسخة اشتغلت على السيرفر، وبيرجع رقم النسخة الأحدث لو الجهاز ده أقدم منها."""
+    if not APP_BUILD: return None
+    try:
+        with db() as c:
+            add_col(c, "settings", "app_build", "INTEGER DEFAULT 0")
+            cur = int(c.execute("SELECT COALESCE(app_build,0) FROM settings WHERE id=1").fetchone()[0] or 0)
+            if APP_BUILD > cur: c.execute("UPDATE settings SET app_build=? WHERE id=1", (APP_BUILD,)); return None
+            return cur if cur > APP_BUILD else None
+    except Exception: return None
+DEFAULT_TAGLINE = "للتوريدات العمومية"
+
+def add_col(c, table, col, decl):
+    cols = [r[1] for r in c.execute(f"PRAGMA table_info({table})")]
+    if col not in cols:
+        c.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+        return True
+    return False
+
+def init_db():
+    with db() as c:
+        db_lock(c, 99)
+        c.executescript("""
+        CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY CHECK(id=1), company TEXT DEFAULT '', english TEXT DEFAULT '', address TEXT DEFAULT '', phone TEXT DEFAULT '', taxno TEXT DEFAULT '');
+        INSERT OR IGNORE INTO settings(id) VALUES(1);
+        CREATE TABLE IF NOT EXISTS items(id INTEGER PRIMARY KEY, code TEXT UNIQUE, name TEXT NOT NULL, unit TEXT DEFAULT 'قطعة', sell_price REAL DEFAULT 0, buy_price REAL DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS parties(id INTEGER PRIMARY KEY, name TEXT NOT NULL, kind TEXT DEFAULT 'عميل/مورد', phone TEXT DEFAULT '', address TEXT DEFAULT '', opening REAL DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS invoices(id INTEGER PRIMARY KEY, number TEXT UNIQUE, kind TEXT NOT NULL, inv_date TEXT NOT NULL, party_id INTEGER, notes TEXT DEFAULT '', discount REAL DEFAULT 0, tax REAL DEFAULT 0, FOREIGN KEY(party_id) REFERENCES parties(id));
+        CREATE TABLE IF NOT EXISTS invoice_lines(id INTEGER PRIMARY KEY, invoice_id INTEGER NOT NULL, item_id INTEGER, item_name TEXT NOT NULL, unit TEXT DEFAULT '', qty REAL NOT NULL, price REAL NOT NULL, FOREIGN KEY(invoice_id) REFERENCES invoices(id) ON DELETE CASCADE, FOREIGN KEY(item_id) REFERENCES items(id));
+        CREATE TABLE IF NOT EXISTS payments(id INTEGER PRIMARY KEY, party_id INTEGER NOT NULL, pay_date TEXT NOT NULL, kind TEXT NOT NULL, amount REAL NOT NULL, notes TEXT DEFAULT '', FOREIGN KEY(party_id) REFERENCES parties(id));
+        CREATE TABLE IF NOT EXISTS employees(id INTEGER PRIMARY KEY, name TEXT NOT NULL, job TEXT DEFAULT '', phone TEXT DEFAULT '', salary REAL DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS expense_cats(id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL);
+        CREATE TABLE IF NOT EXISTS expenses(id INTEGER PRIMARY KEY, exp_date TEXT NOT NULL, kind TEXT NOT NULL, category TEXT DEFAULT '', amount REAL NOT NULL, notes TEXT DEFAULT '', employee_id INTEGER, deducted REAL DEFAULT 0, FOREIGN KEY(employee_id) REFERENCES employees(id));
+        CREATE TABLE IF NOT EXISTS cash_moves(id INTEGER PRIMARY KEY, move_date TEXT NOT NULL, kind TEXT NOT NULL, amount REAL NOT NULL, notes TEXT DEFAULT '');
+        CREATE TABLE IF NOT EXISTS audit_log(id INTEGER PRIMARY KEY, at TEXT NOT NULL, user TEXT DEFAULT '', action TEXT NOT NULL, details TEXT DEFAULT '');
+        """)
+        add_col(c, "settings", "operator", "TEXT DEFAULT ''")
+        add_col(c, "settings", "backup_dir", "TEXT DEFAULT ''")
+        add_col(c, "settings", "cash_opening", "REAL DEFAULT 0")
+        add_col(c, "items", "min_stock", "REAL DEFAULT 0")
+        add_col(c, "items", "opening_qty", "REAL DEFAULT 0")   # رصيد أول المدة (كمية موجودة قبل أول فاتورة)
+        add_col(c, "payments", "invoice_id", "INTEGER")
+        # اسم الشركة في رأس البرنامج + السطر التاني تحته
+        if add_col(c, "settings", "tagline", "TEXT DEFAULT ''"):
+            c.execute("UPDATE settings SET tagline=? WHERE id=1", (DEFAULT_TAGLINE,))
+            c.execute("UPDATE settings SET company=? WHERE id=1 AND TRIM(COALESCE(company,''))=''", (DEFAULT_COMPANY,))
+        # نوع الموظف (موظف/عامل/مندوب)؛ خانة job القديمة أصبحت «الصفة»
+        add_col(c, "employees", "kind", "TEXT DEFAULT 'موظف'")
+        c.execute("UPDATE employees SET kind='موظف' WHERE kind IS NULL OR kind NOT IN ('موظف','عامل','مندوب')")
+        # المندوب (NULL = مكتب) في فواتير المبيعات وسندات التحصيل
+        add_col(c, "invoices", "rep_id", "INTEGER")
+        add_col(c, "payments", "rep_id", "INTEGER")
+        # وقت التسجيل
+        for t in ("invoices", "payments", "expenses", "cash_moves"):
+            add_col(c, t, "created_at", "TEXT")
+        # ربط العميل بالمندوب + عمولة المندوب لكل وحدة
+        add_col(c, "parties", "rep_id", "INTEGER")
+        add_col(c, "parties", "exp_hidden", "TEXT")   # اتشال من «المتوقعين» (بيرجع لوحده لو اشترى تاني)
+        add_col(c, "employees", "commission", "REAL DEFAULT 0")
+        add_col(c, "employees", "active", "INTEGER DEFAULT 1")      # 0 = ساب الشغل (بيختفي من القوايم وسجله يفضل محفوظ)
+        add_col(c, "employees", "pay_period", "TEXT DEFAULT ''")   # طريقة القبض: يومي / أسبوعي / كل أسبوعين / شهري (فاضي = شهري للموظف ويومي للعامل)
+        add_col(c, "employees", "left_date", "TEXT DEFAULT ''")
+        # الهالك: بند مرتجع مبيعات معلَّم هالك، أو هالك مباشر من المخزن
+        add_col(c, "invoice_lines", "damaged", "INTEGER DEFAULT 0")
+        c.execute("""CREATE TABLE IF NOT EXISTS damaged(id INTEGER PRIMARY KEY, d_date TEXT NOT NULL, created_at TEXT, item_id INTEGER NOT NULL,
+                     qty REAL NOT NULL, unit_cost REAL DEFAULT 0, notes TEXT DEFAULT '', FOREIGN KEY(item_id) REFERENCES items(id))""")
+        # عمولة المندوب وقت الفاتورة (على الجديد بس) + نقدي/آجل + الحد الائتماني
+        add_col(c, "invoices", "rep_rate", "REAL DEFAULT 0")
+        add_col(c, "invoices", "rep_unit", "TEXT DEFAULT ''")
+        add_col(c, "invoices", "vehicle_id", "INTEGER")
+        add_col(c, "items", "comm", "REAL DEFAULT 1")              # عمولة المندوب على كل وحدة من الصنف (جنيه)
+        add_col(c, "invoice_lines", "comm", "REAL")                # عمولة الوحدة وقت الفاتورة (علشان تغيير عمولة الصنف ميغيّرش القديم)
+        add_col(c, "invoices", "comm_by_item", "INTEGER DEFAULT 0")
+        add_col(c, "items", "in_target", "INTEGER")              # بيتحسب في تارجت المناديب (فاضي = الافتراضي: الدقيق)          # التوصيل: العربية اللي هتوصّل (فاضي = استلام مكتب)
+        add_col(c, "invoices", "printed_at", "TEXT DEFAULT ''")      # آخر مرة اتطبعت
+        add_col(c, "invoices", "print_count", "INTEGER DEFAULT 0")      # وحدة العمولة وقت الفاتورة: شيكارة / طن
+        add_col(c, "employees", "comm_unit", "TEXT DEFAULT 'شيكارة'")
+        add_col(c, "invoices", "due_date", "TEXT")   # تاريخ الاستحقاق: المخزن بيتأثر فيه
+        if add_col(c, "invoices", "pay_type", "TEXT"):
+            # الفواتير القديمة: مدفوعة بالكامل = نقدي، غير كده = آجل
+            c.execute(f"""UPDATE invoices SET pay_type = CASE WHEN COALESCE((SELECT SUM(amount) FROM payments p WHERE p.invoice_id=invoices.id),0)
+                          >= (SELECT {NET_SQL.replace('i.', 'invoices.')} ) - 0.005 THEN 'نقدي' ELSE 'آجل' END WHERE kind IN ('مبيعات','مشتريات')""")
+        add_col(c, "parties", "credit_limit", "REAL DEFAULT 0")
+        c.execute("""CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, username TEXT UNIQUE NOT NULL, pw_hash TEXT NOT NULL, salt TEXT NOT NULL,
+                     role TEXT NOT NULL, active INTEGER DEFAULT 1, created_at TEXT)""")
+        add_col(c, "users", "screens", "TEXT DEFAULT ''")    # الشاشات المسموحة (JSON) — فاضي = حسب الصلاحية
+        add_col(c, "users", "emp_id", "INTEGER")              # يوزر «مندوب»: مربوط بالمندوب في الموظفين
+        c.execute("UPDATE users SET role='المالك' WHERE role='صاحب الشغل'")   # الاسم القديم للصلاحية
+        for col, val in (("trust_from", "محمود السيد مصطفي زلط"), ("trust_to", "احمد خيري عبد المجيد الجنادي"), ("trust_to_addr", "شبرا الساحل - القاهرة")):
+            if add_col(c, "settings", col, "TEXT DEFAULT ''"): c.execute(f"UPDATE settings SET {col}=? WHERE id=1", (val,))
+        c.execute("CREATE TABLE IF NOT EXISTS sub_cash(id INTEGER PRIMARY KEY, m_date TEXT NOT NULL, created_at TEXT, kind TEXT NOT NULL, amount REAL NOT NULL, notes TEXT DEFAULT '')")
+        c.execute("""CREATE TABLE IF NOT EXISTS trust_receipts(id INTEGER PRIMARY KEY, t_date TEXT NOT NULL, receiver TEXT NOT NULL, id_no TEXT DEFAULT '',
+                     address TEXT DEFAULT '', giver TEXT DEFAULT '', amount REAL NOT NULL, deliver_to TEXT DEFAULT '', notes TEXT DEFAULT '', created_at TEXT)""")
+        # الحضور والغياب: سجل واحد لكل موظف في اليوم (الوقت محفوظ 24 ساعة HH:MM)
+        c.execute("""CREATE TABLE IF NOT EXISTS attendance(id INTEGER PRIMARY KEY, employee_id INTEGER NOT NULL REFERENCES employees(id), a_date TEXT NOT NULL,
+                     present INTEGER NOT NULL DEFAULT 1, check_in TEXT DEFAULT '', late_min INTEGER DEFAULT 0, notes TEXT DEFAULT '', created_at TEXT, UNIQUE(employee_id, a_date))""")
+        for col, val in (("att_start", "09:00"), ("att_grace", "09:30")):
+            if add_col(c, "settings", col, "TEXT DEFAULT ''"): c.execute(f"UPDATE settings SET {col}=? WHERE id=1", (val,))
+        # كل موظف ليه ميعاده (اللي مالوش بياخد الميعاد العام القديم)
+        st_ = c.execute("SELECT att_start, att_grace FROM settings WHERE id=1").fetchone()
+        for col, val in (("att_start", st_[0] or "09:00"), ("att_grace", st_[1] or "09:30")):
+            if add_col(c, "employees", col, "TEXT DEFAULT ''"): c.execute(f"UPDATE employees SET {col}=?", (val,))
+        # عدّاد أرقام الفواتير (يمنع تكرار الرقم بعد حذف آخر فاتورة)
+        c.execute("CREATE TABLE IF NOT EXISTS counters(kind TEXT PRIMARY KEY, last INTEGER NOT NULL DEFAULT 0)")
+        # العربيات: كل حركة (قراءة عداد / تموين / صيانة / ...) بقراءة العداد، والمصروف بيتسجل كمصروف عادي من الخزنة ومربوط بيها
+        c.execute("""CREATE TABLE IF NOT EXISTS vehicles(id INTEGER PRIMARY KEY, name TEXT NOT NULL, plate TEXT DEFAULT '', driver TEXT DEFAULT '',
+                     active INTEGER DEFAULT 1, notes TEXT DEFAULT '', created_at TEXT)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS vehicle_logs(id INTEGER PRIMARY KEY, vehicle_id INTEGER NOT NULL REFERENCES vehicles(id), v_date TEXT NOT NULL,
+                     kind TEXT NOT NULL, odometer REAL, liters REAL DEFAULT 0, amount REAL DEFAULT 0, notes TEXT DEFAULT '', expense_id INTEGER, created_at TEXT)""")
+        # التشوين: بيتسجل طول اليوم (نقلة نقلة) ويتصرف مجمّع آخر اليوم
+        c.execute("""CREATE TABLE IF NOT EXISTS loading_logs(id INTEGER PRIMARY KEY, l_date TEXT NOT NULL, employee_id INTEGER NOT NULL REFERENCES employees(id),
+                     tons REAL NOT NULL DEFAULT 0, price REAL NOT NULL DEFAULT 0, amount REAL NOT NULL DEFAULT 0, crew INTEGER DEFAULT 1, notes TEXT DEFAULT '',
+                     expense_id INTEGER, created_at TEXT)""")
+        # متابعة العملاء المتوقعين: «اتكلمت معاه» بيخفيه من قايمة النهارده
+        c.execute("CREATE TABLE IF NOT EXISTS followups(id INTEGER PRIMARY KEY, party_id INTEGER NOT NULL, f_date TEXT NOT NULL, note TEXT DEFAULT '', by_user TEXT DEFAULT '', created_at TEXT)")
+        # تارجت المندوب الشهري بالكمية (بيفضل ساري للشهور اللي بعده لحد ما يتغير)
+        c.execute("CREATE TABLE IF NOT EXISTS rep_targets(id INTEGER PRIMARY KEY, rep_id INTEGER NOT NULL, month TEXT NOT NULL, qty REAL NOT NULL DEFAULT 0, UNIQUE(rep_id, month))")
+        add_col(c, "rep_targets", "unit", "TEXT DEFAULT 'شيكارة'")   # التارجت بالشيكارة أو بالطن
+        # إقفال الشهور: محدش غير المالك يعدّل أو يضيف أو يحذف فواتير وسندات بتاريخ مقفول
+        add_col(c, "settings", "lock_until", "TEXT DEFAULT ''")
+        # حضور المناديب من تليجرام بالموقع: مكان المخزن + المسافة المسموحة
+        for col, typ in (("wh_lat", "REAL"), ("wh_lon", "REAL"), ("wh_radius", "INTEGER DEFAULT 200"), ("att_auto", "INTEGER DEFAULT 1"), ("att_live", "INTEGER DEFAULT 0")):
+            add_col(c, "settings", col, typ)
+        c.execute("""CREATE TABLE IF NOT EXISTS att_requests(id INTEGER PRIMARY KEY, created_at TEXT NOT NULL, rep_id INTEGER NOT NULL, a_date TEXT NOT NULL, check_in TEXT NOT NULL,
+                     lat REAL, lon REAL, dist REAL, live INTEGER DEFAULT 0, reason TEXT DEFAULT '', status TEXT NOT NULL DEFAULT 'pending', decided_at TEXT, decided_by TEXT DEFAULT '',
+                     chat_id TEXT DEFAULT '', mgr_msgs TEXT DEFAULT '', notified INTEGER DEFAULT 0)""")
+        add_col(c, "settings", "lock_auto", "INTEGER DEFAULT 0")
+        # تقفيل اليوم: بعد ما المحاسب يقفل اليوم، أي تعديل في فواتير/سندات بتاريخه أو قبله محتاج باسوورد المحاسب أو المالك
+        add_col(c, "settings", "day_closed", "TEXT DEFAULT ''")
+        # طلبات سندات التحصيل من موبايل المندوب (بتستنى موافقة)
+        c.execute("""CREATE TABLE IF NOT EXISTS rep_requests(id INTEGER PRIMARY KEY, created_at TEXT NOT NULL, rep_id INTEGER, party_id INTEGER NOT NULL,
+                     amount REAL NOT NULL, notes TEXT DEFAULT '', status TEXT NOT NULL DEFAULT 'pending', decided_at TEXT, decided_by TEXT DEFAULT '',
+                     payment_id INTEGER, chat_id TEXT DEFAULT '', mgr_msgs TEXT DEFAULT '', notified INTEGER DEFAULT 0)""")
+        # مع مين الفلوس وطريقة الدفع (للجرد) + جرد الخزنة المفصّل
+        add_col(c, "payments", "holder", "TEXT DEFAULT ''")
+        add_col(c, "payments", "method", "TEXT DEFAULT ''")
+        add_col(c, "rep_requests", "method", "TEXT DEFAULT ''")
+        add_col(c, "settings", "owners_list", "TEXT DEFAULT 'الحج محمود،الحج حسين'")
+        add_col(c, "parties", "asset_type", "TEXT DEFAULT ''")   # حسابات الأصول: «مسحوبات مالك» أو «أصل» (تريسكل، كمبيوتر ...)
+        add_col(c, "parties", "resale", "REAL DEFAULT 0")        # الأصل: يتباع بكام لو الشركة اتصفّت
+        c.execute("""CREATE TABLE IF NOT EXISTS cash_transfers(id INTEGER PRIMARY KEY, t_date TEXT NOT NULL, created_at TEXT, by_user TEXT DEFAULT '',
+                     from_who TEXT NOT NULL, from_method TEXT DEFAULT 'كاش', to_who TEXT NOT NULL, to_method TEXT DEFAULT 'كاش', amount REAL NOT NULL, notes TEXT DEFAULT '')""")
+        c.execute("""CREATE TABLE IF NOT EXISTS cash_counts(id INTEGER PRIMARY KEY, c_date TEXT NOT NULL, created_at TEXT, by_user TEXT DEFAULT '',
+                     system REAL DEFAULT 0, counted REAL DEFAULT 0, diff REAL DEFAULT 0, data TEXT DEFAULT '')""")
+        # طلبات فواتير المناديب من الموقع (بتستنى موافقة المحاسب أو المالك)
+        c.execute("""CREATE TABLE IF NOT EXISTS inv_requests(id INTEGER PRIMARY KEY, created_at TEXT NOT NULL, rep_id INTEGER, by_user TEXT DEFAULT '',
+                     party_id INTEGER, kind TEXT, net REAL DEFAULT 0, payload TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
+                     decided_at TEXT, decided_by TEXT DEFAULT '', invoice_id INTEGER, reason TEXT DEFAULT '')""")
+        # العينات: أصناف منفصلة تمامًا عن الأصناف العادية
+        c.executescript("""
+        CREATE TABLE IF NOT EXISTS sample_items(id INTEGER PRIMARY KEY, code TEXT UNIQUE, name TEXT NOT NULL, unit TEXT DEFAULT 'قطعة');
+        CREATE TABLE IF NOT EXISTS samples(id INTEGER PRIMARY KEY, s_date TEXT NOT NULL, created_at TEXT, kind TEXT NOT NULL,
+            sample_item_id INTEGER NOT NULL, qty REAL NOT NULL, cost REAL DEFAULT 0, party_id INTEGER, notes TEXT DEFAULT '',
+            FOREIGN KEY(sample_item_id) REFERENCES sample_items(id), FOREIGN KEY(party_id) REFERENCES parties(id));
+        """)
+        if c.execute("SELECT COUNT(*) FROM expense_cats").fetchone()[0] == 0:
+            for n in ("شيال", "أجور", "جاز", "إيجار عربية", "كهربا"):
+                c.execute("INSERT OR IGNORE INTO expense_cats(name) VALUES(?)", (n,))
+        c.execute("INSERT OR IGNORE INTO expense_cats(name) VALUES('مصروفات أخرى')")
+        c.execute("UPDATE settings SET company=?, tagline=? WHERE id=1", (LICENSED_COMPANY, LICENSED_TAGLINE))   # الاسم ثابت حتى لو اتعدّل في قاعدة البيانات
+    migrate_daily_numbering()
+    with db() as c:
+        # فهارس علشان البرنامج يفضل سريع مع سنين من البيانات
+        for name, sql in (("ix_lines_inv", "invoice_lines(invoice_id)"), ("ix_lines_item", "invoice_lines(item_id)"),
+                          ("ix_inv_party", "invoices(party_id)"), ("ix_inv_date", "invoices(inv_date)"), ("ix_inv_kind_date", "invoices(kind, inv_date)"),
+                          ("ix_inv_rep", "invoices(rep_id)"), ("ix_pay_party", "payments(party_id)"), ("ix_pay_inv", "payments(invoice_id)"),
+                          ("ix_pay_date", "payments(pay_date)"), ("ix_pay_rep", "payments(rep_id)"), ("ix_exp_date", "expenses(exp_date)"),
+                          ("ix_exp_emp", "expenses(employee_id)"), ("ix_dmg_item", "damaged(item_id)"), ("ix_party_rep", "parties(rep_id)"),
+                          ("ix_cash_date", "cash_moves(move_date)"), ("ix_repreq_status", "rep_requests(status)"), ("ix_vlog_vehicle", "vehicle_logs(vehicle_id, v_date)"), ("ix_loading_date", "loading_logs(l_date, employee_id)"), ("ix_follow_date", "followups(f_date, party_id)"), ("ix_log_at", "audit_log(at)"), ("ix_samples_item", "samples(sample_item_id)"), ("ix_att_date", "attendance(a_date)")):
+            try: c.execute(f"CREATE INDEX IF NOT EXISTS {name} ON {sql}")
+            except sqlite3.OperationalError: pass
+
+def migrate_daily_numbering():
+    """ترقيم الفواتير بقى يبدأ من 1 كل يوم: الرقم يبقى مميز داخل (النوع + التاريخ) بدل ما يكون مميز على طول.
+    بيشيل UNIQUE من عمود الرقم (إعادة بناء الجدول بأمان) ويعمل نسخة احتياطية قبلها."""
+    if using_pg():
+        with db() as c: c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_invoice_daily_no ON invoices(kind, inv_date, number)")
+        return
+    con = raw_db()
+    try:
+        sql = con.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='invoices'").fetchone()[0]
+        if "number TEXT UNIQUE" in sql:
+            try:
+                dest = sqlite3.connect(os.path.join(APP_DATA_DIR, "warehouse_before_daily_numbering.db")); con.backup(dest); dest.close()
+            except Exception: pass
+            cols = ",".join(r[1] for r in con.execute("PRAGMA table_info(invoices)"))
+            con.execute("PRAGMA foreign_keys=OFF")
+            con.execute("BEGIN")
+            con.execute(sql.replace("CREATE TABLE invoices", "CREATE TABLE invoices_new", 1).replace("CREATE TABLE IF NOT EXISTS invoices", "CREATE TABLE invoices_new", 1).replace("number TEXT UNIQUE", "number TEXT", 1))
+            con.execute(f"INSERT INTO invoices_new({cols}) SELECT {cols} FROM invoices")
+            con.execute("DROP TABLE invoices")
+            con.execute("ALTER TABLE invoices_new RENAME TO invoices")
+            con.execute("COMMIT")
+            con.execute("PRAGMA foreign_keys=ON")
+        con.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_invoice_daily_no ON invoices(kind, inv_date, number)")
+        con.commit()
+    except Exception:
+        try: con.execute("ROLLBACK")
+        except Exception: pass
+        raise
+    finally:
+        con.close()
+
+def fmt(n):
+    return f"{float(n or 0):,.2f}"
+
+def esc(s):
+    return str(s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+def check_date(s):
+    return date.fromisoformat(s.strip()).isoformat()
+
+def open_file(path):
+    try: os.startfile(path)
+    except Exception: webbrowser.open("file:///" + path.replace("\\", "/"))
+
+def _long_path(p):
+    """ويندوز ساعات بيدّي مسار الـ Temp مختصر (زي PCSTOR~1) والمتصفح مبيعرفش يكتب فيه → نرجّعه للمسار الكامل."""
+    if os.name != "nt": return p
+    try:
+        import ctypes
+        buf = ctypes.create_unicode_buffer(1024)
+        if ctypes.windll.kernel32.GetLongPathNameW(p, buf, 1024): return buf.value
+    except Exception: pass
+    return p
+
+def _pdf_workdir():
+    """فولدر شغل للـ PDF: مسار كامل (مش مختصر) ومن غير حروف عربي، علشان Edge/Chrome يعرفوا يكتبوا فيه."""
+    import tempfile
+    cands = [os.path.join(os.path.dirname(PRINT_DIR), "pdfwork"), os.path.join(_long_path(tempfile.gettempdir()), "WarehouseOnlinePDF")]
+    if os.name == "nt": cands.append(os.path.join(os.environ.get("SystemDrive", "C:") + "\\", "WarehouseOnlinePDF"))
+    for d in cands:
+        try:
+            if "~" in d or not d.isascii(): continue
+            os.makedirs(d, exist_ok=True)
+            t = os.path.join(d, "w.tmp"); open(t, "w").close(); os.remove(t)
+            return d
+        except Exception: continue
+    return _long_path(tempfile.mkdtemp(prefix="whpdf"))
+
+_PDF_OK_EXE = None
+
+def _kill_tree(pr):
+    """بيقفل المتصفح وكل اللي فتحه (لو فتح شباك ظاهر)."""
+    import subprocess
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(pr.pid)], capture_output=True, timeout=10, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        else: pr.kill()
+    except Exception: pass
+    try: pr.wait(timeout=5)
+    except Exception: pass
+
+def html_to_pdf(html_path, pdf_path):
+    """بيحوّل صفحة HTML لـ PDF بمتصفح Edge/Chrome اللي على الجهاز (من غير ما يفتح). بيرجع True لو نجح."""
+    import subprocess, shutil, pathlib, uuid
+    cands = [os.path.join(os.environ.get(v, ""), *p) for v in ("ProgramFiles(x86)", "ProgramFiles", "LOCALAPPDATA")
+             for p in (("Microsoft", "Edge", "Application", "msedge.exe"), ("Google", "Chrome", "Application", "chrome.exe"))]
+    cands += [shutil.which(x) or "" for x in ("msedge", "chrome", "google-chrome", "chromium", "chromium-browser")]
+    work = _pdf_workdir(); tag = uuid.uuid4().hex[:8]
+    src = os.path.join(work, f"page_{tag}.html"); out = os.path.join(work, f"out_{tag}.pdf")
+    shutil.copyfile(html_path, src)
+    url = pathlib.Path(src).resolve().as_uri()
+    errs = []
+    global _PDF_OK_EXE
+    order = list(dict.fromkeys(cands))
+    if _PDF_OK_EXE in order: order.remove(_PDF_OK_EXE); order.insert(0, _PDF_OK_EXE)   # المتصفح اللي نجح قبل كده الأول
+    nowin = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        for exe in order:
+            if not exe or not os.path.exists(exe): continue
+            prof = os.path.join(work, "prof_" + ("edge" if "edge" in exe.lower() else "chrome"))   # بروفايل ثابت لكل متصفح (أسرع وميطلعش رسايل)
+            # «--headless» الأول: بيشتغل على النسخ القديمة والجديدة. «--headless=new» على كروم قديم كان بيفتح شباك عادي
+            # فيه الصفحة (الفاتورتين تحت بعض) ويفضل مستني لحد ما تقفله — وده اللي كان بيظهر قبل الفاتورة السليمة
+            for mode in ("--headless", "--headless=new"):
+                try:
+                    if os.path.exists(out): os.remove(out)
+                    args = [exe, mode, "--disable-gpu", "--no-first-run", "--no-default-browser-check", "--disable-extensions",
+                            "--no-pdf-header-footer", "--print-to-pdf-no-header", f"--user-data-dir={prof}", f"--print-to-pdf={out}", url]
+                    if os.name != "nt": args.insert(1, "--no-sandbox")
+                    pr = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=nowin)
+                    try: _o, err = pr.communicate(timeout=30)
+                    except subprocess.TimeoutExpired:          # فتح شباك بدل ما يشتغل في الخلفية → نقفله ونجرب غيره
+                        _kill_tree(pr); errs.append(f"{os.path.basename(exe)} {mode}: timeout"); break
+                    if os.path.exists(out) and os.path.getsize(out) > 500:
+                        shutil.copyfile(out, pdf_path); _PDF_OK_EXE = exe; return True
+                    errs.append(f"{os.path.basename(exe)} {mode}: rc={pr.returncode} {(err or b'')[-200:]!r}")
+                except Exception as e: errs.append(f"{os.path.basename(exe)} {mode}: {e!r}")
+        if errs: write_error_log("PDF: " + work + " | " + " | ".join(errs)[:1500])
+        else: write_error_log("PDF: مفيش Edge ولا Chrome على الجهاز")
+        return False
+    finally:
+        for p in (src, out):
+            try: os.remove(p)
+            except Exception: pass
+
+def sumatra_path():
+    """SumatraPDF اللي جاي مع البرنامج (بيفتح شاشة الطباعة بتاعة ويندوز على طول)."""
+    base = os.path.dirname(sys.executable if getattr(sys, "frozen", False) else os.path.abspath(__file__))
+    for p in (os.path.join(base, "SumatraPDF.exe"), os.path.join(base, "tools", "SumatraPDF.exe")):
+        if os.path.exists(p): return p
+    return None
+
+def _clean_print_dir(max_age=86400):
+    """بيمسح ملفات الطباعة اللي عدّى عليها يوم (اللي مفتوح منها ويندوز مش هيسمح بمسحه فبنسيبه)."""
+    try:
+        now = time.time()
+        for f in os.listdir(PRINT_DIR):
+            fp = os.path.join(PRINT_DIR, f)
+            if f.lower().endswith((".pdf", ".html")) and os.path.isfile(fp) and now - os.path.getmtime(fp) > max_age:
+                try: os.remove(fp)
+                except OSError: pass
+    except Exception: pass
+
+def print_page(html_path, on_done=None):
+    """الطباعة: بيعمل PDF على قد الورقة، وبيفتح شاشة الطباعة بتاعة ويندوز على طول (من غير المتصفح).
+    لو مفيش SumatraPDF: بيفتح الـ PDF، ولو مفيش Edge/Chrome: بيفتح الصفحة في المتصفح. بيشتغل في الخلفية علشان البرنامج ميهنّجش."""
+    import subprocess
+    pdf_cap = getattr(_TLS, "pdf_out", None)
+    if pdf_cap is not None:                   # زرار «PDF»: مش بنطبع، بنرجّع الصفحة علشان تتحول PDF على سطح المكتب
+        pdf_cap.append(html_path)
+        if on_done:
+            try: on_done("pdf")
+            except Exception: pass
+        return
+    cap = getattr(_TLS, "capture_print", None)
+    if cap is not None:                       # من الموقع: الصفحة بترجع للمتصفح وهو اللي يطبع (مش على جهاز المخزن)
+        cap.append(html_path)
+        if on_done:
+            try: on_done("web")
+            except Exception: pass
+        return
+    def work():
+        # اسم جديد لكل طباعة: لو نفس الفاتورة اتطبعت قبل كده (وبعدين اتعدلت) والـ PDF القديم لسه مفتوح/مقفول على الجهاز،
+        # ويندوز مش بيسمح نكتب فوقه فالطباعة كانت بتقف — دلوقتي كل مرة ملف لوحده، والقديم بيتمسح بعد يوم
+        pdf = os.path.splitext(html_path)[0] + datetime.now().strftime("_%H%M%S%f") + ".pdf"
+        _clean_print_dir()
+        how = "html"
+        try:
+            if html_to_pdf(html_path, pdf):
+                sp = sumatra_path()
+                if sp:
+                    subprocess.Popen([sp, "-print-dialog", "-exit-when-done", "-appdata", PRINT_DIR, pdf],
+                                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)); how = "dialog"
+                else: open_file(pdf); how = "pdf"
+            else: open_file(html_path)
+        except Exception as e:
+            write_error_log("print: " + repr(e)); open_file(html_path)
+        if on_done:
+            try: on_done(how)
+            except Exception: pass
+    threading.Thread(target=work, daemon=True).start()
+
+class InvoiceInputError(ValueError):
+    """غلط في بيانات الفاتورة (قبل الحفظ). warn=True = تنبيه مش خطأ."""
+    def __init__(self, msg, title="خطأ", warn=False):
+        super().__init__(msg); self.title = title; self.warn = warn
+
+def _f(x, default=0.0):
+    x = ("" if x is None else str(x)).strip().translate(_AR_DIGITS).replace(",", "")
+    return float(x) if x else default
+
+def prepare_invoice(kind, lines, party, number, inv_date, due, discount, paid, pay_type, notes, rep_id, edit_id=None):
+    """بيراجع بيانات الفاتورة ويجهزها للحفظ (نفس القواعد للشاشة القديمة والجديدة). بيرمي InvoiceInputError."""
+    if not lines: raise InvoiceInputError("أضف صنفًا واحدًا على الأقل", "تنبيه", True)
+    if not party: raise InvoiceInputError("اختر العميل أو المورد", "تنبيه", True)
+    total = sum(float(l["qty"]) * float(l["price"]) for l in lines)
+    try: discount = _f(discount); paid = _f(paid)
+    except ValueError: raise InvoiceInputError("الخصم والمدفوع يجب أن يكونا أرقامًا")
+    if discount < 0 or discount > total: raise InvoiceInputError("الخصم يجب أن يكون بين صفر وإجمالي الفاتورة")
+    net = total - discount
+    number = (number or "").strip()
+    pay_type = pay_type if kind in PAYTYPE_KINDS else None
+    if pay_type == "نقدي": paid = net
+    if paid < 0 or paid > net + 0.005: raise InvoiceInputError("المبلغ المدفوع يجب أن يكون بين صفر وصافي الفاتورة")
+    try: inv_date = check_date(inv_date)
+    except ValueError: raise InvoiceInputError("صيغة التاريخ غير صحيحة (YYYY-MM-DD)")
+    if not number: number = next_no(kind, inv_date)
+    due = (due or "").strip()
+    if due:
+        try: due = check_date(due)
+        except ValueError: raise InvoiceInputError("صيغة تاريخ الاستحقاق غير صحيحة")
+        if due < inv_date: raise InvoiceInputError("تاريخ الاستحقاق لازم يكون نفس تاريخ الفاتورة أو بعده")
+        if due == inv_date: due = ""
+    old_date = None
+    if edit_id:
+        with db() as c:
+            o = c.execute("SELECT inv_date FROM invoices WHERE id=?", (edit_id,)).fetchone(); old_date = o[0] if o else None
+    msg = check_locked(inv_date, old_date)
+    if msg: raise InvoiceInputError(msg, "الشهر مقفول")
+    msg = check_day(inv_date, old_date)
+    if msg: raise InvoiceInputError(msg, "اليوم مقفول")
+    return dict(kind=kind, lines=[dict(l) for l in lines], party=party, number=number, inv_date=inv_date, due=due or None, discount=discount,
+                paid=paid, net=net, pay_type=pay_type, notes=(notes or "").strip(), rep_id=rep_id if kind == "مبيعات" else None, edit_id=edit_id)
+
+def _q(x):
+    x = float(x or 0); return fmt(x).replace(".00", "") if abs(x - round(x)) < 1e-9 else fmt(x)
+
+def _edit_changes(c, old_head, new_head, old_lines, new_lines):
+    """وصف اللي اتغير في الفاتورة (السطور قبل وبعد: الصنف والكمية والسعر + التاريخ والعميل) لسجل النشاط."""
+    out = []
+    if old_head[0] != new_head[0]: out.append(f"التاريخ: كان {old_head[0]} — بقى {new_head[0]}")
+    if old_head[1] != new_head[1]:
+        nm = lambda pid: (c.execute("SELECT name FROM parties WHERE id=?", (pid,)).fetchone() or ["؟"])[0]
+        out.append(f"العميل/المورد: كان {nm(old_head[1])} — بقى {nm(new_head[1])}")
+    def group(ls, nk):
+        g = {}
+        for l in ls:
+            k = l["item_id"]; e = g.setdefault(k, {"name": l[nk], "rows": []}); e["rows"].append((float(l["qty"] or 0), float(l["price"] or 0)))
+        return g
+    txt = lambda rows: " + ".join(f"{_q(q)} × {_q(p)}" for q, p in rows)
+    o, n = group(old_lines, "item_name"), group(new_lines, "name")
+    ch = []
+    for k, e in o.items():
+        if k not in n: ch.append(f"❌ اتشال: {e['name']} ({txt(e['rows'])})")
+        elif sorted(e["rows"]) != sorted(n[k]["rows"]): ch.append(f"✏️ {e['name']}: كان {txt(e['rows'])} — بقى {txt(n[k]['rows'])}")
+    for k, e in n.items():
+        if k not in o: ch.append(f"➕ اتضاف: {e['name']} ({txt(e['rows'])})")
+    out += ch
+    if not ch: out.append("الأصناف والكميات والأسعار ما اتغيرتش")
+    return " — اللي اتغير: " + " • ".join(out)
+
+def persist_invoice(d, override=False, auto_no=False):
+    """بيحفظ الفاتورة (جديدة أو تعديل) في قاعدة البيانات. بيرجع (inv_id, number).
+    بيرمي CreditLimitExceeded / NegativeStock / DBIntegrityError زي ما هي علشان الشاشة تسأل عن كلمة سر المالك."""
+    kind, edit_id, number, inv_date, party = d["kind"], d["edit_id"], d["number"], d["inv_date"], d["party"]
+    discount, paid, net, pay_type, due, rep_id, notes, lines = d["discount"], d["paid"], d["net"], d["pay_type"], d["due"], d["rep_id"], d["notes"], d["lines"]
+    with db() as c:
+        db_lock(c)   # جهاز واحد بس يحفظ فاتورة في اللحظة دي (على السيرفر)
+        if auto_no and c.execute("SELECT 1 FROM invoices WHERE kind=? AND inv_date=? AND number=?", (kind, inv_date, number)).fetchone():
+            number = next_no(kind, inv_date)   # الرقم اتاخد من جهاز تاني: ناخد اللي بعده
+        before_bal = party_balance(c, party, None)
+        old_items = []; renum = False; by_item = 1; old_comm = {}
+        if rep_id:
+            _er = c.execute("SELECT COALESCE(commission,0), COALESCE(comm_unit,'') FROM employees WHERE id=?", (rep_id,)).fetchone()
+            rate = float(_er[0] or 0); runit = _er[1] or "شيكارة"
+        else: rate = 0.0; runit = ""
+        if edit_id:
+            old = c.execute("SELECT * FROM invoices WHERE id=?", (edit_id,)).fetchone()
+            if old["rep_id"] == rep_id:
+                rate = float(old["rep_rate"] or 0); runit = old["rep_unit"] or ("شيكارة" if rep_id else "")   # العمولة القديمة تفضل زي ما هي
+                by_item = int(old["comm_by_item"] or 0)       # فاتورة قديمة (عمولة المندوب) تفضل على نظامها
+                old_comm = {r[0]: r[1] for r in c.execute("SELECT item_id, comm FROM invoice_lines WHERE invoice_id=? AND comm IS NOT NULL", (edit_id,)).fetchall()}
+            old_items = [r[0] for r in c.execute("SELECT DISTINCT item_id FROM invoice_lines WHERE invoice_id=?", (edit_id,))]
+            old_total = c.execute(f"SELECT {NET_SQL} FROM invoices i WHERE i.id=?", (edit_id,)).fetchone()[0]
+            old_lines = [dict(r) for r in c.execute("SELECT item_id,item_name,qty,price FROM invoice_lines WHERE invoice_id=? ORDER BY id", (edit_id,)).fetchall()]
+            old_head = (old["inv_date"], old["party_id"])
+            if old["inv_date"] != inv_date and str(number).strip() == str(old["number"] or "").strip() and 0 < num_of(number) < DAILY_START_LIMIT:
+                # الفاتورة اتنقلت ليوم تاني ورقمها زي ما هو: تاخد رقم من عدّاد اليوم الجديد. قبل كده كانت بتفضل برقم
+                # اليوم القديم (مثلًا 29) فعدّاد اليوم الجديد كان بيقفز ويكمّل منه (1 وبعدها 30)
+                number = next_no(kind, inv_date); renum = True
+            created = old["created_at"]
+            if old["party_id"] != party: before_bal = party_balance(c, party, None)
+            c.execute("UPDATE invoices SET comm_by_item=? WHERE id=?", (by_item, edit_id))
+            c.execute("UPDATE invoices SET number=?,inv_date=?,party_id=?,notes=?,discount=?,rep_id=?,rep_rate=?,rep_unit=?,pay_type=?,due_date=? WHERE id=?",
+                      (number, inv_date, party, notes, discount, rep_id, rate, runit, pay_type, due, edit_id))
+            c.execute("DELETE FROM invoice_lines WHERE invoice_id=?", (edit_id,))
+            c.execute("DELETE FROM payments WHERE invoice_id=?", (edit_id,))
+            inv_id = edit_id
+        else:
+            created = now_ts()
+            cur = c.execute("INSERT INTO invoices(number,kind,inv_date,party_id,notes,discount,rep_id,rep_rate,rep_unit,pay_type,due_date,created_at,comm_by_item) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,1)",
+                            (number, kind, inv_date, party, notes, discount, rep_id, rate, runit, pay_type, due, created))
+            inv_id = cur.lastrowid
+        if auto_no or renum: bump_counter(c, kind, number, inv_date)   # الرقم المكتوب باليد مبيحرّكش العدّاد
+        for l in lines:
+            cm = None
+            if kind == "مبيعات":   # عمولة الصنف وقت الفاتورة (في التعديل: نفس العمولة القديمة للصنف لو كان موجود)
+                cm = old_comm.get(l["item_id"])
+                if cm is None:
+                    r_ = c.execute("SELECT comm FROM items WHERE id=?", (l["item_id"],)).fetchone() if l["item_id"] else None
+                    cm = float(r_[0]) if r_ and r_[0] is not None else 1.0
+            c.execute("INSERT INTO invoice_lines(invoice_id,item_id,item_name,unit,qty,price,damaged,comm) VALUES(?,?,?,?,?,?,?,?)", (inv_id, l["item_id"], l["name"], l["unit"], l["qty"], l["price"], l.get("damaged", 0) if kind == "مرتجع مبيعات" else 0, cm))
+        if paid > 0:
+            c.execute("INSERT INTO payments(party_id,pay_date,kind,amount,notes,invoice_id,rep_id,created_at) VALUES(?,?,?,?,?,?,?,?)", (party, inv_date, PAID_KIND[kind], paid, f"دفعة مع الفاتورة رقم {number}", inv_id, rep_id, created))
+        check_stock(c, set(old_items) | {l["item_id"] for l in lines})
+        # الحد الائتماني: يتقفل لو الرصيد بعد الفاتورة هيعدّي الحد (وزاد عن قبلها)
+        if kind == "مبيعات":
+            p = c.execute("SELECT name,COALESCE(credit_limit,0) lim FROM parties WHERE id=?", (party,)).fetchone()
+            after_bal = party_balance(c, party, None)
+            if p["lim"] > 0 and after_bal > p["lim"] + 0.005 and after_bal > before_bal + 0.005:
+                if not override: raise CreditLimitExceeded(p["name"], float(p["lim"]), before_bal, after_bal)
+                log(c, "تجاوز الحد الائتماني", f"{p['name']}: الحد {fmt(p['lim'])} — الرصيد بعد الفاتورة {fmt(after_bal)} (فاتورة {number}) — تم الفتح بكلمة سر المالك ({override})")
+        rep_txt = f" — المندوب: {rep_name_of(c, rep_id)}" if kind == "مبيعات" else ""
+        if pay_type: rep_txt += f" — {pay_type}"
+        if due: rep_txt += f" — الاستحقاق {due}"
+        nd = sum(1 for l in lines if l.get("damaged"))
+        if kind == "مرتجع مبيعات" and nd: rep_txt += f" — منها {nd} صنف هالك"
+        if edit_id: log(c, "تعديل فاتورة", f"{kind} رقم {number}: الصافي {fmt(old_total)}←{fmt(net)}" + rep_txt + _edit_changes(c, old_head, (inv_date, party), old_lines, lines))
+        else: log(c, "إضافة فاتورة", f"{kind} رقم {number} بصافي {fmt(net)}" + (f" ومدفوع {fmt(paid)}" if paid else "") + rep_txt)
+    return inv_id, number
+
+class ImportProblem(ValueError): pass
+class ImportNeedsConfirm(ValueError): pass
+
+def import_found_date(path, what):
+    """بيقرا الملف ويرجع (rows, hr, cols, التاريخ اللي مكتوب في عنوانه لو فيه)."""
+    if path.lower().endswith(".xls"):
+        raise ImportProblem("الملف ده بصيغة Excel القديمة (.xls).\nافتحه في Excel واعمل «حفظ باسم» واختار «Excel Workbook (.xlsx)» وبعدين استورده.")
+    try: rows = read_xlsx(path)
+    except Exception as e: raise ImportProblem(f"تعذّر قراءة الملف:\n{e}\n\nتأكد إنه ملف Excel ‎.xlsx‎ ومش مفتوح بباسورد.")
+    hr, cols = map_import_header(rows, what)
+    found = None
+    for row in rows[:(hr or 0) + 1]:
+        for cell in row:
+            for y, mth, d in re.findall(r"(20\d\d)[/\-.](\d{1,2})[/\-.](\d{1,2})", str(cell or "")): found = f"{y}-{int(mth):02d}-{int(d):02d}"
+    return rows, hr, cols, found
+
+def import_plan(what, path, asof):
+    """خطة الاستيراد + رسالة الملخص (من غير ما يغيّر حاجة). نفس قواعد السيستم القديم."""
+    title = "استيراد أصناف" if what == "items" else "استيراد عملاء وموردين"
+    rows, hr, cols, _ = import_found_date(path, what)
+    if hr is None:
+        need = "«اسم الصنف»" if what == "items" else "«الاسم»"
+        raise ImportProblem(f"مش لاقي صف العناوين في الملف.\nلازم يكون فيه عمود عنوانه {need}.")
+    from types import SimpleNamespace
+    self = SimpleNamespace(_import_special=None)
+    plan, warns = (App._plan_items if what == "items" else App._plan_parties)(self, rows[hr + 1:], cols, hr + 2)
+    sp = self._import_special if what == "parties" else None
+    if not plan and not (sp and (sp["cash"] or sp["sub"])): raise ImportProblem("مفيش صفوف صالحة للاستيراد في الملف." + ("\n\n" + "\n".join(warns[:12]) if warns else ""))
+    new = sum(1 for p in plan if p["id"] is None); upd = len(plan) - new
+    labels = {"acct": "رقم الحساب", "code": "الكود", "name": "الاسم", "unit": "الوحدة", "buy": "سعر الشراء", "sell": "سعر البيع", "min": "حد أدنى", "qty": "رصيد أول المدة",
+              "kind": "النوع", "debit": "مدين", "credit": "دائن", "opening": "الرصيد الافتتاحي", "phone": "الهاتف", "address": "العنوان", "rep": "المندوب", "limit": "الحد الائتماني"}
+    msg = (f"الأعمدة اللي اتعرفت: {'، '.join(labels[k] for k in cols)}\n"
+           + (f"📅 الأرصدة لحد {asof}: اللي في البرنامج بعد التاريخ ده بيتحسب فوقها، واللي قبله مش بيتكرر\n\n" if asof else "\n")
+           + f"هيتضاف: {new}\nهيتعدّل (موجود قبل كده بنفس {'الكود أو الاسم' if what == 'items' else 'الاسم'}): {upd}\n")
+    if what == "items":
+        msg += ("إجمالي أرصدة الملف: " if asof else "إجمالي رصيد أول المدة: ") + f"{fmt(sum(p['f'].get('opening_qty', 0) for p in plan))}\n"
+    else:
+        msg += ("إجمالي أرصدة الملف: " if asof else "إجمالي الأرصدة الافتتاحية: ") + f"{fmt(sum(p['f'].get('opening', 0) for p in plan))}\n"
+    if sp:
+        if sp["cash"]: msg += f"\n💵 «{sp['cash'][0]}» ← رصيد الخزنة (رصيد أول المدة) = {fmt(sp['cash'][1])}"
+        if sp["sub"]: msg += f"\n🗃 «{sp['sub'][0]}» ← رصيد الصندوق الفرعي = {fmt(sp['sub'][1])}"
+        if sp["skipped"]: msg += f"\n⏭ اتجاهل {len(sp['skipped'])} حساب مش عميل ولا مورد (مصروفات / مشتريات / مبيعات): " + "، ".join(sp["skipped"][:5]) + ("..." if len(sp["skipped"]) > 5 else "")
+        msg += "\n"
+    if warns: msg += f"\nملاحظات ({len(warns)}):\n" + "\n".join(warns[:12]) + ("\n..." if len(warns) > 12 else "")
+    # اللي موجود في البرنامج ومش موجود في الملف (بيتمسح في وضع الاستبدال)
+    in_file = {p["id"] for p in plan if p["id"] is not None}
+    with db() as c:
+        if what == "items":
+            others = c.execute("SELECT id,name,(SELECT COUNT(*) FROM invoice_lines WHERE item_id=items.id)+(SELECT COUNT(*) FROM damaged WHERE item_id=items.id) used FROM items").fetchall()
+        else:
+            others = c.execute("SELECT id,name,(SELECT COUNT(*) FROM invoices WHERE party_id=parties.id)+(SELECT COUNT(*) FROM payments WHERE party_id=parties.id) used FROM parties").fetchall()
+    others = [r for r in others if r["id"] not in in_file and not (sp and r["id"] in sp["drop"])]
+    del_ids = [r["id"] for r in others if not r["used"]]; keep = [r for r in others if r["used"]]
+    noun = "صنف" if what == "items" else "عميل/مورد"
+    msg += (f"\n\nموجود في البرنامج ومش موجود في الملف: {len(others)} {noun}"
+            + (f"\n  • هيتمسح منهم: {len(del_ids)}" if del_ids else "")
+            + (f"\n  • ليهم فواتير أو سندات فمش هيتمسحوا ({len(keep)}) — {'رصيد أول المدة' if what == 'items' else 'الرصيد الافتتاحي'} بتاعهم هيبقى صفر: "
+               + "، ".join(r["name"] for r in keep[:6]) + ("..." if len(keep) > 6 else "") if keep else ""))
+    msg += ("\n\nهيتاخد نسخة احتياطية قبل أي تغيير.\n\n"
+            "«نعم» = استبدال: البرنامج ياخد اللي في الملف بس ويمسح القديم\n"
+            "«لا» = إضافة وتحديث بس: اللي مش في الملف يفضل زي ما هو")
+    return dict(what=what, path=path, asof=asof, title=title, plan=plan, warns=warns, sp=sp, new=new, upd=upd, del_ids=del_ids, keep=keep, msg=msg)
+
+def import_apply(ctx, replace, force_no_backup=False):
+    """تنفيذ الاستيراد (بعد نسخة احتياطية). بيرجع رسالة النتيجة."""
+    what, path, asof, title, plan, sp = ctx["what"], ctx["path"], ctx["asof"], ctx["title"], ctx["plan"], ctx["sp"]
+    new, upd, del_ids, keep = ctx["new"], ctx["upd"], ctx["del_ids"], ctx["keep"]
+    try:
+        os.makedirs(LOCAL_BACKUP_DIR, exist_ok=True)
+        bk = os.path.join(LOCAL_BACKUP_DIR, f"warehouse_before_import_{datetime.now().strftime('%Y-%m-%d_%H%M%S')}.db")
+        src = raw_db(); dest = sqlite3.connect(bk)
+        try: src.backup(dest)
+        finally: dest.close(); src.close()
+    except Exception as e:
+        if not force_no_backup: raise ImportNeedsConfirm(f"تعذّر عمل نسخة احتياطية:\n{e}\n\nتكمّل الاستيراد من غيرها؟")
+    skipped = []; removed = zeroed = 0
+    try:
+        with db() as c:
+            if replace:
+                for i in del_ids: c.execute(f"DELETE FROM {what} WHERE id=?", (i,)); removed += 1
+                for r in keep:
+                    if what == "items":
+                        old = c.execute("SELECT opening_qty FROM items WHERE id=?", (r["id"],)).fetchone()[0]
+                        c.execute("UPDATE items SET opening_qty=0 WHERE id=?", (r["id"],))
+                        try: check_stock(c, [r["id"]]); zeroed += 1
+                        except ValueError:
+                            c.execute("UPDATE items SET opening_qty=? WHERE id=?", (old, r["id"]))
+                            skipped.append(f"«{r['name']}»: رصيد أول المدة ماتصفّرش (هيخلّي الرصيد بالسالب)")
+                    else:
+                        c.execute("UPDATE parties SET opening=0 WHERE id=?", (r["id"],)); zeroed += 1
+            for p in plan:
+                f = {**p.get("blank", {}), **p["f"]} if replace and p["id"] is not None else p["f"]
+                if asof and p["id"] is not None:
+                    f = dict(f)
+                    if what == "items" and "opening_qty" in f:
+                        op = float(c.execute("SELECT COALESCE(opening_qty,0) FROM items WHERE id=?", (p["id"],)).fetchone()[0] or 0)
+                        f["opening_qty"] = round(f["opening_qty"] - (stock_of(c, p["id"], asof) - op), 4)
+                    elif what == "parties" and "opening" in f:
+                        op = float(c.execute("SELECT COALESCE(opening,0) FROM parties WHERE id=?", (p["id"],)).fetchone()[0] or 0)
+                        f["opening"] = round(f["opening"] - (party_balance(c, p["id"], asof) - op), 2)
+                if p["id"] is None:
+                    keys = list(f); c.execute(f"INSERT INTO {what}({','.join(keys)}) VALUES({','.join('?' * len(keys))})", [f[k] for k in keys])
+                else:
+                    if what == "items" and "opening_qty" in f:
+                        old = c.execute("SELECT opening_qty FROM items WHERE id=?", (p["id"],)).fetchone()[0]
+                        c.execute("UPDATE items SET opening_qty=? WHERE id=?", (f["opening_qty"], p["id"]))
+                        try: check_stock(c, [p["id"]])
+                        except ValueError:
+                            c.execute("UPDATE items SET opening_qty=? WHERE id=?", (old, p["id"])); f = {k: v for k, v in f.items() if k != "opening_qty"}
+                            skipped.append(f"«{p['label']}»: رصيد أول المدة ماتغيّرش (هيخلّي الرصيد بالسالب)")
+                    if f: c.execute(f"UPDATE {what} SET {','.join(k + '=?' for k in f)} WHERE id=?", [*f.values(), p["id"]])
+            if sp:
+                for i in set(sp["drop"]):     # صناديق/حسابات كانت اتسجلت غلط كعملاء قبل كده
+                    if not c.execute("SELECT (SELECT COUNT(*) FROM invoices WHERE party_id=?)+(SELECT COUNT(*) FROM payments WHERE party_id=?)", (i, i)).fetchone()[0]:
+                        c.execute("DELETE FROM parties WHERE id=?", (i,))
+                if sp["cash"]:
+                    mv = sum(m[5] - m[6] for m in treasury_moves(c) if m[0] <= asof) if asof else 0.0
+                    c.execute("UPDATE settings SET cash_opening=? WHERE id=1", (round(sp["cash"][1] - mv, 2),))
+                    log(c, "رصيد أول المدة الخزنة", f"{fmt(sp['cash'][1])} (من استيراد Excel)")
+                if sp["sub"]:
+                    c.execute("DELETE FROM sub_cash WHERE notes=?", (SUBCASH_IMPORT_NOTE,))
+                    v = sp["sub"][1]
+                    if asof:
+                        v -= float(c.execute("SELECT COALESCE(SUM(CASE WHEN kind='إيداع' THEN amount ELSE -amount END),0) FROM sub_cash WHERE m_date<=?", (asof,)).fetchone()[0])
+                    if abs(v) > 0.004:
+                        c.execute("INSERT INTO sub_cash(m_date,created_at,kind,amount,notes) VALUES(?,?,?,?,?)",
+                                  (asof or date.today().isoformat(), now_ts(), "إيداع" if v > 0 else "سحب", abs(v), SUBCASH_IMPORT_NOTE))
+                    log(c, "الصندوق الفرعي", f"رصيد افتتاحي {fmt(v)} (من استيراد Excel)")
+            log(c, title + " من Excel" + (" (استبدال)" if replace else ""), f"{os.path.basename(path)}: {new} جديد، {upd} تعديل" + (f"، {removed} اتمسح، {zeroed} اتصفّر رصيدهم" if replace else ""))
+    except DBIntegrityError as e:
+        raise ImportProblem(f"الاستيراد اتلغى ومفيش حاجة اتغيرت:\n{e}\n(غالبًا كود صنف متكرر)")
+    done = f"تم الاستيراد: {new} جديد، {upd} تعديل."
+    if sp and sp["cash"]: done += f"\nرصيد الخزنة: {fmt(sp['cash'][1])}"
+    if sp and sp["sub"]: done += f"\nالصندوق الفرعي: {fmt(sp['sub'][1])}" + (f"\nاتمسح {removed} مش موجودين في الملف" + (f"، و{zeroed} اتصفّر رصيدهم علشان ليهم حركة." if zeroed else ".") if replace else "")
+    if skipped: done += "\n\n" + "\n".join(skipped[:10])
+    return done
+
+def party_label(p):
+    """اسم العميل/المورد في القوائم: يضم الفرع/العنوان والهاتف عشان نفرّق بين الأسماء المتشابهة."""
+    s = f'{p["id"]} - {p["name"]}'
+    if p["address"]: s += f' — {p["address"]}'
+    if p["phone"]: s += f' — {p["phone"]}'
+    return s
+
+def item_label(it):
+    s = f'{it["id"]} - {it["name"]}'
+    if it["code"]: s += f' [{it["code"]}]'
+    return s
+
+# ---------------- المستخدمون وكلمات السر ----------------
+CURRENT_USER = {"id": None, "username": "", "role": ""}
+ROLE_OWNER = "المالك"; ROLE_ACC = "محاسب"; ROLE_REP = "مندوب"
+
+def hash_pw(pw, salt=None):
+    salt = salt or secrets.token_hex(16)
+    h = hashlib.pbkdf2_hmac("sha256", pw.encode("utf-8"), bytes.fromhex(salt), 200_000).hex()
+    return h, salt
+
+def check_pw(pw, h, salt):
+    try: return hmac.compare_digest(hash_pw(pw, salt)[0], h)
+    except Exception: return False
+
+def is_owner():
+    if getattr(_TLS, "viewer_only", False): return False          # تقارير تليجرام للمحاسب / لما «المكسب» مقفول
+    return getattr(_TLS, "as_owner", False) or CURRENT_USER.get("role") == ROLE_OWNER   # as_owner: تقارير الخلفية بتاعة المالك
+
+def verify_owner_password(pw):
+    """كلمة سر أي حساب «المالك» (لفتح قفل الحد الائتماني وتغييره)."""
+    if not pw: return None
+    with db() as c:
+        for u in c.execute("SELECT * FROM users WHERE role=? AND active=1", (ROLE_OWNER,)).fetchall():
+            if check_pw(pw, u["pw_hash"], u["salt"]): return u["username"]
+    return None
+
+def log(c, action, details=""):
+    """تسجيل عملية في سجل النشاط (داخل نفس المعاملة) باسم المستخدم الداخل."""
+    try:
+        user = CURRENT_USER.get("username") or ""
+        if not user:
+            u = c.execute("SELECT operator FROM settings WHERE id=1").fetchone()
+            user = (u["operator"] if u else "") or ""
+        c.execute("INSERT INTO audit_log(at,user,action,details) VALUES(?,?,?,?)", (now_ts(), user, action, details))
+    except Exception:
+        pass
+
+# ---------------- المبلغ بالحروف ----------------
+_ONES = ["", "واحد", "اثنان", "ثلاثة", "أربعة", "خمسة", "ستة", "سبعة", "ثمانية", "تسعة", "عشرة",
+         "أحد عشر", "اثنا عشر", "ثلاثة عشر", "أربعة عشر", "خمسة عشر", "ستة عشر", "سبعة عشر", "ثمانية عشر", "تسعة عشر"]
+_TENS = ["", "", "عشرون", "ثلاثون", "أربعون", "خمسون", "ستون", "سبعون", "ثمانون", "تسعون"]
+_HUNDREDS = ["", "مائة", "مائتان", "ثلاثمائة", "أربعمائة", "خمسمائة", "ستمائة", "سبعمائة", "ثمانمائة", "تسعمائة"]
+
+def _below_1000(n):
+    parts = []
+    h, r = divmod(n, 100)
+    if h: parts.append(_HUNDREDS[h])
+    if r:
+        if r < 20: parts.append(_ONES[r])
+        else:
+            t, o = divmod(r, 10)
+            parts.append((_ONES[o] + " و" + _TENS[t]) if o else _TENS[t])
+    return " و".join(parts)
+
+def _scale(n, one, two, few, many):
+    """ألف/ألفان/آلاف… مع العدد."""
+    if n == 1: return one
+    if n == 2: return two
+    if 3 <= n <= 10: return _below_1000(n) + " " + few
+    return _below_1000(n) + " " + many
+
+def int_words(n):
+    if n == 0: return "صفر"
+    groups = []
+    for size, names in ((10**9, ("مليار", "ملياران", "مليارات", "مليار")), (10**6, ("مليون", "مليونان", "ملايين", "مليون")), (1000, ("ألف", "ألفان", "آلاف", "ألف"))):
+        q, n = divmod(n, size)
+        if q: groups.append(_scale(q, *names))
+    if n: groups.append(_below_1000(n))
+    return " و".join(groups)
+
+def money_words(x):
+    x = round(abs(float(x or 0)) + 1e-9, 2)
+    pounds = int(x); pt = int(round((x - pounds) * 100))
+    if pt == 100: pounds += 1; pt = 0
+    def cur(n, one, two, few, many):
+        if n == 1: return one
+        if n == 2: return two
+        r = n % 100
+        if r == 0: return f"{int_words(n)} {one.split()[0]}"   # مائة جنيه، ألف جنيه
+        return f"{int_words(n)} {few if 3 <= r <= 10 else many}"
+    s = cur(pounds, "جنيه واحد", "جنيهان", "جنيهات", "جنيهًا") if pounds else ""
+    if pt:
+        p = cur(pt, "قرش واحد", "قرشان", "قروش", "قرشًا")
+        s = (s + " و" + p) if s else p
+    return "فقط " + (s or "صفر جنيه") + " لا غير"
+
+def num_of(number):
+    try: return int(''.join(ch for ch in str(number or "") if ch.isdigit()))
+    except ValueError: return 0
+
+DAILY_START_LIMIT = 100000   # أرقام النظام القديم (102820…) مش بتدخل في عدّاد اليوم
+
+def next_no(kind, d=None):
+    """رقم الفاتورة يبدأ من 1 كل يوم لكل نوع لوحده (1، 2… وتاني يوم 1 تاني).
+    ومش بيرجع لرقم اتحذفت فاتورته في نفس اليوم."""
+    d = d or date.today().isoformat()
+    with db() as c:
+        used = [num_of(r[0]) for r in c.execute("SELECT number FROM invoices WHERE kind=? AND inv_date=?", (kind, d)).fetchall()]
+        cnt = c.execute("SELECT last FROM counters WHERE kind=?", (f"{kind}|{d}",)).fetchone()
+    # العدّاد بيمشي بالأرقام التلقائية بس: رقم مكتوب باليد (مثلًا 77) مبيخليش اللي بعده 78 — بنعدّيه بس لو وصلناله
+    n = (cnt[0] if cnt else 0) + 1
+    used = set(used)
+    while n in used: n += 1
+    return str(n)   # رقم بس من غير حروف — وكل نوع (مبيعات/مشتريات/مرتجعات) له عدّاده لوحده
+
+def bump_counter(c, kind, number, d):
+    n = num_of(number)
+    if n and n < DAILY_START_LIMIT:
+        c.execute("INSERT INTO counters(kind,last) VALUES(?,?) ON CONFLICT(kind) DO UPDATE SET last=MAX(last,excluded.last)", (f"{kind}|{d}", n))
+
+# ---------------- المناديب ----------------
+def rep_label(r):
+    return f'{r["id"]} - {r["name"]}'
+
+def rep_lookup(c, include_id=None):
+    """قائمة اختيار المندوب: «مكتب» + الموظفين من نوع مندوب (ومعهم المندوب الحالي للسجل لو اتغير نوعه)."""
+    rows = c.execute("SELECT id,name FROM employees WHERE (kind='مندوب' AND COALESCE(active,1)=1) OR id=? ORDER BY name", (include_id or -1,)).fetchall()
+    d = {OFFICE: None}
+    for r in rows: d[rep_label(r)] = r["id"]
+    return d
+
+def rep_commission(c, rep_id, s="0000-00-00", e="9999-12-31"):
+    """(المستحق من العمولة, المصروف منها) لمندوب في فترة. العمولة = الكمية المباعة × عمولة الفاتورة."""
+    earned = float(c.execute(f"SELECT COALESCE(SUM({COMM_AMT_SQL}),0) FROM invoices i WHERE i.kind='مبيعات' AND i.rep_id=? AND COALESCE(NULLIF(i.due_date,''), i.inv_date) BETWEEN ? AND ?", (rep_id, s, e)).fetchone()[0])
+    paid = float(c.execute("SELECT COALESCE(SUM(amount),0) FROM expenses WHERE kind='عمولة' AND employee_id=? AND exp_date BETWEEN ? AND ?", (rep_id, s, e)).fetchone()[0])
+    return earned, paid
+
+def rep_customers_due(c, rep_key):
+    """إجمالي المستحق (الأرصدة الموجبة) على عملاء المندوب. rep_key = 0 للمكتب."""
+    tot = 0.0; n = 0
+    for p in c.execute("SELECT id FROM parties WHERE COALESCE(rep_id,0)=? AND kind<>'مورد' AND kind<>'أصول'", (rep_key,)).fetchall():
+        b = party_balance(c, p["id"]); n += 1
+        if b > 0.005: tot += b
+    return tot, n
+
+def month_bounds(month):
+    y, m = map(int, month.split("-")); first = date(y, m, 1)
+    nxt = date(y + (m == 12), m % 12 + 1, 1)
+    return first.isoformat(), (nxt - timedelta(days=1)).isoformat()
+
+def rep_target(c, rep_id, month):
+    """(التارجت, الوحدة) الساري للشهر ده (آخر تارجت اتحدد في الشهر ده أو قبله)."""
+    r = c.execute("SELECT qty, COALESCE(unit,'') FROM rep_targets WHERE rep_id=? AND month<=? ORDER BY month DESC LIMIT 1", (rep_id, month)).fetchone()
+    return (float(r[0]), r[1] or "شيكارة") if r else (0.0, "طن")
+
+def rep_month_qty(c, rep_id, month):
+    """(شكاير, أطنان) دقيق المباعة في الشهر (للتارجت)."""
+    s, e = month_bounds(month)
+    r = c.execute(f"SELECT COALESCE(SUM({TGT_BAGS_SQL}),0), COALESCE(SUM({TGT_TONS_SQL}),0) FROM invoices i WHERE i.kind='مبيعات' AND i.rep_id=? "
+                  "AND COALESCE(NULLIF(i.due_date,''), i.inv_date) BETWEEN ? AND ?", (rep_id, s, e)).fetchone()
+    return float(r[0]), float(r[1])
+
+def target_rows(c, month):
+    """[(id, الاسم, التارجت, الوحدة, المحقق بنفس الوحدة, شكاير, أطنان)] لكل المناديب الشغالين."""
+    out = []
+    for r in c.execute("SELECT id,name FROM employees WHERE kind='مندوب' AND COALESCE(active,1)=1 ORDER BY name").fetchall():
+        tgt, unit = rep_target(c, r["id"], month); bags, tons = rep_month_qty(c, r["id"], month)
+        out.append((r["id"], r["name"], tgt, unit, tons if unit == "طن" else bags, bags, tons))
+    return out
+
+VEHICLE_KINDS = ("قراءة عداد", "بنزين", "جاز", "صيانة", "زيوت وفلاتر", "كاوتش", "إيجار", "مصروفات أخرى")
+FUEL_KINDS = ("بنزين", "جاز")
+
+def vehicle_summary(c, vid, s, e):
+    """ملخص العربية في فترة: الكيلومترات، الوقود، المصروفات، الاستهلاك وتكلفة الكيلو."""
+    logs = c.execute("SELECT * FROM vehicle_logs WHERE vehicle_id=? AND v_date BETWEEN ? AND ? ORDER BY v_date, id", (vid, s, e)).fetchall()
+    # أول قراءة في الفترة بتتقارن بآخر قراءة قبلها (علشان كيلومترات أول يوم تتحسب)
+    prev = c.execute("SELECT MAX(odometer) FROM vehicle_logs WHERE vehicle_id=? AND v_date<? AND odometer IS NOT NULL", (vid, s)).fetchone()[0]
+    odos = [float(l["odometer"]) for l in logs if l["odometer"] is not None]
+    start = float(prev) if prev is not None else (odos[0] if odos else None)   # أول قراءة بالترتيب (مش أقل قراءة)
+    km = (max(odos) - start) if odos and start is not None else 0.0
+    liters = sum(float(l["liters"] or 0) for l in logs if l["kind"] in FUEL_KINDS)
+    fuel = sum(float(l["amount"] or 0) for l in logs if l["kind"] in FUEL_KINDS)
+    total = sum(float(l["amount"] or 0) for l in logs)
+    by_kind = {}
+    for l in logs: by_kind[l["kind"]] = by_kind.get(l["kind"], 0.0) + float(l["amount"] or 0)
+    return {"logs": logs, "km": max(km, 0.0), "liters": liters, "fuel": fuel, "total": total, "by_kind": by_kind,
+            "km_per_l": (km / liters) if liters > 0 and km > 0 else None,
+            "cost_km": (total / km) if km > 0 else None, "fuel_km": (fuel / km) if km > 0 else None,
+            "last_odo": max(odos) if odos else (float(prev) if prev is not None else None)}
+
+def vehicles_missing_reading(c, day):
+    """العربيات الشغالة اللي مفيش ليها قراءة عداد في اليوم ده."""
+    return [r["name"] for r in c.execute("SELECT name FROM vehicles v WHERE COALESCE(active,1)=1 AND NOT EXISTS "
+                                         "(SELECT 1 FROM vehicle_logs l WHERE l.vehicle_id=v.id AND l.v_date=? AND l.odometer IS NOT NULL) ORDER BY name", (day,)).fetchall()]
+
+def vehicles_day_text(day):
+    with db() as c:
+        vs = c.execute("SELECT id,name FROM vehicles WHERE COALESCE(active,1)=1 ORDER BY name").fetchall()
+        if not vs: return ""
+        lines = []
+        for v in vs:
+            sm = vehicle_summary(c, v["id"], day, day)
+            has = any(l["odometer"] is not None for l in sm["logs"])
+            lines.append(f"• {_e(v['name'])}: " + (f"{fmt(sm['km'])} كم" if has else "⚠️ مفيش قراءة عداد") + (f" — مصروفات {fmt(sm['total'])}" if sm["total"] else ""))
+    return "\n🚚 <b>العربيات النهارده</b>\n" + "\n".join(lines)
+
+def is_loader(kind, job):
+    """الشيال = عامل صفته فيها «شيال»."""
+    j = (job or "").replace("ّ", "")
+    return "شيال" in j or "تشوين" in j
+
+def expected_customers(c, day=None, lookback=150):
+    """العملاء اللي متوقع يطلبوا النهارده (أو متأخرين عن عادتهم) — من تاريخ فواتيرهم.
+    العادة = الوسيط (median) بين آخر الفواتير. العميل لازم يكون ليه 4 أيام شراء على الأقل ونمطه منتظم."""
+    from statistics import median
+    day = day or date.today().isoformat(); d0 = date.fromisoformat(day)
+    since = (d0 - timedelta(days=lookback)).isoformat()
+    rows = c.execute(f"SELECT i.party_id, i.inv_date, SUM({INV_TONS_SQL}) t, SUM({INV_BAGS_SQL}) b, SUM({NET_SQL}) amt FROM invoices i "
+                     "WHERE i.kind='مبيعات' AND i.party_id IS NOT NULL AND i.inv_date BETWEEN ? AND ? GROUP BY i.party_id, i.inv_date ORDER BY i.party_id, i.inv_date",
+                     (since, day)).fetchall()
+    by = {}
+    for r in rows: by.setdefault(r[0], []).append((r[1], float(r[2] or 0), float(r[3] or 0), float(r[4] or 0)))
+    called = {r[0]: r[1] for r in c.execute("SELECT party_id, note FROM followups WHERE f_date=? ORDER BY id", (day,)).fetchall()}
+    parties = {r["id"]: r for r in c.execute("SELECT p.id, p.name, p.phone, p.kind, e.name rep, p.rep_id, p.exp_hidden FROM parties p LEFT JOIN employees e ON e.id=p.rep_id").fetchall()}
+    out = []
+    for pid, days in by.items():
+        p = parties.get(pid)
+        if not p or p["kind"] in ("مورد", "أصول") or len(days) < 4: continue
+        if days[-1][0] == day: continue                         # طلب النهارده خلاص
+        if p["exp_hidden"] and days[-1][0] <= p["exp_hidden"]: continue   # اتشال بالـ ✕ ومشتراش من ساعتها
+        ds = [date.fromisoformat(x[0]) for x in days][-9:]
+        gaps = [(b - a).days for a, b in zip(ds, ds[1:]) if (b - a).days > 0]
+        if len(gaps) < 3: continue
+        g = median(gaps)
+        if g > 30: continue
+        spread = median([abs(x - g) for x in gaps])            # مدى انتظام العميل
+        if spread > max(1.5, g * 0.5): continue
+        last = ds[-1]; expected = last + timedelta(days=round(g)); late = (d0 - expected).days
+        if late < 0 or late > max(14, 3 * g): continue          # لسه بدري — أو بطّل يطلب من مدة طويلة
+        recent = days[-5:]
+        out.append(dict(id=pid, name=p["name"], phone=p["phone"] or "", rep=p["rep"] or "", rep_id=p["rep_id"], every=g, last=last.isoformat(), late=late,
+                        tons=median([x[1] for x in recent]), bags=median([x[2] for x in recent]), amount=median([x[3] for x in recent]),
+                        called=pid in called, note=called.get(pid, "")))
+    out.sort(key=lambda x: (x["called"], -x["late"], x["name"]))
+    return out
+
+def expected_text(rep_id=None):
+    with db() as c: rows = [r for r in expected_customers(c) if not r["called"] and (rep_id is None or r["rep_id"] == rep_id)]
+    if not rows: return "✅ مفيش عملاء متوقعين النهارده"
+    out = [f"🔔 <b>عملاء متوقع يطلبوا النهارده ({len(rows)})</b>"]
+    for r in rows[:40]:
+        st = "النهارده" if r["late"] == 0 else f"متأخر {r['late']} يوم"
+        out.append(f"• {_e(r['name'])} — {st} (بيطلب كل {fmt(r['every']).replace('.00', '')} يوم)" + (f" — {_e(r['phone'])}" if r["phone"] else "")
+                   + (f"\n   عادةً {fmt(r['tons'])} طن" if r["tons"] else "") + (f" — المندوب: {_e(r['rep'])}" if r["rep"] and rep_id is None else ""))
+    return "\n".join(out)
+
+def lock_date(c=None):
+    """آخر تاريخ مقفول ('' = مفيش إقفال)."""
+    def get(c):
+        r = c.execute("SELECT COALESCE(lock_until,''), COALESCE(lock_auto,0) FROM settings WHERE id=1").fetchone()
+        d = r[0] or ""
+        if r[1]: d = max(d, (date.today().replace(day=1) - timedelta(days=1)).isoformat())
+        return d
+    if c is not None: return get(c)
+    with db() as cc: return get(cc)
+
+def check_locked(*dates):
+    """لو المستخدم مش المالك وأي تاريخ من دول في فترة مقفولة: بيرجع رسالة الرفض، وإلا None."""
+    if is_owner(): return None
+    ld = lock_date()
+    if ld and any(d and d <= ld for d in dates):
+        return f"🔒 الفترة لحد {ld} مقفولة.\nمحدش يقدر يضيف أو يعدّل أو يحذف فواتير أو سندات بتاريخ فيها غير المالك."
+    return None
+
+DAY_OK = {"until": 0.0}      # بعد باسوورد صح: التعديل في الأيام المقفولة مسموح 10 دقايق
+
+def day_closed(c=None):
+    """آخر يوم اتقفل بزرار «تقفيل اليوم» ('' = مفيش)."""
+    def get(c):
+        try: r = c.execute("SELECT COALESCE(day_closed,'') FROM settings WHERE id=1").fetchone()
+        except Exception: return ""
+        return (r[0] if r else "") or ""
+    if c is not None: return get(c)
+    with db() as cc: return get(cc)
+
+def check_day(*dates):
+    """لو أي تاريخ في يوم اتقفل ومفيش باسوورد اتكتب: بيرجع رسالة، وإلا None."""
+    if time.time() < DAY_OK["until"]: return None
+    dc = day_closed()
+    if dc and any(d and d <= dc for d in dates):
+        return f"🔒 يوم {dc} اتقفل (تقفيل اليوم).\nأي إضافة أو تعديل أو حذف لفواتير أو سندات بتاريخه أو قبله محتاج باسوورد المحاسب أو المالك."
+    return None
+
+def verify_day_password(pw):
+    """كلمة سر أي حساب «محاسب» أو «المالك» شغال — بيرجع اسم المستخدم."""
+    if not pw: return None
+    with db() as c:
+        for u in c.execute("SELECT * FROM users WHERE role IN (?,?) AND active=1", (ROLE_OWNER, ROLE_ACC)).fetchall():
+            if check_pw(pw, u["pw_hash"], u["salt"]): return u["username"]
+    return None
+
+def rep_name_of(c, rep_id):
+    if not rep_id: return OFFICE
+    r = c.execute("SELECT name FROM employees WHERE id=?", (rep_id,)).fetchone()
+    return r["name"] if r else OFFICE
+
+def _bulk(c, key, builder):
+    """على السيرفر: أول مرتين بالطريقة العادية، ومن التالتة الحساب لكل الأصناف/العملاء مرة واحدة (أسرع بكتير على الشبكة)."""
+    if not isinstance(c, PgConn): return None
+    hit = c.cache.get(key)
+    if isinstance(hit, dict): return hit
+    n = (hit or 0) + 1
+    if n < 3: c.cache[key] = n; return None
+    c.cache[key] = m = builder(); return m
+
+def last_dates(c):
+    """آخر تحصيل / آخر دفع / آخر فاتورة لكل العملاء والموردين في 3 استعلامات."""
+    lc = {r[0]: r[1] for r in c.execute("SELECT party_id, MAX(pay_date) FROM payments WHERE kind='تحصيل' GROUP BY party_id").fetchall()}
+    lp = {r[0]: r[1] for r in c.execute("SELECT party_id, MAX(pay_date) FROM payments WHERE kind='دفع' GROUP BY party_id").fetchall()}
+    li = {r[0]: r[1] for r in c.execute("SELECT party_id, MAX(inv_date) FROM invoices WHERE party_id IS NOT NULL GROUP BY party_id").fetchall()}
+    return lc, lp, li
+
+def _stock_bulk(c, upto):
+    return stock_map(c, upto or "9999-12-31")
+
+def _balance_bulk(c, upto):
+    bal = {r[0]: float(r[1] or 0) for r in c.execute("SELECT id, COALESCE(opening,0) FROM parties").fetchall()}
+    cond_i = f" AND {EFFECTIVE_DATE_SQL}<=?" if upto else ""
+    cond_p = " AND pay_date<=?" if upto else ""
+    args = (upto,) if upto else ()
+    for r in c.execute(f"SELECT i.party_id, SUM(CASE WHEN i.kind IN ('مبيعات','مرتجع مشتريات') THEN {NET_SQL} ELSE -{NET_SQL} END) "
+                       f"FROM invoices i WHERE i.party_id IS NOT NULL{cond_i} GROUP BY i.party_id", args).fetchall():
+        if r[0] in bal: bal[r[0]] += float(r[1] or 0)
+    for r in c.execute(f"SELECT party_id, SUM(CASE WHEN kind IN ('تحصيل','خصم مسموح به') THEN -amount ELSE amount END) FROM payments WHERE 1=1{cond_p} GROUP BY party_id", args).fetchall():
+        if r[0] in bal: bal[r[0]] += float(r[1] or 0)
+    return bal
+
+def _avgcost_bulk(c, upto):
+    pur = {r[0]: (float(r[1] or 0), float(r[2] or 0)) for r in c.execute(
+        "SELECT l.item_id, SUM(l.qty), SUM(l.qty*l.price) FROM invoice_lines l JOIN invoices i ON i.id=l.invoice_id "
+        "WHERE i.kind='مشتريات' AND COALESCE(NULLIF(i.due_date,''), i.inv_date)<=? GROUP BY l.item_id", (upto,)).fetchall()}
+    out = {}
+    for r in c.execute("SELECT id, buy_price, COALESCE(opening_qty,0) FROM items").fetchall():
+        bp = float(r[1] or 0); oq = max(float(r[2] or 0), 0.0); q, v = pur.get(r[0], (0.0, 0.0))
+        out[r[0]] = (v + oq * bp) / (q + oq) if q + oq > 1e-9 and q > 1e-9 else bp
+    return out
+
+# ---------- تكلفة البضاعة: الوارد أولًا يُصرف أولًا (FIFO) ----------
+# مثال: اشتريت 100 بـ1000 وبعت 80 (تكلفتهم 1000)، اشتريت 100 بـ1020 وبعت 80 → 20 بـ1000 + 60 بـ1020.
+_FIFO = {"sig": None, "res": None}
+
+def _fifo_sig(c):
+    r = c.execute("SELECT (SELECT COUNT(*) FROM invoice_lines), (SELECT COALESCE(MAX(id),0) FROM invoice_lines), (SELECT COALESCE(SUM(qty*price),0) FROM invoice_lines), "
+                  "(SELECT COUNT(*) FROM damaged), (SELECT COALESCE(SUM(qty),0) FROM damaged), "
+                  "(SELECT COALESCE(SUM(COALESCE(opening_qty,0)*(1+COALESCE(buy_price,0))),0) FROM items), (SELECT COALESCE(MAX(id),0) FROM audit_log), (SELECT COUNT(*) FROM items)").fetchone()
+    return (DB_CFG.get("mode"), DB_CFG.get("host"), DB_CFG.get("dbname"), DB_PATH) + tuple(float(x or 0) for x in r)
+
+def fifo_engine(c):
+    """بيمشي على كل حركات كل صنف بالترتيب (رصيد أول المدة ← الفواتير والهالك حسب التاريخ) ويرجّع:
+    line: تكلفة الوحدة لكل سطر فاتورة • dmg: تكلفة الوحدة لكل هالك • today: الطبقات الباقية النهارده لكل صنف."""
+    sig = _fifo_sig(c)
+    if _FIFO["sig"] == sig and _FIFO["res"] is not None: return _FIFO["res"]
+    from collections import deque
+    today = date.today().isoformat()
+    layers, last_in, last_out = {}, {}, {}
+    for r in c.execute("SELECT id, COALESCE(opening_qty,0), COALESCE(buy_price,0) FROM items").fetchall():
+        q, p = float(r[1] or 0), float(r[2] or 0)
+        layers[r[0]] = deque([[q, p]] if q > 1e-9 else []); last_in[r[0]] = p
+    ev = []
+    for r in c.execute("SELECT l.id, l.item_id, l.qty, l.price, COALESCE(l.damaged,0), i.kind, COALESCE(NULLIF(i.due_date,''), i.inv_date), COALESCE(i.created_at,''), i.id "
+                       "FROM invoice_lines l JOIN invoices i ON i.id=l.invoice_id WHERE l.item_id IS NOT NULL").fetchall():
+        rank = {"مشتريات": 0, "مرتجع مبيعات": 1, "مرتجع مشتريات": 2, "مبيعات": 3}.get(r[5], 4)
+        ev.append((r[6] or "", r[7] or "", rank, r[8], r[0], "L", r[1], float(r[2] or 0), float(r[3] or 0), r[4], r[5]))
+    for r in c.execute("SELECT id, item_id, qty, d_date, COALESCE(created_at,'') FROM damaged").fetchall():
+        ev.append((r[3] or "", r[4] or "", 3, 0, r[0], "D", r[1], float(r[2] or 0), 0.0, 0, "هالك"))
+    ev.sort(key=lambda e: e[:5])
+    line, dmg, snap = {}, {}, None
+    deficit = {}   # كمية اتباعت والرصيد صفر (بالسالب): أول بضاعة تدخل بعد كده بتغطيها الأول
+
+    def put(iid, q, price, front=False):
+        """بضاعة داخلة: تغطي العجز (الرصيد السالب) الأول، والباقي يبقى طبقة جديدة."""
+        dfc = deficit.get(iid, 0.0)
+        if dfc > 1e-9:
+            u = min(dfc, q); deficit[iid] = dfc - u; q -= u
+        if q > 1e-9:
+            L = layers.setdefault(iid, deque())
+            if front: L.appendleft([q, price])
+            else: L.append([q, price])
+
+    def take(iid, q):
+        """بيسحب كمية من أقدم طبقة ويرجّع إجمالي تكلفتها."""
+        L = layers.setdefault(iid, deque()); cost = 0.0; left = q
+        while left > 1e-9 and L:
+            lq, lp = L[0]; t = min(lq, left); cost += t * lp; left -= t
+            if lq - t <= 1e-9: L.popleft()
+            else: L[0][0] = lq - t
+        if left > 1e-9:
+            cost += left * (last_in.get(iid) or 0.0)       # رصيد بالسالب: بسعر آخر شراء
+            deficit[iid] = deficit.get(iid, 0.0) + left    # ومتسجل عجز علشان أول شراء بعده يتخصم منه (قبل كده كان بيتنسي فالمخزون يبان أكتر)
+        return cost
+
+    for e in ev:
+        d, _, _, _, rid, typ, iid, q, price, damaged, kind = e
+        if snap is None and d > today: snap = {k: [list(x) for x in v] for k, v in layers.items()}
+        if q <= 0: continue
+        L = layers.setdefault(iid, deque())
+        if typ == "D":
+            u = take(iid, q) / q; dmg[rid] = u; last_out[iid] = u
+        elif kind == "مشتريات":
+            put(iid, q, price); last_in[iid] = price; line[rid] = price
+        elif kind == "مرتجع مشتريات":                                    # المرتجع للمورد بيطلع من آخر بضاعة دخلت
+            left = q; cost = 0.0
+            while left > 1e-9 and L:
+                lq, lp = L[-1]; t = min(lq, left); cost += t * lp; left -= t
+                if lq - t <= 1e-9: L.pop()
+                else: L[-1][0] = lq - t
+            if left > 1e-9:
+                cost += left * (last_in.get(iid) or 0.0); deficit[iid] = deficit.get(iid, 0.0) + left
+            line[rid] = cost / q
+        elif kind == "مبيعات":
+            u = take(iid, q) / q; line[rid] = u; last_out[iid] = u
+        elif kind == "مرتجع مبيعات":                                     # بيرجع بتكلفة آخر بيع للصنف
+            u = last_out.get(iid, L[0][1] if L else last_in.get(iid, 0.0)); line[rid] = u
+            if not damaged: put(iid, q, u, front=True)
+    if snap is None: snap = {k: [list(x) for x in v] for k, v in layers.items()}
+    res = {"line": line, "dmg": dmg, "today": snap, "last_in": last_in}
+    _FIFO["sig"], _FIFO["res"] = sig, res
+    return res
+
+def fifo_preview(c, needs, skip_invoice=None):
+    """تكلفة الوحدة لأصناف لسه هتتباع (فاتورة جديدة): needs = [(item_id, qty), ...] بالترتيب.
+    بيسحب من الطبقات الموجودة النهارده. skip_invoice = فاتورة بتتعدّل (بنرجّع بضاعتها الأول)."""
+    f = fifo_engine(c)
+    L = {k: [list(x) for x in v] for k, v in f["today"].items()}
+    if skip_invoice:
+        for r in c.execute("SELECT id, item_id, qty FROM invoice_lines WHERE invoice_id=?", (skip_invoice,)).fetchall():
+            if r[0] in f["line"] and r[1]: L.setdefault(r[1], []).insert(0, [float(r[2] or 0), f["line"][r[0]]])
+    out = []
+    for iid, q in needs:
+        lst = L.setdefault(iid, []); cost = 0.0; left = q
+        while left > 1e-9 and lst:
+            lq, lp = lst[0]; t = min(lq, left); cost += t * lp; left -= t
+            if lq - t <= 1e-9: lst.pop(0)
+            else: lst[0][0] = lq - t
+        if left > 1e-9: cost += left * (f["last_in"].get(iid) or 0.0)
+        out.append(cost / q if q > 1e-9 else (lst[0][1] if lst else f["last_in"].get(iid, 0.0)))
+    return out
+
+def fifo_stock_value(c):
+    """قيمة المخزون النهارده بتكلفة الشراء الحقيقية (الطبقات الباقية)."""
+    return sum(q * p for v in fifo_engine(c)["today"].values() for q, p in v if q > 0)
+
+def avg_cost(c, item_id, upto):
+    m = _bulk(c, ("avg", upto), lambda: _avgcost_bulk(c, upto))
+    if m is not None and item_id in m: return m[item_id]
+    return _avg_cost_one(c, item_id, upto)
+
+def _avg_cost_one(c, item_id, upto):
+    """متوسط سعر الشراء المرجّح للصنف من فواتير المشتريات حتى تاريخ معيّن
+    (مثال: شكارة بـ1000 وشكارة بـ1050 → التكلفة 1025). لو مفيش مشتريات: سعر الشراء من شاشة الأصناف."""
+    r = c.execute("SELECT SUM(l.qty) q,SUM(l.qty*l.price) v FROM invoice_lines l JOIN invoices i ON i.id=l.invoice_id "
+                  "WHERE i.kind='مشتريات' AND l.item_id=? AND COALESCE(NULLIF(i.due_date,''), i.inv_date)<=?", (item_id, upto)).fetchone()
+    b = c.execute("SELECT buy_price, COALESCE(opening_qty,0) oq FROM items WHERE id=?", (item_id,)).fetchone()
+    bp = float(b["buy_price"] or 0) if b else 0.0
+    oq = max(float(b["oq"] or 0), 0.0) if b else 0.0      # رصيد أول المدة بيتحسب بسعر الشراء المسجّل
+    q = float(r["q"] or 0) if r else 0.0
+    if q + oq > 1e-9 and q > 1e-9: return (float(r["v"] or 0) + oq * bp) / (q + oq)
+    return bp
+
+EFFECTIVE_DATE_SQL = "COALESCE(NULLIF(i.due_date,''), i.inv_date)"   # الفاتورة بتأثر على المخزن في تاريخ الاستحقاق
+
+def stock_of(c, item_id, upto="today"):
+    """رصيد الصنف لحد اليوم (الفواتير اللي استحقاقها بعدين مش بتتحسب لسه). upto=None = الرصيد النهائي بعد كل الفواتير."""
+    if upto == "today": upto = date.today().isoformat()
+    m = _bulk(c, ("stock", upto), lambda: _stock_bulk(c, upto))
+    if m is not None and item_id in m: return m[item_id]
+    cond = f" AND {EFFECTIVE_DATE_SQL}<=?" if upto else ""
+    args = (item_id, upto) if upto else (item_id,)
+    inv = c.execute(f"SELECT COALESCE(SUM({STOCK_CASE}),0) FROM invoice_lines l JOIN invoices i ON i.id=l.invoice_id WHERE l.item_id=?{cond}", args).fetchone()[0]
+    dcond = " AND d_date<=?" if upto else ""
+    dmg = c.execute(f"SELECT COALESCE(SUM(qty),0) FROM damaged WHERE item_id=?{dcond}", args).fetchone()[0]
+    op = c.execute("SELECT COALESCE(opening_qty,0) FROM items WHERE id=?", (item_id,)).fetchone()
+    return (float(op[0]) if op else 0.0) + inv - dmg
+
+def reserved_of(c, item_id):
+    """كميات في فواتير استحقاقها بعد اليوم (صادر − وارد)."""
+    return stock_of(c, item_id) - stock_of(c, item_id, None)
+
+class NegativeStock(ValueError): pass
+
+def check_stock(c, item_ids):
+    """يرفع NegativeStock لو أي صنف سيصبح رصيده بالسالب (يُستدعى داخل المعاملة بعد التعديل).
+    المالك يقدر يسمح بالسالب بكلمة السر (_TLS.allow_neg)."""
+    if getattr(_TLS, "allow_neg", None): return
+    for iid in item_ids:
+        if iid is None: continue
+        if stock_of(c, iid, None) < -1e-9 or stock_of(c, iid) < -1e-9:
+            r = c.execute("SELECT name FROM items WHERE id=?", (iid,)).fetchone()
+            raise NegativeStock(f"الرصيد غير كافٍ للصنف «{r['name'] if r else iid}» (سيصبح بالسالب)")
+
+# ---------------- حسابات العملاء والموردين ----------------
+DISC_KIND = "خصم مسموح به"     # سند خصم للعميل: بينزّل رصيده ومش بيدخل الخزنة، وبيتخصم من الربح
+
+def move_key(d, created_at, typ, idx):
+    """ترتيب حركات الحساب: بالتاريخ، وجوه نفس اليوم بوقت الإدخال الفعلي (السند اللي اتعمل الصبح قبل فاتورة الضهر)."""
+    return (d or "", created_at or "", typ, idx)
+
+def party_moves(c, pid):
+    """كل حركات الحساب (فواتير + سندات) مرتبة. كل حركة: (تاريخ, ترتيب, id, مرجع, بيان, مدين, دائن)"""
+    moves = []
+    inv_ts = {}
+    for r in c.execute(f"SELECT i.id,i.number,i.kind,{EFFECTIVE_DATE_SQL} d,i.due_date,i.created_at,{NET_SQL} amt FROM invoices i WHERE i.party_id=?", (pid,)):
+        amt = float(r["amt"]); deb = r["kind"] in DEBIT_KINDS
+        inv_ts[r["id"]] = r["created_at"] or ""
+        moves.append((r["d"], 0, r["id"], r["number"], "فاتورة " + r["kind"] + (" (استحقاق)" if r["due_date"] else ""), amt if deb else 0.0, 0.0 if deb else amt,
+                      move_key(r["d"], r["created_at"], 0, r["id"]), r["created_at"]))
+    for r in c.execute("SELECT * FROM payments WHERE party_id=?", (pid,)):
+        amt = float(r["amount"]); is_col = r["kind"] in ("تحصيل", DISC_KIND)
+        label = DISC_KIND if r["kind"] == DISC_KIND else "تحصيل" if is_col else "دفع"   # الملاحظات بتظهر لما تفتح السند (ضغطتين)
+        # جوه نفس اليوم: بالترتيب اللي اتسجلت بيه فعلًا (وقت الإدخال). الدفعة المرتبطة بفاتورة بتيجي بعدها على طول
+        if r["invoice_id"]:
+            if r["invoice_id"] not in inv_ts:
+                x = c.execute("SELECT created_at FROM invoices WHERE id=?", (r["invoice_id"],)).fetchone(); inv_ts[r["invoice_id"]] = (x[0] if x else "") or ""
+            key = move_key(r["pay_date"], inv_ts[r["invoice_id"]], 0, r["invoice_id"] + 0.5)
+        else: key = move_key(r["pay_date"], r["created_at"], 1, r["id"])
+        moves.append((r["pay_date"], 1, r["id"], f"سند {r['id']}", label, 0.0 if is_col else amt, amt if is_col else 0.0, key, r["created_at"]))
+    moves.sort(key=lambda m: m[7])
+    return moves
+
+def party_balance(c, pid, upto="today"):
+    """رصيد الحساب لحد اليوم (فواتير الاستحقاق بتتحسب في تاريخها). upto=None = بعد كل الفواتير القادمة."""
+    if upto == "today": upto = date.today().isoformat()
+    m = _bulk(c, ("bal", upto), lambda: _balance_bulk(c, upto))
+    if m is not None and pid in m: return m[pid]
+    p = c.execute("SELECT opening FROM parties WHERE id=?", (pid,)).fetchone()
+    return float(p["opening"] or 0) + sum(m[5] - m[6] for m in party_moves(c, pid) if upto is None or m[0] <= upto)
+
+def build_statement(pid, start, end):
+    with db() as c:
+        party = c.execute("SELECT * FROM parties WHERE id=?", (pid,)).fetchone()
+        moves = party_moves(c, pid)
+    opening = float(party["opening"] or 0)
+    for m in moves:
+        if m[0] < start: opening += m[5] - m[6]
+    rows, running = [], opening
+    for m in moves:
+        if start <= m[0] <= end:
+            running += m[5] - m[6]
+            rows.append((m[0], m[3], m[4], m[5], m[6], running, m[1], m[2], m[8]))
+    return party, opening, rows, running
+
+def party_last_text(c, pid):
+    col = c.execute("SELECT pay_date,amount FROM payments WHERE party_id=? AND kind='تحصيل' ORDER BY pay_date DESC,id DESC LIMIT 1", (pid,)).fetchone()
+    pay = c.execute("SELECT pay_date,amount FROM payments WHERE party_id=? AND kind='دفع' ORDER BY pay_date DESC,id DESC LIMIT 1", (pid,)).fetchone()
+    inv = c.execute("SELECT inv_date,number,kind FROM invoices WHERE party_id=? ORDER BY inv_date DESC,id DESC LIMIT 1", (pid,)).fetchone()
+    t1 = f"آخر تحصيل: {col['pay_date']} ({fmt(col['amount'])})" if col else "آخر تحصيل: —"
+    t2 = f"آخر دفع: {pay['pay_date']} ({fmt(pay['amount'])})" if pay else "آخر دفع: —"
+    t3 = f"آخر فاتورة: {inv['number']} ({inv['inv_date']})" if inv else "آخر فاتورة: —"
+    return "   •   ".join([t1, t2, t3])
+
+# ---------------- الخزنة ----------------
+def treasury_moves(c):
+    """حركات الخزنة: (تاريخ, ترتيب, id, مفتاح, بيان, وارد, صادر, وقت التسجيل)"""
+    mv = []
+    for r in c.execute("SELECT p.*,pt.name pname FROM payments p JOIN parties pt ON pt.id=p.party_id WHERE p.kind<>'خصم مسموح به'"):
+        amt = float(r["amount"]); inn = r["kind"] == "تحصيل"
+        label = ("تحصيل من " if inn else "دفع إلى ") + r["pname"] + (f" - {r['notes']}" if r["notes"] else "")
+        mv.append((r["pay_date"], 0, r["id"], f"p-{r['id']}", label, amt if inn else 0.0, 0.0 if inn else amt, r["created_at"]))
+    for r in c.execute("SELECT e.*,m.name ename FROM expenses e LEFT JOIN employees m ON m.id=e.employee_id"):
+        amt = float(r["amount"])
+        if r["kind"] == "مصروف": label = "مصروفات: " + (r["category"] or "")
+        elif r["kind"] == "مرتب": label = "مرتب" + (f" ({r['category']})" if r["category"] in WAGE_CATS else "") + ": " + (r["ename"] or "")
+        elif r["kind"] == "عمولة": label = "صرف عمولة: " + (r["ename"] or "")
+        else: label = "سلفة: " + (r["ename"] or "")
+        if r["notes"]: label += f" - {r['notes']}"
+        mv.append((r["exp_date"], 1, r["id"], f"e-{r['id']}", label, 0.0, amt, r["created_at"]))
+    for r in c.execute("SELECT * FROM cash_moves"):
+        amt = float(r["amount"]); inn = r["kind"] == "إيداع"
+        label = r["kind"] + (f" - {r['notes']}" if r["notes"] else "")
+        mv.append((r["move_date"], 2, r["id"], f"c-{r['id']}", label, amt if inn else 0.0, 0.0 if inn else amt, r["created_at"]))
+    mv.sort(key=lambda m: (m[0], m[1], m[2]))
+    return mv
+
+def cash_opening(c):
+    return float(c.execute("SELECT cash_opening FROM settings WHERE id=1").fetchone()[0] or 0)
+
+def cash_balance(c):
+    return cash_opening(c) + sum(m[5] - m[6] for m in treasury_moves(c))
+
+# ---------------- الأرباح ----------------
+def profit_summary(start, end):
+    with db() as c:
+        items = c.execute("SELECT id,name,buy_price FROM items").fetchall()
+        sold = {(r["item_id"], r["kind"]): (r["q"], r["amt"]) for r in c.execute(
+            "SELECT l.item_id,i.kind,SUM(l.qty) q,SUM(l.qty*l.price) amt FROM invoice_lines l JOIN invoices i ON i.id=l.invoice_id "
+            "WHERE i.kind IN ('مبيعات','مرتجع مبيعات') AND COALESCE(NULLIF(i.due_date,''), i.inv_date) BETWEEN ? AND ? GROUP BY l.item_id,i.kind", (start, end))}
+        buy = {r["item_id"]: (r["q"], r["cost"]) for r in c.execute(
+            "SELECT l.item_id,SUM(l.qty) q,SUM(l.qty*l.price) cost FROM invoice_lines l JOIN invoices i ON i.id=l.invoice_id "
+            "WHERE i.kind='مشتريات' AND COALESCE(NULLIF(i.due_date,''), i.inv_date)<=? GROUP BY l.item_id", (end,))}
+        disc = {r["kind"]: float(r["d"]) for r in c.execute(
+            "SELECT kind,COALESCE(SUM(discount),0) d FROM invoices WHERE kind IN ('مبيعات','مرتجع مبيعات') AND COALESCE(NULLIF(due_date,''), inv_date) BETWEEN ? AND ? GROUP BY kind", (start, end))}
+        ex = c.execute("SELECT kind,category,COALESCE(SUM(amount),0) a FROM expenses WHERE exp_date BETWEEN ? AND ? GROUP BY kind,category", (start, end)).fetchall()
+        disc_v = float(c.execute("SELECT COALESCE(SUM(amount),0) FROM payments WHERE kind=? AND pay_date BETWEEN ? AND ?", (DISC_KIND, start, end)).fetchone()[0])
+        dmg_ret = {r["item_id"]: float(r["q"]) for r in c.execute(
+            "SELECT l.item_id,SUM(l.qty) q FROM invoice_lines l JOIN invoices i ON i.id=l.invoice_id "
+            "WHERE i.kind='مرتجع مبيعات' AND COALESCE(l.damaged,0)=1 AND COALESCE(NULLIF(i.due_date,''), i.inv_date) BETWEEN ? AND ? GROUP BY l.item_id", (start, end))}
+        f = fifo_engine(c)
+        lines_ = c.execute("SELECT l.id, l.item_id, i.kind, l.qty, COALESCE(l.damaged,0) FROM invoice_lines l JOIN invoices i ON i.id=l.invoice_id "
+                           "WHERE i.kind IN ('مبيعات','مرتجع مبيعات') AND l.item_id IS NOT NULL AND COALESCE(NULLIF(i.due_date,''), i.inv_date) BETWEEN ? AND ?", (start, end)).fetchall()
+        fc = {}                       # تكلفة البيع والمرتجع والهالك لكل صنف (FIFO)
+        for r in lines_:
+            k = fc.setdefault(r[1], [0.0, 0.0, 0.0]); v = float(r[3] or 0) * f["line"].get(r[0], 0.0)
+            if r[2] == "مبيعات": k[0] += v
+            else:
+                k[1] += v
+                if r[4]: k[2] += v
+        dmg_direct = sum(float(r[1] or 0) * f["dmg"].get(r[0], float(r[2] or 0)) for r in c.execute("SELECT id, qty, unit_cost FROM damaged WHERE d_date BETWEEN ? AND ?", (start, end)).fetchall())
+        commission = float(c.execute(f"SELECT COALESCE(SUM({COMM_AMT_SQL}),0) FROM invoices i WHERE i.kind='مبيعات' AND i.rep_id IS NOT NULL AND COALESCE(NULLIF(i.due_date,''), i.inv_date) BETWEEN ? AND ?", (start, end)).fetchone()[0])
+    rows = []; rev = ret = cost = rcost = dmg_ret_val = 0.0
+    for it in items:
+        sq, sa = sold.get((it["id"], "مبيعات"), (0, 0)); rq, ra = sold.get((it["id"], "مرتجع مبيعات"), (0, 0))
+        if not sq and not rq: continue
+        sc, rc, dc = fc.get(it["id"], (0.0, 0.0, 0.0))
+        net_cost = sc - rc; nq = sq - rq
+        avg = net_cost / nq if abs(nq) > 1e-9 else (sc / sq if sq else 0.0)
+        rows.append((it["name"], nq, sa - ra, avg, net_cost, sa - ra - net_cost))
+        rev += sa; ret += ra; cost += sc; rcost += rc; dmg_ret_val += dc
+    ds = disc.get("مبيعات", 0.0) + disc_v; dr = disc.get("مرتجع مبيعات", 0.0)
+    gross = rev - ret - (cost - rcost) - (ds - dr)
+    general = sum(float(r["a"]) for r in ex if r["kind"] == "مصروف")
+    salary = sum(float(r["a"]) for r in ex if r["kind"] == "مرتب")
+    adv = sum(float(r["a"]) for r in ex if r["kind"] == "سلفة")
+    by_cat = sorted(((r["category"], float(r["a"])) for r in ex if r["kind"] == "مصروف"), key=lambda x: -x[1])
+    exp_total = general + salary + adv
+    damaged = dmg_ret_val + dmg_direct
+    return {"rows": rows, "rev": rev, "ret": ret, "cost": cost, "rcost": rcost, "ds": ds, "dr": dr, "gross": gross,
+            "general": general, "salary": salary, "adv": adv, "by_cat": by_cat, "exp_total": exp_total,
+            "damaged": damaged, "commission": commission, "actual": gross - exp_total - damaged - commission}
+
+def metric_rows(ps):
+    return [("المبيعات", ps["rev"]), ("المرتجعات", ps["ret"]), ("صافي التكلفة", ps["cost"] - ps["rcost"]),
+            ("الخصومات (صافي)", ps["ds"] - ps["dr"]), ("إجمالي الربح (Total)", ps["gross"]),
+            ("المصروفات العامة", ps["general"]), ("المرتبات", ps["salary"]), ("السلف", ps["adv"]),
+            ("إجمالي المصروفات", ps["exp_total"]), ("الهالك والتالف (بالتكلفة)", ps["damaged"]), ("عمولات المناديب", ps["commission"]),
+            ("صافي الربح", ps["actual"])]
+
+# ---------------- التقرير اليومي ----------------
+def daily_rows(day):
+    ps = profit_summary(day, day)
+    with db() as c:
+        def inv(kind):
+            r = c.execute(f"SELECT COUNT(*) n,COALESCE(SUM({NET_SQL}),0) t FROM invoices i WHERE i.kind=? AND COALESCE(NULLIF(i.due_date,''), i.inv_date)=?", (kind, day)).fetchone()
+            return r["n"], float(r["t"])
+        def pay(kind):
+            r = c.execute("SELECT COUNT(*) n,COALESCE(SUM(amount),0) t FROM payments WHERE kind=? AND pay_date=?", (kind, day)).fetchone()
+            return r["n"], float(r["t"])
+        data = {k: inv(k) for k in KINDS}
+        col = pay("تحصيل"); pa = pay("دفع"); dv = pay(DISC_KIND)
+        exp = c.execute("SELECT kind,category,COALESCE(SUM(amount),0) a FROM expenses WHERE exp_date=? GROUP BY kind,category", (day,)).fetchall()
+        moves = treasury_moves(c); opening = cash_opening(c)
+    ob = opening + sum(m[5] - m[6] for m in moves if m[0] < day)
+    cin = sum(m[5] for m in moves if m[0] == day); cout = sum(m[6] for m in moves if m[0] == day)
+    R = []
+    R.append(("h", "الفواتير", ""))
+    for k in KINDS:
+        n, t = data[k]; R.append(("r", f"{k} ({n} فاتورة)", fmt(t)))
+    R.append(("h", "السندات", ""))
+    R.append(("r", f"تحصيلات (من العملاء / رد نقدي من الموردين) ({col[0]} سند)", fmt(col[1])))
+    R.append(("r", f"مدفوعات (للموردين / رد نقدي للعملاء) ({pa[0]} سند)", fmt(pa[1])))
+    if dv[0]: R.append(("r", f"خصم مسموح به للعملاء ({dv[0]} سند — مش فلوس)", fmt(dv[1])))
+    R.append(("h", "المصروفات", ""))
+    if not exp: R.append(("r", "لا توجد مصروفات", fmt(0)))
+    for r in exp:
+        lab = {"مصروف": "مصروفات: " + (r["category"] or ""), "مرتب": "مرتبات" + (f" ({r['category']})" if r["category"] in WAGE_CATS else ""), "سلفة": "سلف", "عمولة": "صرف عمولات (من العمولات المستحقة)"}[r["kind"]]
+        R.append(("r", lab, fmt(r["a"])))
+    R.append(("b", "إجمالي المصروفات", fmt(ps["exp_total"])))
+    R.append(("h", "الخزنة", ""))
+    R.append(("r", "رصيد أول اليوم", fmt(ob)))
+    R.append(("r", "وارد اليوم", fmt(cin)))
+    R.append(("r", "صادر اليوم", fmt(cout)))
+    R.append(("b", "رصيد آخر اليوم", fmt(ob + cin - cout)))
+    if is_owner():   # الأرباح للمالك بس
+        R.append(("h", "الأرباح", ""))
+        R.append(("r", "صافي المبيعات (بعد المرتجعات)", fmt(ps["rev"] - ps["ret"])))
+        R.append(("r", "صافي التكلفة", fmt(ps["cost"] - ps["rcost"])))
+        R.append(("b", "إجمالي الربح", fmt(ps["gross"])))
+        if ps["damaged"]: R.append(("r", "الهالك والتالف (بالتكلفة)", fmt(ps["damaged"])))
+        if ps["commission"]: R.append(("r", "عمولات المناديب", fmt(ps["commission"])))
+        R.append(("b", "صافي الربح", fmt(ps["actual"])))
+    return R
+
+# ---------------- النسخ الاحتياطي التلقائي ----------------
+LOCAL_BACKUP_DIR = os.path.join(APP_DATA_DIR, "backups")
+
+def backup_dir():
+    if DB_CFG.get("mode") == "postgres": return DB_CFG.get("backup_dir") or LOCAL_BACKUP_DIR
+    try:
+        with db() as c: d = c.execute("SELECT backup_dir FROM settings WHERE id=1").fetchone()["backup_dir"]
+    except Exception: d = ""
+    return d or LOCAL_BACKUP_DIR
+
+# ---------------- قراءة ملفات Excel (من غير أي مكتبات إضافية) ----------------
+_XNS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+
+def read_xlsx(path):
+    """يرجّع صفوف أول شيت في ملف ‎.xlsx كقائمة قوائم (نصوص وأرقام)."""
+    def col_idx(ref):
+        n = 0
+        for ch in re.match(r"[A-Z]+", ref).group(0): n = n * 26 + ord(ch) - 64
+        return n - 1
+    with zipfile.ZipFile(path) as z:
+        names = z.namelist()
+        shared = []
+        if "xl/sharedStrings.xml" in names:
+            for si in ET.fromstring(z.read("xl/sharedStrings.xml")).iter(_XNS + "si"):
+                shared.append("".join(t.text or "" for t in si.iter(_XNS + "t")))
+        sheet = "xl/worksheets/sheet1.xml"
+        try:   # أول شيت حسب ترتيب الملف
+            wb = ET.fromstring(z.read("xl/workbook.xml")); rels = ET.fromstring(z.read("xl/_rels/workbook.xml.rels"))
+            first = wb.find(_XNS + "sheets")[0]
+            rid = first.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id")
+            for rel in rels:
+                if rel.get("Id") == rid:
+                    t = rel.get("Target").lstrip("/"); sheet = t if t.startswith("xl/") else "xl/" + t
+        except Exception: pass
+        rows = []
+        for row in ET.fromstring(z.read(sheet)).iter(_XNS + "row"):
+            vals = {}
+            for cel in row.iter(_XNS + "c"):
+                t = cel.get("t"); v = cel.find(_XNS + "v")
+                if t == "s" and v is not None: val = shared[int(v.text)]
+                elif t == "inlineStr": val = "".join(x.text or "" for x in cel.iter(_XNS + "t"))
+                elif v is None: continue
+                elif t in ("str", "b", "e"): val = v.text or ""
+                else:
+                    try: val = float(v.text)
+                    except (TypeError, ValueError): val = v.text or ""
+                vals[col_idx(cel.get("r"))] = val
+            if vals: rows.append([vals.get(i, "") for i in range(max(vals) + 1)])
+            else: rows.append([])
+        return rows
+
+def _norm(x):
+    x = str(x or "").strip()
+    x = re.sub("[\u064b-\u0652\u0640]", "", x)              # تشكيل وتطويل
+    return re.sub(r"\s+", " ", x.replace("أ", "ا").replace("إ", "ا").replace("آ", "ا").replace("ة", "ه").replace("ى", "ي"))
+
+def _loose(x):
+    """مقارنة الأسامي من غير «لا»: ملفات PDF القديمة كانت بتضيّع الحرف ده (الشراف = الاشراف، مولنا = مولانا)."""
+    return re.sub(r"\s+", "", _norm(x).replace("لا", "ل"))
+
+def _num(x):
+    if x in ("", None): return None
+    if isinstance(x, (int, float)): return float(x)
+    s = str(x).translate(str.maketrans("٠١٢٣٤٥٦٧٨٩٫٬", "0123456789.,")).replace(",", "").replace("جنيه", "").replace("ج", "").strip()
+    neg = s.startswith("(") and s.endswith(")")
+    s = s.strip("()").strip()
+    try: return -float(s) if neg else float(s)
+    except ValueError: return "bad"
+
+def _cell_text(x):
+    if isinstance(x, float): return str(int(x)) if x.is_integer() else str(x)
+    return re.sub(r"\s+", " ", str(x or "")).strip()
+
+# كل عمود: الكلمات اللي ممكن تكون في عنوانه (الأدق الأول)
+SUBCASH_IMPORT_NOTE = "رصيد افتتاحي (من استيراد Excel)"
+
+IMPORT_COLS = {
+    "items": [("code", ("كود", "رقم الصنف", "الكود")), ("name", ("اسم الصنف", "الصنف", "الاسم", "البيان")), ("unit", ("الوحده",)),
+              ("buy", ("سعر الشراء", "شراء", "التكلفه")), ("sell", ("سعر البيع", "بيع")), ("min", ("حد ادني", "الحد الادني")),
+              ("qty", ("رصيد اول المده", "الكميه", "الرصيد", "الموجود"))],
+    "parties": [("name", ("اسم العميل", "اسم المورد", "اسم الحساب", "الاسم", "العميل", "=الحساب")), ("acct", ("رقم الحساب", "كود الحساب", "=الكود", "=رقم")), ("kind", ("النوع",)),
+                ("debit", ("مدين", "=عليه")), ("credit", ("دائن", "=له")), ("opening", ("الرصيد الافتتاحي", "رصيد اول المده", "الرصيد")),
+                ("phone", ("الهاتف", "التليفون", "الموبايل", "تليفون", "موبايل", "رقم الهاتف")), ("address", ("العنوان",)),
+                ("rep", ("المندوب",)), ("limit", ("الحد الائتماني", "حد الائتمان"))],
+}
+
+def map_import_header(rows, what):
+    """يدوّر على صف العناوين في أول 15 صف ويرجّع (رقم الصف، {المفتاح: رقم العمود})."""
+    best = (None, {})
+    for ri, row in enumerate(rows[:15]):
+        cols, used = {}, set()
+        for key, words in IMPORT_COLS[what]:
+            for w in words:
+                exact = w.startswith("=")       # "=" يعني العنوان لازم يكون الكلمة دي بالظبط
+                hit = next((ci for ci, h in enumerate(row) if ci not in used and isinstance(h, str) and
+                            (_norm(h) == _norm(w[1:]) if exact else _norm(w) in _norm(h))), None)
+                if hit is not None: cols[key] = hit; used.add(hit); break
+        if "name" in cols and len(cols) > len(best[1]): best = (ri, cols)
+    return best
+
+def auto_backup_path(d=None):
+    tag = "server_" if DB_CFG.get("mode") == "postgres" else ""
+    return os.path.join(d or backup_dir(), f"warehouse_auto_{tag}{date.today().isoformat()}.db")
+
+def _backup_to(d):
+    os.makedirs(d, exist_ok=True)
+    target = auto_backup_path(d)
+    src = raw_db(); dest = sqlite3.connect(target)
+    try: src.backup(dest)
+    finally: dest.close(); src.close()
+    for pre in ("warehouse_auto_server_", "warehouse_auto_2"):
+      files = sorted(f for f in os.listdir(d) if f.startswith(pre) and f.endswith(".db"))
+      for f in files[:-30]:
+        try: os.remove(os.path.join(d, f))
+        except Exception: pass
+    return target
+
+def backup_copy(kind="manual"):
+    """نسخة جديدة باسم فيه التاريخ والساعة في المجلد المختار — مبتمسحش ولا بتكتب فوق أي نسخة قبلها.
+    لو المجلد مش متاح (فلاشة مش متركبة): بتتحفظ على الجهاز. بترجع (المسار, تحذير أو None)."""
+    tag = "server_" if DB_CFG.get("mode") == "postgres" else ""
+    name = f"zalat_{'close_day' if kind == 'close' else 'before_restore' if kind == 'before_restore' else 'backup'}_{tag}{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.db"
+    def to(d):
+        os.makedirs(d, exist_ok=True)
+        target = os.path.join(d, name)
+        src = raw_db(); dest = sqlite3.connect(target)
+        try: src.backup(dest)
+        finally: dest.close(); src.close()
+        return target
+    d = backup_dir()
+    try: return to(d), None
+    except Exception as e:
+        warn = f"تعذّر حفظ النسخة في: {d} ({e})"
+        if os.path.normcase(os.path.abspath(d)) != os.path.normcase(os.path.abspath(LOCAL_BACKUP_DIR)):
+            try: return to(LOCAL_BACKUP_DIR), warn + f" — اتحفظت بدالها على الجهاز في: {LOCAL_BACKUP_DIR}"
+            except Exception as e2: warn += f" — وفشل الحفظ على الجهاز كمان: {e2}"
+        return None, warn
+
+# ---------------- نسخة احتياطية على Google Drive (أوتوماتيك) ----------------
+# البرنامج بيكتب النسخة في فولدر «Google Drive للكمبيوتر» (G:\My Drive مثلًا) وبرنامج جوجل هو اللي بيرفعها.
+# كده لو الكمبيوتر باظ أو اتسرق، آخر نسخة موجودة على الدرايف (وجوجل بيحتفظ بالنسخ القديمة كمان).
+CLOUD_SUB = "Zalat Backup"
+CLOUD_STATE = {"last": "", "err": "", "sig": None, "running": False}
+
+def find_gdrive():
+    """بيدوّر على فولدر Google Drive على الجهاز (من غير ما المستخدم يختار)."""
+    names = ("My Drive", "ملفاتي", "Mon Drive", "Meine Ablage")
+    cands = []
+    if os.name == "nt":
+        for L in "GHIJKLMNOPQRSTUVWXYZDEF":
+            cands += [f"{L}:\\{n}" for n in names]
+    home = os.path.expanduser("~")
+    cands += [os.path.join(home, "Google Drive", n) for n in names] + [os.path.join(home, "Google Drive"), os.path.join(home, "My Drive")]
+    for c in cands:
+        try:
+            if os.path.isdir(c): return c
+        except Exception: pass
+    return ""
+
+def cloud_dir():
+    """فولدر النسخ على الدرايف ("" لو مقفول أو مفيش درايف)."""
+    if DB_CFG.get("cloud_off"): return ""
+    base = DB_CFG.get("cloud_dir") or ""
+    if base and not os.path.isdir(base): return ""
+    base = base or find_gdrive()
+    return os.path.join(base, CLOUD_SUB) if base else ""
+
+def _data_sig():
+    with db() as c:
+        return tuple(c.execute("SELECT (SELECT COALESCE(MAX(id),0) FROM audit_log), (SELECT COUNT(*) FROM audit_log), "
+                               "(SELECT COALESCE(MAX(id),0) FROM invoices), (SELECT COALESCE(MAX(id),0) FROM payments)").fetchone())
+
+def _snapshot(target):
+    src = raw_db(); dest = sqlite3.connect(target)
+    try: src.backup(dest)
+    finally: dest.close(); src.close()
+
+def cloud_backup(force=False):
+    """بيكتب zalat_latest.db (آخر نسخة) + نسخة لكل يوم (آخر 30 يوم) في فولدر الدرايف — بس لو الداتا اتغيرت."""
+    d = cloud_dir()
+    if not d: return None
+    if CLOUD_STATE["running"]: return None
+    CLOUD_STATE["running"] = True
+    try:
+        sig = _data_sig()
+        if not force and sig == CLOUD_STATE["sig"]: return "same"
+        os.makedirs(d, exist_ok=True)
+        tmp = os.path.join(d, ".zalat_uploading.tmp")
+        _snapshot(tmp)
+        latest = os.path.join(d, "zalat_latest.db")
+        os.replace(tmp, latest)                     # الملف بيتبدل مرة واحدة (مفيش نسخة نص كده تترفع)
+        import shutil
+        shutil.copyfile(latest, os.path.join(d, f"zalat_{date.today().isoformat()}.db"))
+        days = sorted(f for f in os.listdir(d) if f.startswith("zalat_2") and f.endswith(".db"))
+        for f in days[:-30]:
+            try: os.remove(os.path.join(d, f))
+            except Exception: pass
+        CLOUD_STATE.update(sig=sig, last=datetime.now().strftime("%Y-%m-%d %H:%M"), err="")
+        return latest
+    except Exception as e:
+        CLOUD_STATE["err"] = str(e); write_error_log("cloud backup: " + repr(e)); return None
+    finally:
+        CLOUD_STATE["running"] = False
+
+def restore_backup(path):
+    """استرجاع نسخة احتياطية (.db): بياخد نسخة من الداتا الحالية الأول، وبعدين بيبدّل كل الداتا بالنسخة.
+    بيشتغل على SQLite وعلى السيرفر (PostgreSQL). بيرجع (عدد الفواتير والأصناف والعملاء, مسار نسخة الأمان)."""
+    import shutil, tempfile
+    if not path or not os.path.isfile(path): raise ValueError("الملف مش موجود")
+    work = os.path.join(APP_DATA_DIR, "restore_tmp"); os.makedirs(work, exist_ok=True)
+    tmp = os.path.join(work, "restore_%s.db" % datetime.now().strftime("%H%M%S%f"))
+    shutil.copyfile(path, tmp)                         # نشتغل على نسخة (الملف الأصلي ممكن يكون بيترفع على الدرايف)
+    try:
+        cnt = _local_data_counts(tmp)
+        if not cnt: raise ValueError("الملف ده مش نسخة احتياطية من البرنامج")
+        if not cnt.get("users"): raise ValueError("النسخة دي مفيهاش مستخدمين — مش هينفع تسترجعها (مش هتعرف تدخل)")
+        safe, warn = backup_copy("before_restore")      # الداتا الحالية تتحفظ قبل أي تغيير
+        if not safe: raise ValueError("مقدرتش آخد نسخة من الداتا الحالية قبل الاسترجاع — مااتغيرش حاجة.\n" + (warn or ""))
+        if using_pg():
+            import_sqlite_to_pg(tmp)                    # بيمسح ويحط في نفس العملية (لو فشل مفيش حاجة بتتغير)
+        else:
+            with sqlite_target(tmp): init_db()
+            s = sqlite3.connect(tmp); d = sqlite3.connect(DB_PATH)
+            try: s.backup(d)
+            finally: d.close(); s.close()
+        init_db()
+        with db() as c: log(c, "استرجاع نسخة احتياطية", f"{os.path.basename(path)} — فواتير {cnt['invoices']} • أصناف {cnt['items']} • عملاء/موردين {cnt['parties']} — الداتا القديمة اتحفظت في: {safe}")
+        CLOUD_STATE["sig"] = None
+        return cnt, safe
+    finally:
+        try: os.remove(tmp)
+        except Exception: pass
+
+_CLOUD_THREAD = None
+def start_cloud_backup():
+    """بيشتغل في الخلفية طول ما البرنامج مفتوح: كل كام دقيقة (10 افتراضي) يرفع نسخة لو فيه تغيير."""
+    global _CLOUD_THREAD
+    if _CLOUD_THREAD: return
+    def loop():
+        time.sleep(90)
+        while True:
+            try: cloud_backup()
+            except Exception: pass
+            time.sleep(max(int(DB_CFG.get("cloud_every") or 10), 2) * 60)
+    _CLOUD_THREAD = threading.Thread(target=loop, daemon=True, name="cloud-backup"); _CLOUD_THREAD.start()
+
+def auto_backup():
+    """نسخة واحدة لكل يوم (تُحدّث عند كل غلق)، ويُحتفظ بآخر 30 يومًا.
+    لو المجلد المختار (فلاشة مثلًا) مش متاح، النسخة تتحفظ على الجهاز. ترجع (المسار, رسالة تحذير أو None)."""
+    d = backup_dir()
+    try:
+        return _backup_to(d), None
+    except Exception as e:
+        warn = f"تعذّر حفظ النسخة الاحتياطية في:\n{d}\n({e})"
+        if os.path.normcase(os.path.abspath(d)) != os.path.normcase(os.path.abspath(LOCAL_BACKUP_DIR)):
+            try:
+                t = _backup_to(LOCAL_BACKUP_DIR)
+                return t, warn + f"\n\nتم حفظها بدلًا من ذلك على الجهاز في:\n{LOCAL_BACKUP_DIR}\nتأكد من تركيب الفلاشة."
+            except Exception as e2:
+                warn += f"\n\nوفشل الحفظ على الجهاز أيضًا: {e2}"
+        return None, warn
+
+# أيقونات بكسل 16×16 مرسومة جوه البرنامج (مش محتاجة ملفات ولا خطوط إيموجي)
+# '#' اللون الأساسي ، 'd' أغمق ، 'w' أبيض ، '.' شفاف
+ICON_ART = {
+"home": """
+.......##.......
+......####......
+.....######.....
+....########....
+...##########...
+..############..
+.##############.
+...##########...
+...##########...
+...####ww####...
+...###wwww###...
+...###wwww###...
+...###wwww###...
+...###wwww###...
+...##########...
+................""",
+"invoice": """
+..###########...
+..#wwwwwwwww#...
+..#w#######w#...
+..#wwwwwwwww#...
+..#w#######w#...
+..#wwwwwwwww#...
+..#w#####www#...
+..#wwwwwwwww#...
+..#w#######w#...
+..#wwwwwwwww#...
+..#www#ddd#w#...
+..#www#ddd#w#...
+..#wwwwwwwww#...
+..#w#w#w#w#w#...
+..##.#.#.#.##...
+................""",
+"box": """
+................
+.......dd.......
+.....dd##dd.....
+...dd######dd...
+.dd##########dd.
+.d#dd######dd#d.
+.d###dd##dd###d.
+.d#####dd#####d.
+.d#####dd#####d.
+.d#####dd#####d.
+.d#####dd#####d.
+.d#####dd#####d.
+..dd###dd###dd..
+....dd#dd#dd....
+......dddd......
+................""",
+"people": """
+................
+...###....###...
+..#####..#####..
+..#####..#####..
+..#####..#####..
+...###....###...
+................
+.#######.######.
+#########.######
+#########.######
+#########.######
+#########.######
+#########.######
+................
+................
+................""",
+"calc": """
+..############..
+..#wwwwwwwwww#..
+..#wwwwwwdddw#..
+..#wwwwwwwwww#..
+..############..
+..#ww#ww#ww###..
+..#ww#ww#ww###..
+..############..
+..#ww#ww#ww###..
+..#ww#ww#ww###..
+..############..
+..#ww#ww#ww###..
+..#ww#ww#ww###..
+..############..
+................
+................""",
+"chart": """
+................
+.............##.
+.............##.
+.........##..##.
+.........##..##.
+.........##..##.
+.....##..##..##.
+.....##..##..##.
+.....##..##..##.
+.##..##..##..##.
+.##..##..##..##.
+.##..##..##..##.
+.##..##..##..##.
+dddddddddddddddd
+dddddddddddddddd
+................""",
+"gear": """
+.......##.......
+...##..##..##...
+...##########...
+....########....
+..####dddd####..
+.####d....d####.
+.###d......d###.
+#####d....d#####
+#####d....d#####
+.###d......d###.
+.####d....d####.
+..####dddd####..
+....########....
+...##########...
+...##..##..##...
+.......##.......""",
+"save": """
+################
+##wwwwwwwwww##d#
+##wwwwwwwwww##d#
+##wwwwwwwwww####
+##wwwwwwwwww####
+################
+################
+################
+###dddddddddd###
+###dwwwwwwwwd###
+###dwwwwwwwwd###
+###dwwwwwwwwd###
+###dwwwwwwwwd###
+###dwwwwwwwwd###
+################
+................""",
+"print": """
+....########....
+....#wwwwww#....
+....#wwwwww#....
+....#wwwwww#....
+################
+################
+##########ww####
+################
+################
+###dddddddddd###
+...#wwwwwwww#...
+...#w######w#...
+...#wwwwwwww#...
+...#w####www#...
+...##########...
+................""",
+"trash": """
+......####......
+.....##..##.....
+################
+################
+..############..
+..##w##w##w##...
+..##w##w##w##...
+..##w##w##w##...
+..##w##w##w##...
+..##w##w##w##...
+..##w##w##w##...
+..##w##w##w##...
+..##w##w##w##...
+..###########...
+...#########....
+................""",
+"edit": """
+............ddd.
+...........d###d
+..........d####d
+.........d####d.
+........d####d..
+.......d####d...
+......d####d....
+.....d####d.....
+....d####d......
+...d####d.......
+..dw###d........
+..dww#d.........
+..dwwwd.........
+..ddddd.........
+................
+................""",
+"plus": """
+................
+......####......
+......####......
+......####......
+......####......
+......####......
+################
+################
+################
+################
+......####......
+......####......
+......####......
+......####......
+......####......
+................""",
+"search": """
+....######......
+...##wwww##.....
+..##wwwwww##....
+..#wwwwwwww#....
+..#wwwwwwww#....
+..#wwwwwwww#....
+..#wwwwwwww#....
+..##wwwwww##....
+...##wwww###....
+....#########...
+.........####...
+..........####..
+...........####.
+............###.
+.............#..
+................""",
+"money": """
+................
+................
+################
+#dddddddddddddd#
+#d####dd####d#d#
+#d###d##d###d#d#
+#d##d####d##d#d#
+#d##d####d##d#d#
+#d###d##d###d#d#
+#d####dd####d#d#
+#dddddddddddddd#
+################
+................
+................
+................
+................""",
+"user": """
+................
+.....######.....
+....########....
+....########....
+....########....
+....########....
+.....######.....
+......####......
+................
+...##########...
+..############..
+.##############.
+.##############.
+.##############.
+.##############.
+................""",
+"logout": """
+#########.......
+#wwwwwww#.......
+#w......#...#...
+#w......#...##..
+#w......#...###.
+#w...##########.
+#w...###########
+#w...##########.
+#w......#...###.
+#w......#...##..
+#w......#...#...
+#wwwwwww#.......
+#########.......
+................
+................
+................""",
+"list": """
+................
+##.############.
+##.############.
+................
+##.############.
+##.############.
+................
+##.############.
+##.############.
+................
+##.############.
+##.############.
+................
+................
+................
+................""",
+"close": """
+................
+.###........###.
+.####......####.
+..####....####..
+...####..####...
+....########....
+.....######.....
+......####......
+.....######.....
+....########....
+...####..####...
+..####....####..
+.####......####.
+.###........###.
+................
+................""",
+"cal": """
+..##......##....
+..##......##....
+################
+################
+#wwwwwwwwwwwwww#
+#w##w##w##w##ww#
+#w##w##w##w##ww#
+#wwwwwwwwwwwwww#
+#w##w##w##w##ww#
+#w##w##w##wddww#
+#wwwwwwwwwwwwww#
+#w##w##w##w##ww#
+#w##w##w##w##ww#
+#wwwwwwwwwwwwww#
+################
+................""",
+"clock": """
+.....######.....
+...##wwwwww##...
+..#wwwwddwwww#..
+.#wwwwwddwwwww#.
+.#wwwwwddwwwww#.
+#wwwwwwddwwwwww#
+#wwwwwwddwwwwww#
+#wwwwwwdddddddw#
+#wwwwwwdddddddw#
+#wwwwwwwwwwwwww#
+#wwwwwwwwwwwwww#
+.#wwwwwwwwwwww#.
+.#wwwwwwwwwwww#.
+..#wwwwwwwwww#..
+...##wwwwww##...
+.....######.....""",
+"warn": """
+.......##.......
+......####......
+......####......
+.....##ww##.....
+.....##ww##.....
+....###ww###....
+....###ww###....
+...####ww####...
+...####ww####...
+..############..
+..#####ww#####..
+.######ww######.
+.##############.
+################
+................
+................""",
+}
+
+_ICON_CACHE = {}
+_ICON_ROOT = [None]   # نافذة البرنامج الحالية (الأيقونات بتتعمل من جديد لو البرنامج اتفتح تاني بعد تبديل المستخدم)
+
+def _shade(hexcol, f):
+    r, g, b = (int(hexcol[i:i + 2], 16) for i in (1, 3, 5))
+    return "#%02x%02x%02x" % tuple(max(0, min(255, int(v * f))) for v in (r, g, b))
+
+def make_icon(name, color="#1f6fd1", scale=1):
+    """أيقونة PhotoImage من رسم البكسل (بتتعمل مرة وتتحفظ)."""
+    key = (name, color, scale)
+    if key in _ICON_CACHE: return _ICON_CACHE[key]
+    rows = ICON_ART[name].strip("\n").split("\n")
+    cols = {"#": color, "d": _shade(color, 0.62), "w": "#ffffff"}
+    if color.lower() == "#ffffff": cols = {"#": "#ffffff", "d": "#dbeafe", "w": "#1f6fd1"}   # أيقونة بيضا على الزرار الأزرق
+    img = tk.PhotoImage(master=_ICON_ROOT[0], width=16, height=16)
+    for y, r in enumerate(rows):
+        for x, ch in enumerate(r):
+            if ch in cols: img.put(cols[ch], to=(x, y, x + 1, y + 1))
+    if scale > 1: img = img.zoom(scale)
+    _ICON_CACHE[key] = img
+    return img
+
+# أيقونة تلقائية لأي زرار حسب الكلام المكتوب عليه (الترتيب مهم: الأدق الأول)
+BUTTON_ICONS = [
+    ("إلغاء", "close", "#64748b"), ("إغلاق", "close", "#64748b"), ("طباعة", "print", "#334e68"), ("🖨", "print", "#334e68"), ("حفظ", "save", "#16a34a"), ("حذف", "trash", "#dc2626"),
+    ("تعديل", "edit", "#ea7a0c"), ("صرف", "money", "#0d9488"), ("إضافة", "plus", "#16a34a"), ("+", "plus", "#16a34a"),
+    ("جديد", "plus", "#16a34a"), ("كشف", "list", "#1f6fd1"), ("سجل", "list", "#1f6fd1"), ("حركات", "list", "#1f6fd1"),
+    ("ملخص", "chart", "#7c3aed"), ("مقارنة", "chart", "#7c3aed"), ("عرض", "search", "#1f6fd1"), ("بحث", "search", "#1f6fd1"),
+    ("جرد", "calc", "#0d9488"), ("إيداع", "money", "#16a34a"), ("سحب", "money", "#dc2626"), ("دخول", "user", "#1f6fd1"),
+    ("إنشاء", "user", "#16a34a"), ("إلغاء", "close", "#64748b"), ("إغلاق", "close", "#64748b"), ("تفريغ", "close", "#64748b"),
+    ("إيقاف", "warn", "#ea7a0c"), ("تغيير", "edit", "#ea7a0c"), ("اختيار", "search", "#1f6fd1"), ("الرجوع", "home", "#64748b"),
+    ("فتح", "search", "#1f6fd1"), ("سند", "invoice", "#1f6fd1"), ("أمانة", "invoice", "#c9a54a"),
+]
+
+def icon_for_text(text):
+    for kw, name, color in BUTTON_ICONS:
+        if kw in text: return make_icon(name, color)
+    return None
+
+_TtkButton = ttk.Button
+class IconButton(_TtkButton):
+    """زرار ttk بيحط أيقونة ملونة لوحده جنب الكلام."""
+    def __init__(self, master=None, **kw):
+        style = str(kw.get("style", ""))
+        if "image" not in kw and not style.startswith("Nav") and kw.get("text"):
+            kw["text"] = kw["text"].replace("🖨", "").replace("📋", "").strip()
+            try:
+                img = icon_for_text(kw["text"])
+                if img is not None: kw["image"] = img; kw["compound"] = "right"
+            except tk.TclError: pass
+        super().__init__(master, **kw)
+ttk.Button = IconButton
+
+# أيقونة ولون كل قسم في الشريط العلوي
+NAV_ICONS = {"الرئيسية": ("home", "#1f6fd1"), "الفواتير": ("invoice", "#16a34a"), "الأصناف والمخزون": ("box", "#ea7a0c"),
+             "العملاء والموردون": ("people", "#7c3aed"), "الموظفون": ("user", "#0891b2"), "الحسابات": ("calc", "#0d9488"),
+             "السندات": ("money", "#b45309"), "التقارير": ("chart", "#dc2626"), "الأرباح": ("chart", "#16a34a"),
+             "الإعدادات": ("gear", "#64748b")}
+
+BG = "#f2f7fc"; PANEL = "#fafcfe"; NAVY = "#123b67"; NAVBAR = "#e1edf8"; STRIPE = "#e4f2fb"; ACCENT = "#1f6fd1"
+
+# كل شاشة تابعة لأي زرار في الشريط العلوي (عشان يتلوّن بالأزرق)
+SECTION = {
+    "show_home": "الرئيسية",
+    "show_invoice": "الفواتير", "show_invoices": "الفواتير",
+    "show_items": "الأصناف والمخزون", "show_stock": "الأصناف والمخزون",
+    "show_sample_items": "الأصناف والمخزون", "show_damaged": "الأصناف والمخزون", "show_samples": "الأصناف والمخزون",
+    "show_parties": "العملاء والموردون", "show_party_list": "العملاء والموردون", "show_employees": "الموظفون", "show_attendance": "الموظفون", "show_attendance_log": "الموظفون", "show_att_requests": "الموظفون",
+    "show_account": "الحسابات", "show_balances": "الحسابات", "show_cash": "الحسابات", "show_subcash": "الحسابات", "show_vehicles": "الموظفون",
+    "show_payments": "السندات", "show_vouchers": "السندات", "show_rep_requests": "السندات", "show_profit": "الأرباح", "show_reps": "التقارير", "show_targets": "التقارير", "show_dashboard": "التقارير",
+    "show_daily": "التقارير", "show_items_out": "الأصناف والمخزون", "show_log": "التقارير",
+    "show_settings": "الإعدادات", "show_users": "الإعدادات",
+}
+
+
+AR_MONTHS = ["يناير", "فبراير", "مارس", "أبريل", "مايو", "يونيو", "يوليو", "أغسطس", "سبتمبر", "أكتوبر", "نوفمبر", "ديسمبر"]
+AR_DAYS = ["سبت", "أحد", "اثنين", "ثلاثاء", "أربعاء", "خميس", "جمعة"]   # الأسبوع بيبدأ السبت
+
+class DatePicker(tk.Toplevel):
+    """تقويم صغير بيفتح تحت خانة التاريخ: تختار اليوم بالماوس."""
+    def __init__(self, anchor, var):
+        super().__init__(anchor.winfo_toplevel())
+        self.var = var; self.overrideredirect(True); self.configure(bg=NAVY)
+        try: cur = datetime.strptime(var.get().strip(), "%Y-%m-%d").date()
+        except ValueError: cur = date.today()
+        self.sel = cur; self.year, self.month = cur.year, cur.month
+        self.box = tk.Frame(self, bg="white", padx=6, pady=6); self.box.pack(padx=2, pady=2)
+        self.draw()
+        self.update_idletasks()
+        x = anchor.winfo_rootx() + anchor.winfo_width() - self.winfo_reqwidth()
+        y = anchor.winfo_rooty() + anchor.winfo_height() + 2
+        if y + self.winfo_reqheight() > self.winfo_screenheight() - 40: y = anchor.winfo_rooty() - self.winfo_reqheight() - 2
+        self.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        self.bind("<Escape>", lambda e: self.destroy())
+        self.after(50, self._grab)
+
+    def _grab(self):
+        try: self.grab_set(); self.focus_set()
+        except tk.TclError: pass
+        self.bind("<Button-1>", self._click_outside)
+
+    def _click_outside(self, e):
+        # بالمكان مش بالعنصر: الضغطة على ساعة/صباحًا بتعيد رسم الأزرار، فالعنصر اللي اتداس عليه بيتمسح قبل ما نوصل هنا
+        try:
+            x, y = self.winfo_rootx(), self.winfo_rooty()
+            if x <= e.x_root < x + self.winfo_width() and y <= e.y_root < y + self.winfo_height(): return
+        except tk.TclError: return
+        self.destroy()
+
+    def shift(self, d):
+        m = self.month + d; y = self.year + (m - 1) // 12; m = (m - 1) % 12 + 1
+        self.year, self.month = y, m; self.draw()
+
+    def pick(self, d):
+        self.var.set(d.isoformat()); self.destroy()
+
+    def draw(self):
+        for w in self.box.winfo_children(): w.destroy()
+        hdr = tk.Frame(self.box, bg="white"); hdr.grid(row=0, column=0, columnspan=7, sticky="ew", pady=(0, 4))
+        tk.Button(hdr, text="◀", command=lambda: self.shift(1), relief="flat", bg="#e3eefa", fg=NAVY, font=("Tahoma", 12, "bold"), width=3, cursor="hand2").pack(side="left")
+        tk.Button(hdr, text="▶", command=lambda: self.shift(-1), relief="flat", bg="#e3eefa", fg=NAVY, font=("Tahoma", 12, "bold"), width=3, cursor="hand2").pack(side="right")
+        tk.Label(hdr, text=f"{AR_MONTHS[self.month - 1]} {self.year}", bg="white", fg=NAVY, font=("Tahoma", 13, "bold")).pack(side="top", expand=True)
+        for i, dn in enumerate(AR_DAYS):
+            tk.Label(self.box, text=dn, bg="#cfe2f6", fg=NAVY, font=("Tahoma", 10, "bold"), width=6).grid(row=1, column=6 - i, padx=1, pady=1, sticky="ew")
+        first = date(self.year, self.month, 1)
+        start = first - timedelta(days=(first.weekday() - 5) % 7)   # أول سبت قبل أول الشهر
+        today = date.today()
+        for k in range(42):
+            d = start + timedelta(days=k); r, ci = divmod(k, 7)
+            inmonth = d.month == self.month
+            bg = ACCENT if d == self.sel else ("#fff2c2" if d == today else "white")
+            fg = "white" if d == self.sel else (NAVY if inmonth else "#a7b4c2")
+            lb = tk.Label(self.box, text=str(d.day), bg=bg, fg=fg, font=("Tahoma", 12, "bold" if d in (today, self.sel) else "normal"), width=6, pady=4, cursor="hand2",
+                          highlightthickness=1 if d == today else 0, highlightbackground="#f0a500")
+            lb.grid(row=r + 2, column=6 - ci, padx=1, pady=1)
+            lb.bind("<Button-1>", lambda e, dd=d: self.pick(dd))
+            if d != self.sel:
+                lb.bind("<Enter>", lambda e, w=lb: w.config(bg="#dbeafe")); lb.bind("<Leave>", lambda e, w=lb, b=bg: w.config(bg=b))
+        ft = tk.Frame(self.box, bg="white"); ft.grid(row=8, column=0, columnspan=7, sticky="ew", pady=(4, 0))
+        tk.Button(ft, text=f"اليوم: {today.isoformat()}", command=lambda: self.pick(today), relief="flat", bg="#fff2c2", fg=NAVY, font=("Tahoma", 11, "bold"), cursor="hand2").pack(side="right", fill="x", expand=True)
+        tk.Button(ft, text="مسح", command=lambda: (self.var.set(""), self.destroy()), relief="flat", bg="#eef2f6", fg="#64748b", font=("Tahoma", 11), cursor="hand2").pack(side="left", padx=(4, 0))
+
+def time12(hhmm):
+    """‎"13:05"‎ → ‎"01:05 م"‎"""
+    try: h, m = map(int, str(hhmm).split(":")[:2])
+    except (ValueError, AttributeError): return ""
+    return f"{(h % 12) or 12:02d}:{m:02d} " + ("ص" if h < 12 else "م")
+
+def parse_time(txt):
+    """يقبل ‎"9:15"‎ أو ‎"09:15 ص"‎ أو ‎"1:05 م"‎ ويرجّع ‎"HH:MM"‎ (24 ساعة)، أو "" لو فاضي، أو None لو غلط."""
+    t = str(txt or "").strip().translate(str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789"))
+    if not t: return ""
+    pm = "م" in t or "pm" in t.lower(); am = "ص" in t or "am" in t.lower()
+    m = re.match(r"^(\d{1,2})(?:[:.](\d{1,2}))?", t)
+    if not m: return None
+    h, mi = int(m.group(1)), int(m.group(2) or 0)
+    if pm and h < 12: h += 12
+    if am and h == 12: h = 0
+    if not (0 <= h < 24 and 0 <= mi < 60): return None
+    return f"{h:02d}:{mi:02d}"
+
+def minutes_of(hhmm):
+    h, m = map(int, hhmm.split(":")); return h * 60 + m
+
+def fmt_minutes(n):
+    n = int(n or 0)
+    if n < 60: return f"{n} دقيقة"
+    h = n // 60; hs = "ساعة" if h == 1 else "ساعتين" if h == 2 else f"{h} ساعات" if h <= 10 else f"{h} ساعة"
+    return hs + (f" و {n % 60} دقيقة" if n % 60 else "")   # مسافة بعد «و» عشان بعض الخطوط بتلزقها في الرقم
+
+class TimePicker(DatePicker):
+    """اختيار الساعة بالماوس زي التقويم: الساعة ← الدقايق ← صباحًا/مساءً."""
+    def __init__(self, anchor, var, on_pick=None):
+        self.on_pick = on_pick
+        cur = parse_time(var.get()) or datetime.now().strftime("%H:%M")
+        h, m = map(int, cur.split(":"))
+        self.h12, self.mi, self.pm = (h % 12) or 12, m - m % 5, h >= 12
+        tk.Toplevel.__init__(self, anchor.winfo_toplevel())
+        self.var = var; self.overrideredirect(True); self.configure(bg=NAVY)
+        self.box = tk.Frame(self, bg="white", padx=6, pady=6); self.box.pack(padx=2, pady=2)
+        self.draw()
+        self.update_idletasks()
+        x = anchor.winfo_rootx() + anchor.winfo_width() - self.winfo_reqwidth()
+        y = anchor.winfo_rooty() + anchor.winfo_height() + 2
+        if y + self.winfo_reqheight() > self.winfo_screenheight() - 40: y = anchor.winfo_rooty() - self.winfo_reqheight() - 2
+        self.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        self.bind("<Escape>", lambda e: self.destroy())
+        self.after(50, self._grab)
+
+    def _btn(self, parent, text, sel, cmd, w=5):
+        b = tk.Label(parent, text=text, width=w, pady=5, cursor="hand2", font=("Tahoma", 12, "bold" if sel else "normal"),
+                     bg=ACCENT if sel else "#eef4fb", fg="white" if sel else NAVY)
+        b.bind("<Button-1>", lambda e: cmd())
+        if not sel: b.bind("<Enter>", lambda e: b.config(bg="#dbeafe")); b.bind("<Leave>", lambda e: b.config(bg="#eef4fb"))
+        return b
+
+    def draw(self):
+        for w in self.box.winfo_children(): w.destroy()
+        tk.Label(self.box, text=f"{self.h12:02d}:{self.mi:02d} {'م' if self.pm else 'ص'}", bg="white", fg=NAVY, font=("Tahoma", 18, "bold")).pack(pady=(0, 4))
+        ap = tk.Frame(self.box, bg="white"); ap.pack(fill="x", pady=2)
+        for txt, val in (("صباحًا", False), ("مساءً", True)):
+            self._btn(ap, txt, self.pm == val, lambda v=val: self._set(pm=v), 8).pack(side="right", expand=True, fill="x", padx=1)
+        tk.Label(self.box, text="الساعة", bg="white", fg="#50647b", font=("Tahoma", 10)).pack(anchor="e")
+        hg = tk.Frame(self.box, bg="white"); hg.pack()
+        for i, h in enumerate(range(1, 13)):
+            self._btn(hg, str(h), h == self.h12, lambda v=h: self._set(h12=v)).grid(row=i // 6, column=5 - i % 6, padx=1, pady=1)
+        tk.Label(self.box, text="الدقايق (اضغط عليها للاختيار)", bg="white", fg="#50647b", font=("Tahoma", 10)).pack(anchor="e", pady=(4, 0))
+        mg = tk.Frame(self.box, bg="white"); mg.pack()
+        for i, m in enumerate(range(0, 60, 5)):
+            self._btn(mg, f"{m:02d}", m == self.mi, lambda v=m: self._set(mi=v, done=True)).grid(row=i // 6, column=5 - i % 6, padx=1, pady=1)
+        ft = tk.Frame(self.box, bg="white"); ft.pack(fill="x", pady=(6, 0))
+        tk.Button(ft, text="تمام", command=lambda: self._set(done=True), relief="flat", bg=ACCENT, fg="white", font=("Tahoma", 11, "bold"), cursor="hand2").pack(side="right", fill="x", expand=True)
+        tk.Button(ft, text="الساعة دلوقتي", command=self._now, relief="flat", bg="#fff2c2", fg=NAVY, font=("Tahoma", 11), cursor="hand2").pack(side="right", padx=4)
+        tk.Button(ft, text="مسح", command=lambda: self._finish(""), relief="flat", bg="#eef2f6", fg="#64748b", font=("Tahoma", 11), cursor="hand2").pack(side="left")
+
+    def _set(self, done=False, **kw):
+        for k, v in kw.items(): setattr(self, k, v)
+        if done: return self._finish(f"{self.h12:02d}:{self.mi:02d} {'م' if self.pm else 'ص'}")
+        self.draw()
+
+    def _now(self):
+        n = datetime.now(); self._finish(time12(n.strftime("%H:%M")))
+
+    def _finish(self, txt):
+        self.var.set(txt); self.destroy()
+        if self.on_pick: self.on_pick()
+
+def is_date_label(label):
+    l = label.replace("YYYY-MM-DD", "").strip()
+    return "YYYY-MM-DD" in label or "تاريخ" in l.split("(")[0] or l in ("من", "إلى", "التاريخ")
+
+class StripedTree(ttk.Treeview):
+    """جدول بصفوف ملونة بالتناوب (أبيض / أزرق فاتح)، والأعمدة معروضة من اليمين للشمال.
+    الصف المحدد يفضل أزرق غامق: لون التناوب يتشال منه وقت التحديد ويرجع بعده."""
+    STRIPES = ("even", "odd")
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self._n = 0; self._sel = set()
+        self.tag_configure("even", background="white")
+        self.tag_configure("odd", background=STRIPE)
+        self.bindtags(self.bindtags() + ("StripedTree",))
+
+    def insert(self, parent, index, iid=None, **kw):
+        if parent == "":
+            tags = kw.get("tags", ())
+            if isinstance(tags, str): tags = (tags,)
+            kw["tags"] = (self.STRIPES[self._n % 2],) + tuple(t for t in tags if t not in self.STRIPES)
+            self._n += 1
+        return super().insert(parent, index, iid=iid, **kw)
+
+    def delete(self, *items):
+        super().delete(*items)
+        if not self.get_children(""):
+            self._n = 0; self._sel = set()
+            if getattr(self, "_sort", None): self._sort = None; self._sort_marks()
+
+    # ----- ترتيب بالضغط على عنوان العمود (تصاعدي ← تنازلي) -----
+    def enable_sort(self):
+        self._sort = None; self._titles = {}
+        for col in self["columns"]:
+            self._titles[col] = self.heading(col, "text")
+            self.heading(col, command=lambda c=col: self.sort_by(c))
+
+    @staticmethod
+    def _sort_key(v):
+        t = str(v).strip()
+        n = t.replace(",", "").replace("٬", "").replace("ج.م", "").replace("%", "").replace("−", "-").strip().translate(_AR_DIGITS)
+        try: return (0, float(n), "")
+        except ValueError: return (1 if t else 2, 0.0, t)      # الأرقام الأول، بعدين الكلام، والفاضي في الآخر
+
+    def sort_by(self, col):
+        rows = list(self.get_children(""))
+        if not rows or any("h" in (self.item(i, "tags") or ()) for i in rows): return   # تقارير متقسمة بعناوين: مفيش ترتيب
+        desc = bool(self._sort and self._sort[0] == col and not self._sort[1])
+        keyed = [(self._sort_key(self.set(i, col)), i) for i in rows]
+        filled = [x for x in keyed if x[0][0] != 2]; empty = [x for x in keyed if x[0][0] == 2]
+        filled.sort(key=lambda x: x[0], reverse=desc)
+        for n, (_, iid) in enumerate(filled + empty):
+            self.move(iid, "", n)
+            if iid not in self._sel:
+                tags = tuple(t for t in (self.item(iid, "tags") or ()) if t not in self.STRIPES)
+                self.item(iid, tags=(self.STRIPES[n % 2],) + tags)
+        self._sort = (col, desc); self._sort_marks()
+
+    def _sort_marks(self):
+        for col, title in (getattr(self, "_titles", None) or {}).items():
+            mark = (" ▼" if self._sort[1] else " ▲") if self._sort and self._sort[0] == col else ""
+            try: self.heading(col, text=title + mark)
+            except tk.TclError: pass
+
+    def _restripe_selection(self):
+        cur = set(self.selection())
+        for iid in self._sel - cur:
+            if self.exists(iid):
+                tags = tuple(self.item(iid, "tags") or ())
+                stripe = self.STRIPES[self.index(iid) % 2]
+                if stripe not in tags: self.item(iid, tags=(stripe,) + tags)
+        for iid in cur - self._sel:
+            tags = tuple(t for t in (self.item(iid, "tags") or ()) if t not in self.STRIPES)
+            self.item(iid, tags=tags)
+        self._sel = cur
+
+def _drag_press(e):
+    t = e.widget
+    t._drag = None
+    if str(t.cget("selectmode")) != "extended" or t.identify_region(e.x, e.y) not in ("cell", "tree"): return
+    if e.state & 0x0005: return                     # Shift/Ctrl + كليك: سيب السلوك العادي
+    row = t.identify_row(e.y)
+    if row: t._drag = {"anchor": row, "y": e.y, "job": None}
+
+def _drag_select_to(t, row):
+    d = getattr(t, "_drag", None)
+    if not d or not row: return
+    kids = list(t.get_children(""))
+    try: a, b = kids.index(d["anchor"]), kids.index(row)
+    except ValueError: return
+    lo, hi = min(a, b), max(a, b)
+    t.selection_set(kids[lo:hi + 1]); t.see(row)
+
+def _drag_motion(e):
+    t = e.widget; d = getattr(t, "_drag", None)
+    if not d: return
+    d["y"] = e.y
+    h = t.winfo_height()
+    if 0 <= e.y < h: _drag_select_to(t, t.identify_row(e.y))
+    if (e.y < 0 or e.y >= h) and not d["job"]: _drag_scroll(t)
+    return "break"
+
+def _drag_scroll(t):
+    """طول ما الماوس برّه الجدول (فوق أو تحت) والزرار مضغوط: الجدول بيتحرك ويكمّل التحديد."""
+    d = getattr(t, "_drag", None)
+    if not d or not t.winfo_exists(): return
+    y, h = d["y"], t.winfo_height()
+    if 0 <= y < h: d["job"] = None; return
+    t.yview_scroll(-1 if y < 0 else 1, "units")
+    kids = list(t.get_children(""))
+    if kids:
+        edge = t.identify_row(2 if y < 0 else h - 3) or (kids[0] if y < 0 else kids[-1])
+        _drag_select_to(t, edge)
+    d["job"] = t.after(max(15, 90 - min(abs(y if y < 0 else y - h), 75)), lambda: _drag_scroll(t))   # كل ما تبعد أكتر يسرع
+
+def _drag_release(e):
+    t = e.widget; d = getattr(t, "_drag", None)
+    if d and d.get("job"):
+        try: t.after_cancel(d["job"])
+        except Exception: pass
+    t._drag = None
+
+def _on_striped_select(e):
+    try: e.widget._restripe_selection()
+    except Exception: pass
+
+_INPUTS = (ttk.Entry, ttk.Combobox, tk.Entry, ttk.Spinbox, tk.Spinbox)
+
+def _input_ok(cur, top):
+    if not isinstance(cur, _INPUTS): return False
+    try: return str(cur.cget("state")) != "disabled" and bool(cur.winfo_viewable()) and cur.winfo_toplevel() is top
+    except tk.TclError: return False
+
+def _next_input(w, back=False):
+    """الخانة اللي بعدها في نفس النافذة (بيتخطى الزراير والمقفول) — من غير ما يلف للأول تاني."""
+    top = w.winfo_toplevel(); order, seen, cur = [], set(), top
+    for _ in range(600):                                   # ترتيب الخانات في النافذة زي Tab
+        try: cur = cur.tk_focusNext()
+        except (tk.TclError, KeyError): break
+        if cur is None or str(cur) in seen: break
+        seen.add(str(cur))
+        if _input_ok(cur, top): order.append(cur)
+    if w not in order: return None
+    i = order.index(w) + (-1 if back else 1)
+    return order[i] if 0 <= i < len(order) else None
+
+def focus_input(w):
+    """ينقل للخانة والمؤشر في آخر الكلام (من غير ما يحدد الكلام كله — Backspace تمسح حرف حرف)."""
+    try:
+        w.focus_set(); w.icursor("end"); w.selection_clear()
+    except tk.TclError: pass
+
+_FIT_STYLES = set()
+def _fit_popdown(e):
+    w = e.widget
+    try:
+        vals = w.cget("values")
+        if not vals: return
+        import tkinter.font as tkfont
+        fnt = tkfont.Font(family="Tahoma", size=13)
+        need = max(fnt.measure(str(v)) for v in (vals if isinstance(vals, (list, tuple)) else w.tk.splitlist(vals))) + 46
+        cur = w.winfo_width(); extra = min(max(0, need - cur), max(0, w.winfo_screenwidth() - cur - 20))
+        base = str(w.cget("style")) or "TCombobox"
+        if base.startswith("Fit") and "." in base: base = base.split(".", 1)[1]
+        if extra < 8:
+            if str(w.cget("style")).startswith("Fit"): w.configure(style=base)
+            return
+        extra = (extra // 10 + 1) * 10
+        shift = min(extra, max(0, w.winfo_rootx() - 5))       # بتفرد ناحية الشمال (اتجاه العربي) ومش بتخرج برّه الشاشة
+        name = f"Fit{extra}x{shift}.{base}"
+        if name not in _FIT_STYLES:
+            ttk.Style(w).configure(name, postoffset=(-shift, 0, extra, 0)); _FIT_STYLES.add(name)
+        if str(w.cget("style")) != name: w.configure(style=name)
+    except (tk.TclError, ValueError): pass
+
+def _no_select_all(e):
+    """ويندوز/Tk بيحددوا كل الكلام لما تدخل الخانة بـ Tab أو تختار من القايمة — بنشيل التحديد ونسيب المؤشر في الآخر."""
+    w = e.widget
+    def later():
+        try:
+            if w.winfo_exists() and w.selection_present() and w.index("sel.first") == 0 and w.index("sel.last") == w.index("end"):
+                w.selection_clear(); w.icursor("end")
+        except (tk.TclError, AttributeError): pass
+    try: w.after_idle(later)
+    except tk.TclError: pass
+
+def _enter_next(e):
+    w = e.widget
+    try:
+        if not w.winfo_exists() or w.bind("<Return>"): return     # الخانة ليها شغل خاص بالـ Enter
+    except tk.TclError: return
+    nxt = _next_input(w)
+    top = w.winfo_toplevel()
+    if nxt is None: return            # آخر خانة: لو دايلوج، الـ Enter بتاعه (تمام/دخول) هو اللي يشتغل
+    focus_input(nxt)
+    if top.bind("<Return>"): return "break"
+    return None
+
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        _ICON_CACHE.clear(); _ICON_ROOT[0] = self
+        # Enter = الخانة اللي بعدها (في كل الشاشات والنوافذ)
+        for cls in ("TEntry", "TCombobox", "Entry", "TSpinbox", "Spinbox"):
+            self.bind_class(cls, "<Return>", _enter_next, add="+"); self.bind_class(cls, "<KP_Enter>", _enter_next, add="+")
+            self.bind_class(cls, "<FocusIn>", _no_select_all, add="+")
+        self.bind_class("TCombobox", "<<ComboboxSelected>>", _no_select_all, add="+")
+        # القايمة اللي بتنزل من أي Combobox: عرضها على قد أطول اختيار (الكلام يبان كله)
+        for ev in ("<Enter>", "<FocusIn>"): self.bind_class("TCombobox", ev, _fit_popdown, add="+")
+        self.geometry("1280x800")
+        try: self.state("zoomed")   # يفتح ملء الشاشة على ويندوز
+        except tk.TclError: pass
+        self.compact = self.winfo_screenheight() < 900   # شاشة صغيرة (لابتوب): مسافات أقل
+        self.minsize(1100, 680)
+        self.configure(bg=BG)
+        self.style = ttk.Style(self)
+        try: self.style.theme_use("clam")
+        except Exception: pass
+        st = self.style
+        st.configure(".", font=("Tahoma", 12))
+        st.configure("TButton", padding=(10, 6), font=("Tahoma", 12), background="#f7fafd", bordercolor="#c5d5e6", lightcolor="#ffffff", darkcolor="#dfe8f1")
+        st.map("TButton", background=[("active", "#e3eefa")])
+        st.configure("Nav.TButton", padding=(8, self.nav_vpad()), font=("Tahoma", 12), foreground="#1d3d5f", background="#ffffff", bordercolor="#c5d5e6", lightcolor="#ffffff", darkcolor="#e6eef6")
+        st.map("Nav.TButton", background=[("active", "#e3eefa")])
+        st.configure("NavActive.TButton", padding=(8, self.nav_vpad()), font=("Tahoma", 12, "bold"), foreground="white", background=ACCENT, bordercolor="#1a5fb4", lightcolor=ACCENT, darkcolor="#1a5fb4")
+        st.map("NavActive.TButton", background=[("active", "#2a7be0")], foreground=[("active", "white")])
+        st.configure("TLabel", font=("Tahoma", 12), background=BG)
+        st.configure("Treeview", font=("Tahoma", 12), rowheight=29 if self.compact else 34, background="white", fieldbackground="white", bordercolor="#c9d8e8")
+        st.configure("Treeview.Heading", font=("Tahoma", 12, "bold"), padding=(4, 6), background="#cfe2f6", foreground="#123b67", bordercolor="#b9cde2", lightcolor="#e6f0fa", darkcolor="#b9cde2")
+        st.map("Treeview.Heading", background=[("active", "#c6dcf2")])
+        st.map("Treeview", background=[("selected", ACCENT)], foreground=[("selected", "white")])
+        self.bind_class("StripedTree", "<<TreeviewSelect>>", _on_striped_select)
+        # تحديد أكتر من سطر بالسحب (زي Excel) + القايمة بتنزل/تطلع لوحدها لما تسحب لآخرها
+        self.bind_class("StripedTree", "<ButtonPress-1>", _drag_press, add="+")
+        self.bind_class("StripedTree", "<B1-Motion>", _drag_motion, add="+")
+        self.bind_class("StripedTree", "<ButtonRelease-1>", _drag_release, add="+")
+        # أي نافذة صغيرة بتكبر لوحدها على قد محتواها (علشان الأزرار ماتستخبّاش بعد تكبير الخط)
+        self.bind_class("Toplevel", "<Map>", lambda e: e.widget.after(30, lambda w=e.widget: self.fit_window(w)), add="+")
+        # خط أكبر في البرنامج كله (الخانات والقوايم المنسدلة كمان)
+        import tkinter.font as tkfont
+        for fname in ("TkDefaultFont", "TkTextFont", "TkMenuFont", "TkHeadingFont", "TkFixedFont"):
+            try: tkfont.nametofont(fname).configure(family="Tahoma", size=13)
+            except tk.TclError: pass
+        self.option_add("*TEntry.font", ("Tahoma", 13)); self.option_add("*TCombobox.font", ("Tahoma", 13))
+        self.option_add("*TCombobox*Listbox.font", ("Tahoma", 13)); self.option_add("*Entry.font", ("Tahoma", 13))
+        st.configure("TEntry", padding=(6, 4)); st.configure("TCombobox", padding=(6, 4))
+        # الخانة اللي بتكتب فيها تنور بلون فاتح (زي الـ highlight)
+        st.map("TEntry", fieldbackground=[("focus", "#fff7d6"), ("disabled", "#eef2f6")], bordercolor=[("focus", "#f0a500")])
+        st.map("TCombobox", fieldbackground=[("focus", "#fff7d6"), ("readonly", "white"), ("disabled", "#eef2f6")],
+               bordercolor=[("focus", "#f0a500")], foreground=[("disabled", "#8a98a8")])
+        # خلفيات فاتحة للنماذج بدل الرمادي الافتراضي
+        for cls in ("Frame", "Labelframe", "Label"): self.option_add(f"*{cls}.background", PANEL)
+        self.option_add("*Labelframe.foreground", NAVY)
+        self.option_add("*Labelframe.font", ("Tahoma", 12, "bold"))
+        self.option_add("*Labelframe.relief", "groove")
+        st.configure("TCombobox", fieldbackground="white", background="#f7fafd", bordercolor="#c5d5e6", arrowcolor="#3b5f86")
+        st.configure("TEntry", fieldbackground="white", bordercolor="#c5d5e6")
+        self.current_lines = []
+        self.invoice_kind = "مبيعات"
+        self.edit_id = None
+        self.last_statement = None
+        self.item_edit_id = None
+        self.party_edit_id = None
+        self.emp_edit_id = None
+        self.pay_edit = None
+        self.active_section = None
+        self.relogin = False
+        # تسجيل الدخول قبل ما الشاشة الرئيسية تظهر
+        CURRENT_USER.update(id=None, username="", role="")
+        self.withdraw()
+        self.logged_in = self.login()
+        if not self.logged_in: return
+        self.deiconify()
+        # تلوين زرار القسم تلقائيًا مع فتح أي شاشة
+        for name, sec in SECTION.items():
+            orig = getattr(self, name)
+            def wrapper(*a, _orig=orig, _sec=sec, _name=name, **k):
+                self.set_active(_sec)
+                try: self.status.config(text="جاهز")   # الرسالة القديمة تتمسح مع كل شاشة جديدة
+                except Exception: pass
+                res = _orig(*a, **k)
+                self._last_screen = (_name, a, k); self.mark_refreshed()
+                return res
+            setattr(self, name, wrapper)
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.build_shell()
+        self.refresh_header()
+        self.show_home()
+
+    # ================= تسجيل الدخول =================
+    def _dialog(self, title, w=520, h=360):
+        d = tk.Toplevel(self); d.title(title); d.configure(bg=BG); d.resizable(False, False)
+        sw, sh = d.winfo_screenwidth(), d.winfo_screenheight()
+        d.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 3}")
+        top = tk.Frame(d, bg=NAVY); top.pack(fill="x")
+        with db() as c: st = c.execute("SELECT company,tagline FROM settings WHERE id=1").fetchone()
+        self._dlg_logo = self.load_logo_image(70)
+        if self._dlg_logo: tk.Label(top, image=self._dlg_logo, bg=NAVY).pack(pady=(10, 0))
+        tk.Label(top, text=(st["company"] or DEFAULT_COMPANY), font=("Tahoma", 19, "bold"), fg="white", bg=NAVY).pack(pady=(6, 0))
+        tk.Label(top, text=(st["tagline"] or ""), font=("Tahoma", 12), fg="#cfe2fa", bg=NAVY).pack(pady=(0, 10))
+        tk.Label(d, text=title, font=("Tahoma", 15, "bold"), fg=NAVY, bg=BG).pack(pady=(12, 6))
+        return d
+
+    def _entry(self, parent, label, var, show=None):
+        tk.Label(parent, text=label, bg=BG, anchor="e").pack(fill="x", padx=30)
+        e = ttk.Entry(parent, textvariable=var, justify="right", show=show or ""); e.pack(fill="x", padx=30, pady=(0, 8))
+        return e
+
+    def login(self):
+        with db() as c: n = c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        return self.first_owner_dialog() if n == 0 else self.login_dialog()
+
+    def first_owner_dialog(self):
+        d = self._dialog("إنشاء حساب المالك", h=580)
+        tk.Label(d, text="أول مرة: اعمل حساب المالك (ليه كل الصلاحيات).\n⚠️ اكتب كلمة السر في مكان آمن — مفيش طريقة استرجاع حاليًا.",
+                 bg=BG, fg="#9b2c2c", font=("Tahoma", 11), justify="center", wraplength=480).pack(pady=(0, 8))
+        u, p1, p2 = tk.StringVar(), tk.StringVar(), tk.StringVar()
+        e = self._entry(d, "اسم المستخدم", u); self._entry(d, "كلمة السر", p1, "•"); self._entry(d, "تأكيد كلمة السر", p2, "•")
+        result = {"ok": False}
+        def ok(*a):
+            name = u.get().strip()
+            if not name: return messagebox.showwarning("تنبيه", "اكتب اسم المستخدم", parent=d)
+            if len(p1.get()) < 4: return messagebox.showwarning("تنبيه", "كلمة السر لازم تكون 4 حروف/أرقام على الأقل", parent=d)
+            if p1.get() != p2.get(): return messagebox.showerror("خطأ", "كلمتين السر مش متطابقتين", parent=d)
+            h, salt = hash_pw(p1.get())
+            with db() as c:
+                uid = c.execute("INSERT INTO users(username,pw_hash,salt,role,active,created_at) VALUES(?,?,?,?,1,?)", (name, h, salt, ROLE_OWNER, now_ts())).lastrowid
+            CURRENT_USER.update(id=uid, username=name, role=ROLE_OWNER)
+            with db() as c: log(c, "إنشاء حساب المالك", name)
+            result["ok"] = True; d.destroy()
+        ttk.Button(d, text="إنشاء والدخول", command=ok).pack(pady=8)
+        self._server_button(d)
+        d.bind("<Return>", ok); e.focus_set()
+        d.protocol("WM_DELETE_WINDOW", d.destroy); d.grab_set(); self.wait_window(d)
+        return result["ok"]
+
+    def login_dialog(self):
+        d = self._dialog("تسجيل الدخول", h=490)
+        u, p = tk.StringVar(), tk.StringVar()
+        e = self._entry(d, "اسم المستخدم", u); pe = self._entry(d, "كلمة السر", p, "•")
+        msg = tk.Label(d, text="", bg=BG, fg="#b91c1c", font=("Tahoma", 11)); msg.pack()
+        result = {"ok": False}
+        def ok(*a):
+            with db() as c: r = c.execute("SELECT * FROM users WHERE username=? AND active=1", (u.get().strip(),)).fetchone()
+            if not r or not check_pw(p.get(), r["pw_hash"], r["salt"]):
+                p.set(""); pe.focus_set(); return msg.config(text="اسم المستخدم أو كلمة السر غير صحيحة")
+            if r["role"] not in (ROLE_OWNER, ROLE_ACC):            # المندوب وأي صلاحيات محدودة: من البرنامج الجديد أو الموقع بس
+                p.set(""); return msg.config(text="اليوزر ده بيدخل من برنامج «زلط» أو الموقع بس")
+            CURRENT_USER.update(id=r["id"], username=r["username"], role=r["role"])
+            with db() as c: log(c, "تسجيل دخول", f"{r['username']} ({r['role']})")
+            result["ok"] = True; d.destroy()
+        ttk.Button(d, text="دخول", command=ok).pack(pady=8)
+        self._server_button(d)
+        d.bind("<Return>", ok); e.focus_set()
+        d.protocol("WM_DELETE_WINDOW", d.destroy); d.grab_set(); self.wait_window(d)
+        return result["ok"]
+
+    FORM_SCREENS = {"show_invoice", "show_payments", "show_parties", "show_items", "show_attendance", "show_employees", "show_settings"}
+
+    def _shortcut(self, fn):
+        """اختصار من الكيبورد: لو فيه نافذة صغيرة مفتوحة (دايلوج) مبيعملش حاجة."""
+        try:
+            if self.grab_current() not in (None, self): return "break"
+        except Exception: pass
+        last = (getattr(self, "_last_screen", None) or ("",))[0]
+        if last == "show_invoice" and getattr(self, "current_lines", None) and \
+                not messagebox.askyesno("تنبيه", "الفاتورة اللي مفتوحة فيها أصناف ولسه ماتحفظتش — تسيبها وتفتح الشاشة التانية؟"): return "break"
+        try: fn()
+        except Exception as e: self.report_callback_exception(type(e), e, e.__traceback__)
+        return "break"
+
+    def _expected(self, force=False):
+        t, rows = self._exp_cache
+        if force or rows is None or time.time() - t > 300:
+            try:
+                with db() as c: rows = expected_customers(c)
+            except Exception: rows = rows or []
+            self._exp_cache = (time.time(), rows)
+        return rows
+
+    def update_bell(self, force=False):
+        try:
+            n = sum(1 for r in self._expected(force) if not r["called"])
+            self.bell_btn.config(text=f"🔔 {n}", bg="#fde68a" if n else "#dbeafe")
+        except Exception: pass
+
+    def toggle_expected(self):
+        """درج جانبي بيطلع ويدخل: العملاء اللي متوقع يطلبوا النهارده."""
+        d = getattr(self, "exp_drawer", None)
+        if d is not None and d.winfo_exists():
+            return self._slide(d, close=True)
+        rows = self._expected(force=True); self.update_bell()
+        W = 470
+        d = tk.Frame(self, bg="white", highlightbackground="#94a3b8", highlightthickness=1); self.exp_drawer = d
+        y0 = self.body.winfo_rooty() - self.winfo_rooty()
+        d.place(x=self.winfo_width(), y=y0, width=W, height=max(self.winfo_height() - y0 - 30, 300))
+        hdr = tk.Frame(d, bg=NAVY); hdr.pack(fill="x")
+        tk.Button(hdr, text="✕", command=lambda: self._slide(d, close=True), relief="flat", bg=NAVY, fg="white", activebackground=NAVY, font=("Tahoma", 12, "bold"), cursor="hand2").pack(side="left", padx=6)
+        open_ = [r for r in rows if not r["called"]]
+        tk.Label(hdr, text=f"🔔 متوقع يطلبوا النهارده ({len(open_)})", bg=NAVY, fg="white", font=("Tahoma", 13, "bold")).pack(side="right", padx=10, pady=8)
+        tk.Label(d, text="البرنامج بيتعلم من عادة كل عميل (كل كام يوم بيطلب). لو العميل ماطلبش، كلّمه ودوس «اتكلمت معاه».", bg="white", fg="#50647b",
+                 font=("Tahoma", 10), wraplength=W - 30, justify="right").pack(anchor="e", padx=10, pady=(6, 2))
+        cv = tk.Canvas(d, bg="white", highlightthickness=0); sb = ttk.Scrollbar(d, orient="vertical", command=cv.yview)
+        inner = tk.Frame(cv, bg="white"); win = cv.create_window(0, 0, window=inner, anchor="nw")
+        inner.bind("<Configure>", lambda e: cv.configure(scrollregion=cv.bbox("all"))); cv.bind("<Configure>", lambda e: cv.itemconfigure(win, width=e.width))
+        cv.configure(yscrollcommand=sb.set); sb.pack(side="left", fill="y"); cv.pack(side="right", fill="both", expand=True)
+        if not rows:
+            tk.Label(inner, text="✅ مفيش عملاء متوقعين النهارده\n(أو لسه مفيش تاريخ فواتير كفاية علشان البرنامج يتعلم)", bg="white", fg="#1c7c4d",
+                     font=("Tahoma", 12), justify="center").pack(pady=30)
+        for r in rows:
+            late = r["late"]; done = r["called"]
+            col = "#94a3b8" if done else ("#1f6fd1" if late == 0 else "#d97706" if late <= max(2, r["every"]) else "#b91c1c")
+            card = tk.Frame(inner, bg="#f8fafc", highlightbackground=col, highlightthickness=2); card.pack(fill="x", padx=8, pady=4)
+            top_ = tk.Frame(card, bg="#f8fafc"); top_.pack(fill="x", padx=8, pady=(6, 0))
+            tk.Label(top_, text=r["name"], bg="#f8fafc", fg=NAVY if not done else "#64748b", font=("Tahoma", 12, "bold")).pack(side="right")
+            tk.Button(top_, text="✕", command=lambda p=r["id"], n=r["name"]: self.hide_expected(p, n), relief="flat", bg="#f8fafc", fg="#94a3b8",
+                      activebackground="#fee2e2", activeforeground="#b91c1c", font=("Tahoma", 11, "bold"), cursor="hand2", bd=0, padx=4).pack(side="left", padx=(0, 6))
+            st = "✔ اتكلمت معاه" + (f": {r['note']}" if r["note"] else "") if done else ("متوقع النهارده" if late == 0 else f"متأخر {late} يوم")
+            tk.Label(top_, text=st, bg="#f8fafc", fg=col, font=("Tahoma", 10, "bold")).pack(side="left")
+            every = fmt(r["every"]).replace(".00", "")
+            info = f"بيطلب كل {every} يوم  •  آخر فاتورة {r['last']}"
+            if r["tons"]: info += f"\nعادةً {fmt(r['tons'])} طن ({fmt(r['bags'])} شيكارة) ≈ {fmt(r['amount'])} ج.م"
+            elif r["amount"]: info += f"\nعادةً ≈ {fmt(r['amount'])} ج.م"
+            if r["phone"] or r["rep"]: info += "\n" + "  •  ".join(x for x in (("📞 " + r["phone"]) if r["phone"] else "", ("المندوب: " + r["rep"]) if r["rep"] else "") if x)
+            tk.Label(card, text=info, bg="#f8fafc", fg="#334155", font=("Tahoma", 10), justify="right", anchor="e").pack(fill="x", padx=8)
+            bb = tk.Frame(card, bg="#f8fafc"); bb.pack(fill="x", padx=6, pady=6)
+            ttk.Button(bb, text="فاتورة", command=lambda p=r["id"]: (self._slide(d, close=True), self.new_invoice_for(p))).pack(side="right", padx=2)
+            ttk.Button(bb, text="كشف حساب", command=lambda p=r["id"]: (self._slide(d, close=True), self.show_account(p))).pack(side="right", padx=2)
+            if not done: ttk.Button(bb, text="اتكلمت معاه", command=lambda p=r["id"], n=r["name"]: self.mark_called(p, n)).pack(side="left", padx=2)
+            else: ttk.Button(bb, text="↩ تراجع", command=lambda p=r["id"]: self.unmark_called(p)).pack(side="left", padx=2)
+        cv.bind_all("<MouseWheel>", lambda e: cv.winfo_exists() and cv.yview_scroll(-1 if e.delta > 0 else 1, "units"))
+        d.lift(); self._slide(d)
+
+    def _slide(self, d, close=False, step=0):
+        """حركة الدرج: بيدخل من اليمين ويطلع لليمين."""
+        if not d.winfo_exists(): return
+        W = d.winfo_width() or 470; X = self.winfo_width()
+        start, end = (X - W, X) if close else (X, X - W)
+        n = 8
+        if step > n:
+            if close: d.destroy(); self.unbind_all("<MouseWheel>")
+            return
+        try: d.place_configure(x=int(start + (end - start) * step / n))
+        except tk.TclError: return
+        self.after(15, lambda: self._slide(d, close, step + 1))
+
+    def mark_called(self, pid, name):
+        note = simpledialog.askstring("اتكلمت معاه", f"«{name}» — ملاحظة (اختياري، مثلًا: هيطلب بكرة):", parent=self)
+        if note is None: return
+        with db() as c:
+            c.execute("INSERT INTO followups(party_id,f_date,note,by_user,created_at) VALUES(?,?,?,?,?)", (pid, date.today().isoformat(), note.strip(), CURRENT_USER.get("username", ""), now_ts()))
+            log(c, "متابعة عميل", f"{name}: اتكلم معاه" + (f" — {note.strip()}" if note.strip() else ""))
+        d = self.exp_drawer
+        if d is not None and d.winfo_exists(): d.destroy(); self.unbind_all("<MouseWheel>")
+        self._exp_cache = (0, None); self.update_bell(); self.toggle_expected()
+
+    def hide_expected(self, pid, name):
+        if not messagebox.askyesno("شيل العميل", f"تشيل «{name}» من قايمة المتوقعين؟\n\n(لو رجع اشترى تاني، هيرجع للقايمة لوحده)", parent=self): return
+        with db() as c:
+            c.execute("UPDATE parties SET exp_hidden=? WHERE id=?", (date.today().isoformat(), pid))
+            log(c, "متابعة عميل", f"{name}: اتشال من قايمة المتوقعين")
+        d = self.exp_drawer
+        if d is not None and d.winfo_exists(): d.destroy(); self.unbind_all("<MouseWheel>")
+        self._exp_cache = (0, None); self.update_bell(); self.toggle_expected()
+
+    def unmark_called(self, pid):
+        with db() as c: c.execute("DELETE FROM followups WHERE party_id=? AND f_date=?", (pid, date.today().isoformat()))
+        d = self.exp_drawer
+        if d is not None and d.winfo_exists(): d.destroy(); self.unbind_all("<MouseWheel>")
+        self._exp_cache = (0, None); self.update_bell(); self.toggle_expected()
+
+    def new_invoice_for(self, pid):
+        self.show_invoice("مبيعات")
+        k = next((k for k, v in self.party_lookup.items() if v == pid), None)
+        if k:
+            self.inv_party.set(k)
+            try: self.invoice_party_changed()
+            except Exception: pass
+
+    def mark_refreshed(self):
+        try: self.refresh_lbl.config(text="آخر تحديث: " + fmt_time(now_ts()))
+        except Exception: pass
+
+    def refresh_screen(self):
+        """يعيد تحميل الشاشة الحالية بأحدث داتا (مفيد لما جهاز تاني يعدّل)."""
+        last = getattr(self, "_last_screen", None)
+        if not last: return self.show_home()
+        name, a, k = last
+        if name in self.FORM_SCREENS and not messagebox.askyesno("تحديث", "أي حاجة مكتوبة في الشاشة دي ولسه ماتحفظتش هتتمسح. تكمّل؟"): return
+        getattr(self, name)(*a, **k)
+        try: self.status.config(text="✔ اتحدثت بأحدث داتا")
+        except Exception: pass
+
+    def _server_button(self, d):
+        """زرار صغير في شاشة الدخول لإعدادات الاتصال (لازم للجهاز التاني قبل أول دخول)."""
+        f = tk.Frame(d, bg=BG); f.pack(side="bottom", fill="x", pady=(0, 6))
+        newer = check_app_version()
+        if newer: tk.Label(f, text=f"⚠️ فيه نسخة أحدث ({newer}) شغالة على جهاز تاني — سطّب التحديث على الجهاز ده", bg=BG, fg="#b91c1c", font=("Tahoma", 10, "bold"), wraplength=480).pack()
+        tk.Label(f, text=version_text() + "   •   البيانات: " + server_label(), bg=BG, fg="#50647b", font=("Tahoma", 10)).pack()
+        def go():
+            try:
+                with db() as c: has_users = c.execute("SELECT COUNT(*) FROM users").fetchone()[0] > 0
+            except Exception: has_users = False
+            if has_users:
+                pw = simpledialog.askstring("إعدادات الاتصال", "اكتب كلمة سر المالك:", show="•", parent=d)
+                if not pw: return
+                if not verify_owner_password(pw): return messagebox.showerror("خطأ", "كلمة السر غلط", parent=d)
+            if db_connection_dialog(d):
+                APP_RESTART[0] = True; d.destroy()
+        ttk.Button(f, text="🌐 إعدادات الاتصال بالسيرفر", command=go).pack()
+
+    def logout(self):
+        if not messagebox.askyesno("تبديل المستخدم", "تسجيل الخروج والدخول بمستخدم تاني؟"): return
+        with db() as c: log(c, "تسجيل خروج", CURRENT_USER.get("username", ""))
+        self.relogin = True
+        self.destroy()
+
+    def on_close(self):
+        _, warn = auto_backup()
+        if warn: messagebox.showwarning("النسخة الاحتياطية", warn)
+        self.destroy()
+
+    def report_callback_exception(self, exc, val, tb):
+        if isinstance(val, DBUnavailable) or (DBConnectionError and isinstance(val, DBConnectionError)):
+            pg_reset_connection()
+            return messagebox.showerror("السيرفر مش متاح", f"{val if isinstance(val, DBUnavailable) else pg_error_text(val)}\n\nاللي كنت بتعمله ماتحفظش. أول ما الاتصال يرجع جرّب تاني.")
+        import traceback
+        txt = "".join(traceback.format_exception(exc, val, tb))
+        try:
+            with open(os.path.join(APP_DATA_DIR, "error_log.txt"), "a", encoding="utf-8") as f: f.write(now_ts() + "\n" + txt + "\n")
+        except Exception: pass
+        messagebox.showerror("خطأ غير متوقع", f"{val}\n\nتفاصيل الخطأ محفوظة في:\n{os.path.join(APP_DATA_DIR, 'error_log.txt')}")
+
+    def build_shell(self):
+        top = tk.Frame(self, bg=NAVY)
+        top.pack(fill="x")
+        brand = tk.Frame(top, bg=NAVY); brand.pack(side="right", padx=22, pady=(1, 1) if self.compact else (8, 8))
+        self.hdr_company = tk.Label(brand, text="", font=("Tahoma", 17 if self.compact else 22, "bold"), fg="white", bg=NAVY)
+        self.hdr_company.pack(anchor="e")
+        self.hdr_tagline = tk.Label(brand, text="", font=("Tahoma", 10 if self.compact else 13), fg="#cfe2fa", bg=NAVY)
+        self.hdr_tagline.pack(anchor="e")
+        rf = tk.Frame(top, bg=NAVY); rf.pack(side="right", padx=(0, 6))
+        tk.Button(rf, text="🔄 تحديث", command=self.refresh_screen, font=("Tahoma", 11, "bold"), fg="white", bg="#1f6fd1", activebackground="#2a7be0",
+                  activeforeground="white", relief="flat", cursor="hand2", padx=12, pady=1, bd=0).pack(anchor="e")
+        self.refresh_lbl = tk.Label(rf, text="", font=("Tahoma", 10), fg="#cfe2fa", bg=NAVY); self.refresh_lbl.pack(anchor="e", pady=(2, 0))
+        self.bind_all("<F5>", lambda e: self.refresh_screen())
+        # اختصارات: F1 مبيعات • F2 مشتريات • F3 سجل الفواتير • F6 سند جديد • F7 سجل السندات
+        for key, fn in (("<F1>", lambda: self.show_invoice("مبيعات")), ("<F2>", lambda: self.show_invoice("مشتريات")), ("<F3>", self.show_invoices),
+                        ("<F6>", self.show_payments), ("<F7>", self.show_vouchers)):
+            self.bind_all(key, lambda e, f=fn: self._shortcut(f))
+        bf = tk.Frame(top, bg=NAVY); bf.pack(side="right", padx=(0, 6))
+        self.bell_btn = tk.Button(bf, text="🔔", command=self.toggle_expected, font=("Tahoma", 11, "bold"), fg=NAVY, bg="#fde68a", activebackground="#fcd34d",
+                                  relief="flat", cursor="hand2", padx=10, pady=1, bd=0)
+        self.bell_btn.pack(anchor="e")
+        tk.Label(bf, text="متوقع النهارده", font=("Tahoma", 10), fg="#cfe2fa", bg=NAVY).pack(anchor="e", pady=(2, 0))
+        self._exp_cache = (0, None); self.after(800, self.update_bell)
+        df = tk.Frame(top, bg=NAVY); df.pack(side="right", padx=(0, 6))
+        tk.Button(df, text="📊", command=self.show_daily, font=("Tahoma", 11, "bold"), fg=NAVY, bg="#c7f0d8", activebackground="#a7e3c0",
+                  relief="flat", cursor="hand2", padx=10, pady=1, bd=0).pack(anchor="e")
+        tk.Label(df, text="تقرير اليوم", font=("Tahoma", 10), fg="#cfe2fa", bg=NAVY).pack(anchor="e", pady=(2, 0))
+        self.hdr_logo = tk.Label(top, bg=NAVY, bd=0, highlightthickness=0)
+        self.hdr_logo.pack(side="left", padx=(14, 4), pady=4)
+        ub = tk.Frame(top, bg=NAVY); ub.pack(side="left", padx=12)
+        tk.Label(ub, text=f"👤 {CURRENT_USER['username']}  ({CURRENT_USER['role']})", font=("Tahoma", 12, "bold"), fg="white", bg=NAVY).pack(anchor="w")
+        self.profit_btn = None
+        if is_owner():   # الأرباح للمالك بس: زرار تحت اسم المستخدم
+            self.profit_btn = tk.Button(ub, text=" الأرباح 🔒", image=make_icon("chart", "#ffffff"), compound="left", command=self.show_profit,
+                                        font=("Tahoma", 11 if self.compact else 12, "bold"), fg="white", bg="#16a34a", activebackground="#15803d", activeforeground="white",
+                                        relief="flat", cursor="hand2", padx=10, pady=0 if self.compact else 2, bd=0)
+            self.profit_btn.pack(anchor="w", pady=(2, 0))
+        else:
+            tk.Label(ub, text="يعمل بدون إنترنت • حفظ محلي تلقائي", font=("Tahoma", 11), fg="#bcd5f2", bg=NAVY).pack(anchor="w")
+        groups = [
+            ("الرئيسية", self.show_home, None),
+            ("الفواتير", None, [("فاتورة مبيعات", lambda: self.show_invoice("مبيعات")), ("فاتورة مشتريات", lambda: self.show_invoice("مشتريات")),
+                                 ("مرتجع مبيعات", lambda: self.show_invoice("مرتجع مبيعات")), ("مرتجع مشتريات", lambda: self.show_invoice("مرتجع مشتريات")),
+                                 None, ("سجل الفواتير", self.show_invoices)]),
+            ("السندات", None, [("سند جديد (تحصيل / دفع / مصروفات)", self.show_payments), ("سجل السندات", self.show_vouchers), ("📱 طلبات تحصيل المناديب", self.show_rep_requests), None, ("طباعة إيصال أمانة", self.print_trust_form)]),
+            ("الأصناف والمخزون", None, [("الأصناف", self.show_items), ("أرصدة الأصناف", self.show_stock), ("المبيعات", lambda: self.show_items_out("مبيعات")), ("المشتريات", lambda: self.show_items_out("مشتريات")), None,
+                                         ("قايمة الهالك والتالف", self.show_damaged),
+                                         ("العينات", [("أصناف العينات", self.show_sample_items), ("عينات مبيعات", lambda: self.show_samples("عينات مبيعات")),
+                                                      ("عينات مشتريات", lambda: self.show_samples("عينات مشتريات"))])]),
+            ("العملاء والموردون", None, [("إضافة عميل / مورد", self.show_parties), ("سجل العملاء والموردين", self.show_party_list)]),
+            ("الموظفون", None, [("الموظفون (مرتب وسلف)", self.show_employees), None, ("الحضور والغياب", self.show_attendance), ("سجل الحضور", self.show_attendance_log), ("📍 حضور المناديب بالموقع", self.show_att_requests), None, ("🚚 العربيات", self.show_vehicles)]),
+            ("الحسابات", None, [("كشف الحساب", self.show_account), ("أرصدة الحسابات", self.show_balances), ("الخزنة", self.show_cash), ("الصندوق الفرعي", self.show_subcash)]),
+            ("التقارير", None, [("تقرير يومي", self.show_daily), ("لوحة أرقام اليوم", self.show_dashboard), ("تقرير المناديب", self.show_reps), ("🎯 تارجت المناديب", self.show_targets), None, ("سجل النشاط", self.show_log)]),
+            ("الإعدادات", None, [("الإعدادات", self.show_settings)] + ([("المستخدمين وكلمات السر 🔒", self.show_users)] if is_owner() else []) +
+                                 [("نسخة احتياطية", self.backup), None, ("تبديل المستخدم / تسجيل خروج", self.logout)]),
+        ]
+        navbar = tk.Frame(self, bg=NAVBAR); navbar.pack(fill="x")
+        self.nav_menus = []; self.nav_buttons = {}
+        for label, fn, items in groups:
+            ic_name, ic_color = NAV_ICONS.get(label, ("home", ACCENT))
+            nav_img = make_icon(ic_name, ic_color, 1 if self.compact else 2)
+            if items is None:
+                btn = ttk.Button(navbar, text=label, command=fn, style="Nav.TButton", image=nav_img, compound="right")
+            else:
+                menu = tk.Menu(self, tearoff=0, font=("Tahoma", 13), bg="white", activebackground=ACCENT, activeforeground="white")
+                for it in items:
+                    if it is None: menu.add_separator()
+                    elif isinstance(it[1], list):          # قايمة فرعية: «◂ العينات» بتفتح على الشمال (زي البرامج العربي)
+                        sub = tk.Menu(self, tearoff=0, font=("Tahoma", 13), bg="white", activebackground=ACCENT, activeforeground="white")
+                        for sit in it[1]:
+                            sub.add_command(label="  " + sit[0] + "  ", command=sit[1], image=icon_for_text(sit[0]) or make_icon(ic_name, ic_color), compound="right")
+                        menu.add_command(label="◂     " + it[0] + "  ", image=icon_for_text(it[0]) or make_icon(ic_name, ic_color), compound="right",
+                                         command=lambda m=menu, sm=sub, idx=menu.index("end") + 1 if menu.index("end") is not None else 0: self.open_submenu(m, sm, idx))
+                        self.nav_menus.append(sub)
+                    else:
+                        mi = icon_for_text(it[0]) or make_icon(ic_name, ic_color)
+                        menu.add_command(label="  " + it[0] + "  ", command=it[1], image=mi, compound="right")
+                self.nav_menus.append(menu)
+                btn = ttk.Button(navbar, text=label + " ▾", style="Nav.TButton", image=nav_img, compound="right")
+                btn.configure(command=lambda b=btn, m=menu: self.open_menu(b, m))
+            btn.pack(side="right", padx=3, pady=6)
+            self.nav_buttons[label] = btn
+        self.nav_level = 0; self._nav_w = 0
+        navbar.bind("<Configure>", lambda e: e.width != self._nav_w and (setattr(self, "_nav_w", e.width), self.after_idle(self.fit_nav)))
+        self.status = tk.Label(self, text="جاهز — البيانات محفوظة على هذا الكمبيوتر", anchor="e", bg=NAVBAR, fg="#173b60", font=("Tahoma", 11), padx=10, pady=6)
+        self.status.pack(fill="x", side="bottom")
+        tk.Label(self.status, text=DEVELOPER_MARK, bg=NAVBAR, fg="#7d93ab", font=("Tahoma", 10, "italic")).pack(side="left")
+        self.body = tk.Frame(self, bg=BG)
+        self.body.pack(fill="both", expand=True, padx=15, pady=4 if self.compact else 12)
+
+    def open_submenu(self, menu, sub, idx):
+        """القايمة الفرعية بتفتح على شمال القايمة الأصلية، قصاد السطر بتاعها."""
+        try:
+            sub.update_idletasks()
+            # القايمة الأصلية بتتقفل لما ندوس على السطر (وساعتها مكانها بيبقى 0)، فبناخد مكانها اللي اتفتحت فيه
+            mx, my = getattr(self, "_menu_pos", {}).get(str(menu), (menu.winfo_rootx(), menu.winfo_rooty()))
+            try: ypos = menu.yposition(idx)
+            except tk.TclError: ypos = 0
+            x = mx - sub.winfo_reqwidth() + 2
+            y = my + ypos
+            if x < 0: x = mx + menu.winfo_reqwidth() - 2      # مفيش مكان على الشمال → على اليمين
+            sub.tk_popup(max(0, x), y)
+        finally:
+            try: sub.grab_release()
+            except tk.TclError: pass
+
+    NAV_LEVELS = ((12, 8, 3), (11, 6, 2), (10, 4, 1), (9, 3, 1))   # (حجم الخط، الحشو، المسافة) من الأكبر للأصغر
+
+    def nav_vpad(self):
+        """ارتفاع أزرار القوايم: أطول في الشاشات العادية، وأقل في الشاشات القصيرة علشان الجداول تاخد مكانها."""
+        return 6 if getattr(self, "compact", False) else 11
+
+    def fit_nav(self):
+        """لو أزرار القوايم مش واخدة في عرض الشاشة، بنصغّر الخط والمسافات لحد ما تيجي كلها."""
+        btns = list(getattr(self, "nav_buttons", {}).values())
+        if not btns: return
+        try:
+            avail = btns[0].master.winfo_width()
+            if avail < 50: return
+            st = ttk.Style()
+            for lvl, (fs, pad, gap) in enumerate(self.NAV_LEVELS):
+                st.configure("Nav.TButton", font=("Tahoma", fs), padding=(pad, self.nav_vpad()))
+                st.configure("NavActive.TButton", font=("Tahoma", fs, "bold"), padding=(pad, self.nav_vpad()))
+                for b in btns: b.pack_configure(padx=gap)
+                self.update_idletasks()
+                need = sum(b.winfo_reqwidth() + 2 * gap for b in btns)
+                if need <= avail - 4: break
+            self.nav_level = lvl
+        except tk.TclError: pass
+
+    def set_active(self, section):
+        self.active_section = section
+        for label, btn in getattr(self, "nav_buttons", {}).items():
+            try:
+                active = label == section
+                btn.configure(style="NavActive.TButton" if active else "Nav.TButton")
+                ic_name, ic_color = NAV_ICONS.get(label, ("home", ACCENT))
+                btn.configure(image=make_icon(ic_name, "#ffffff" if active else ic_color, 1 if self.compact else 2))
+            except Exception: pass
+        if getattr(self, "profit_btn", None):
+            try: self.profit_btn.configure(bg="#f59e0b" if section == "الأرباح" else "#16a34a")
+            except tk.TclError: pass
+
+    def load_logo_image(self, max_h):
+        """الشعار كـ PhotoImage بارتفاع أقصى max_h (تصغير بعدد صحيح لأن Tk مش بيصغّر غير كده)."""
+        if max_h <= max(DEFAULT_LOGO_SMALL):   # الشعار الافتراضي: نسخة متصغّرة بجودة عالية
+            sizes = [h for h in DEFAULT_LOGO_SMALL if h <= max_h]
+            if sizes:
+                try: return tk.PhotoImage(master=self, data=DEFAULT_LOGO_SMALL[max(sizes)])
+                except tk.TclError: pass
+        try:
+            img = tk.PhotoImage(master=self, data=base64.b64encode(logo_bytes()).decode())
+        except tk.TclError:
+            return None
+        f = max(1, -(-img.height() // max_h))
+        return img.subsample(f) if f > 1 else img
+
+    def refresh_header(self):
+        with db() as c: s = c.execute("SELECT company,tagline FROM settings WHERE id=1").fetchone()
+        company = (s["company"] or "").strip() or DEFAULT_COMPANY
+        tagline = (s["tagline"] or "").strip()
+        self.hdr_company.config(text=company)
+        self.hdr_tagline.config(text=tagline)
+        if tagline: self.hdr_tagline.pack(anchor="e")
+        else: self.hdr_tagline.pack_forget()
+        self.title(company)
+        self._hdr_logo_img = self.load_logo_image(48 if self.compact else 70)
+        self.hdr_logo.config(image=self._hdr_logo_img or "")
+
+    def open_menu(self, btn, menu):
+        x = btn.winfo_rootx(); y = btn.winfo_rooty() + btn.winfo_height()
+        if not hasattr(self, "_menu_pos"): self._menu_pos = {}
+        self._menu_pos[str(menu)] = (x, y)          # مكان القايمة، علشان القايمة الفرعية تفتح لازقة فيها
+        try: menu.tk_popup(x, y)
+        finally: menu.grab_release()
+
+    def clear(self):
+        for w in self.body.winfo_children(): w.destroy()
+
+    def title_label(self, text):
+        """عنوان الشاشة بأيقونة ولون القسم المفتوح + خط ملوّن تحته."""
+        ic_name, color = NAV_ICONS.get(self.active_section or "", ("home", ACCENT))
+        row = tk.Frame(self.body, bg=BG); row.pack(fill="x", pady=(0, 3 if self.compact else 8))
+        tk.Label(row, text=" " + text, font=("Tahoma", 16 if self.compact else 19, "bold"), bg=BG, fg=NAVY, image=make_icon(ic_name, color, 1 if self.compact else 2), compound="right").pack(anchor="e")
+        tk.Frame(row, bg=color, height=3).pack(fill="x", pady=(4, 0))
+
+    def field(self, parent, label, var, values=None, side="right", search=False):
+        bgc = parent.cget("bg")
+        col = tk.Frame(parent, bg=bgc); col.pack(side=side, expand=True, fill="x", padx=5)
+        is_date = values is None and not search and is_date_label(label)
+        label = label.replace(" YYYY-MM-DD", "").replace("YYYY-MM-DD", "").strip()
+        tk.Label(col, text=label + (" (اكتب للبحث)" if search else ""), anchor="e", bg=bgc).pack(fill="x")
+        if values is not None:
+            w = ttk.Combobox(col, textvariable=var, values=values, state="normal" if search else "readonly", justify="right")
+        elif is_date:
+            row = tk.Frame(col, bg=bgc); row.pack(fill="x")
+            w = ttk.Entry(row, textvariable=var, justify="right")
+            btn = tk.Button(row, image=make_icon("cal", "#1f6fd1"), relief="flat", bg="#e3eefa", activebackground="#cfe2f6", cursor="hand2", padx=6)
+            btn.configure(command=lambda: DatePicker(w, var))
+            btn.pack(side="left", fill="y", padx=(0, 2))
+            w.pack(side="right", fill="x", expand=True)
+            w.bind("<Double-1>", lambda e: DatePicker(w, var))
+            return w
+        else:
+            w = ttk.Entry(col, textvariable=var, justify="right")
+        w.pack(fill="x")
+        if search and values is not None:
+            allv = list(values)
+            top = w.winfo_toplevel()
+            lb = tk.Listbox(top, font=("Tahoma", 13), activestyle="none", exportselection=False, selectbackground="#1f6fd1",
+                            selectforeground="white", highlightthickness=1, highlightbackground="#1f6fd1", justify="right")
+            def matches():
+                t = var.get().strip().lower()
+                return [v for v in allv if t in v.lower()] if t else allv
+            def hide(e=None):
+                try: lb.place_forget()
+                except Exception: pass
+            def show():
+                m = matches()
+                if not m or (len(m) == 1 and m[0] == var.get()): return hide()
+                lb.delete(0, "end")
+                for v in m[:60]: lb.insert("end", v)
+                lb.configure(height=min(len(m), 8))
+                # العرض على قد أطول اسم (علشان الكلام يبان كله)، والقايمة لازقة في يمين الخانة ومش بتخرج برّه الشاشة
+                import tkinter.font as tkfont
+                try: fnt = tkfont.Font(font=lb.cget("font")); need = max(fnt.measure(v) for v in m[:60]) + 40
+                except Exception: need = 300
+                width = min(max(w.winfo_width(), 300, need), top.winfo_width() - 20)
+                right = w.winfo_rootx() - top.winfo_rootx() + w.winfo_width()
+                x = max(10, min(right - width, top.winfo_width() - width - 10)); y = w.winfo_rooty() - top.winfo_rooty() + w.winfo_height()
+                lb.place(x=x, y=y, width=width); lb.lift()
+                lb.selection_clear(0, "end"); lb.selection_set(0); lb.activate(0)
+            def choose(idx=None):
+                sel = lb.curselection() if idx is None else (idx,)
+                if sel:
+                    var.set(lb.get(sel[0])); hide(); w.icursor("end"); w.event_generate("<<ComboboxSelected>>")
+            def move(d):
+                if not lb.winfo_ismapped(): return show()
+                cur = lb.curselection(); i = (cur[0] if cur else -1) + d
+                i = max(0, min(lb.size() - 1, i))
+                lb.selection_clear(0, "end"); lb.selection_set(i); lb.activate(i); lb.see(i)
+            def on_return(e):
+                if lb.winfo_ismapped(): choose()
+                else:
+                    m = matches()
+                    if var.get() not in allv and m:
+                        var.set(m[0]); w.event_generate("<<ComboboxSelected>>")
+                if var.get() in allv:
+                    nxt = _next_input(w)
+                    if nxt is not None: w.after(1, lambda: focus_input(nxt))
+                return "break"
+            def on_focus_out(e):
+                def later():
+                    m = matches()
+                    if var.get() not in allv and len(m) == 1:
+                        var.set(m[0]); w.event_generate("<<ComboboxSelected>>")
+                    hide()
+                w.after(180, later)
+            w.bind("<KeyRelease>", lambda e: None if e.keysym in ("Up", "Down", "Return", "Escape", "Tab", "Left", "Right", "Shift_L", "Shift_R", "Control_L", "Control_R") else show())
+            w.bind("<Down>", lambda e: (move(1), "break")[1])
+            w.bind("<Up>", lambda e: (move(-1), "break")[1])
+            w.bind("<Return>", on_return)
+            w.bind("<Escape>", lambda e: hide())
+            def on_backspace(e):
+                # الخانة فيها اختيار كامل من القايمة (صنف/عميل): Backspace تمسحه كله علشان تكتب غيره على طول
+                if var.get() in allv:
+                    var.set(""); w.icursor(0); w.after(1, show); return "break"
+            w.bind("<BackSpace>", on_backspace)
+            w.bind("<FocusOut>", on_focus_out)
+            w.bind("<<ComboboxSelected>>", lambda e: hide(), add="+")
+            lb.bind("<Button-1>", lambda e: (choose(lb.nearest(e.y)), "break")[1])
+            w.bind("<Destroy>", lambda e: lb.destroy() if e.widget is w else None, add="+")
+        return w
+
+    def tree(self, parent, columns, headings, widths=None, height=None):
+        box = tk.Frame(parent); box.pack(fill="both", expand=True)
+        t = StripedTree(box, columns=columns, show="headings", height=height or (3 if self.compact else 4))   # بيكبر لوحده ويملى المساحة
+        for i, col in enumerate(columns):
+            t.heading(col, text=headings[i], anchor="e")
+            t.column(col, width=(widths[i] if widths else 130), anchor="e")
+        # أول عمود (الكود / الاسم) يظهر على اليمين، والأرقام على الشمال
+        t["displaycolumns"] = tuple(reversed(columns))
+        t.enable_sort()
+        y = ttk.Scrollbar(box, orient="vertical", command=t.yview); t.configure(yscrollcommand=y.set)
+        t.pack(side="right", fill="both", expand=True); y.pack(side="left", fill="y")
+        return t
+
+    def total_bar(self, parent, pairs, title="الإجمالي"):
+        """شريط الإجمالي تحت الجدول. pairs = [(العنوان, القيمة), ...]"""
+        bar = tk.Frame(parent, bg="#3f7cc0"); bar.pack(fill="x", pady=(2, 4))
+        tk.Label(bar, text=title, bg="#3f7cc0", fg="white", font=("Tahoma", 14, "bold"), padx=14, pady=6).pack(side="right")
+        for label, val in pairs:
+            f = tk.Frame(bar, bg="#3f7cc0"); f.pack(side="right", padx=16)
+            tk.Label(f, text=label + ":", bg="#3f7cc0", fg="#dcebfb", font=("Tahoma", 12)).pack(side="right")
+            tk.Label(f, text=val, bg="#3f7cc0", fg="white", font=("Tahoma", 13, "bold")).pack(side="right", padx=4)
+        return bar
+
+    def search_bar(self, label, var):
+        sb = tk.Frame(self.body, bg=BG); sb.pack(fill="x", pady=(0, 6))
+        ttk.Entry(sb, textvariable=var, justify="right").pack(side="right", fill="x", expand=True)
+        tk.Label(sb, text=label, bg=BG).pack(side="right", padx=6)
+
+    # ================= الرئيسية (لوحة اليوم) =================
+    def show_home(self):
+        """الرئيسية: الشعار واسم الشركة بعرض الشاشة (تقريبًا الثلثين) + فواتير اليوم تحت (التلت)."""
+        self.clear()
+        today = date.today().isoformat()
+        with db() as c:
+            st = c.execute("SELECT company,tagline FROM settings WHERE id=1").fetchone()
+            rows = c.execute(f"SELECT i.id,i.number,i.kind,i.inv_date,i.due_date,i.created_at,i.pay_type,p.name party,r.name rep,{NET_SQL} total "
+                             "FROM invoices i LEFT JOIN parties p ON p.id=i.party_id LEFT JOIN employees r ON r.id=i.rep_id "
+                             "WHERE i.inv_date=? ORDER BY i.id DESC", (today,)).fetchall()
+        # ---- البانر: خلفية متدرجة + الشعار + اسم الشركة ----
+        banner = tk.Canvas(self.body, highlightthickness=0, bd=0, bg="white", height=10)
+        banner.pack(fill="both", expand=True)
+        self._home_logo_big = self.load_logo_image(420)
+        self._home_logo_small = self._home_logo_big.subsample(2) if self._home_logo_big else None
+        company = (st["company"] or DEFAULT_COMPANY) if st else DEFAULT_COMPANY
+        tagline = (st["tagline"] or "") if st else ""
+        def draw(e=None):
+            banner.delete("all")
+            w, h = banner.winfo_width(), banner.winfo_height()
+            if w < 10 or h < 10: return
+            top, bot = (255, 255, 255), (198, 226, 246)
+            steps = 60
+            for i in range(steps):
+                f = i / (steps - 1)
+                col = "#%02x%02x%02x" % tuple(int(top[k] + (bot[k] - top[k]) * f) for k in range(3))
+                banner.create_rectangle(0, h * i / steps, w, h * (i + 1) / steps + 1, fill=col, outline=col)
+            banner.create_oval(-w * 0.15, h * 0.55, w * 0.45, h * 1.6, outline="#a9cdee", width=2)
+            banner.create_oval(w * 0.62, -h * 0.5, w * 1.25, h * 0.6, outline="#cfe3f5", width=2)
+            # الشعار على اليمين واسم الشركة جنبه (بيصغر لو المساحة مش كفاية)
+            big = self._home_logo_big
+            self._home_logo = big if big and big.height() + 30 <= h and not self.compact else self._home_logo_small
+            if self._home_logo and self._home_logo.height() + 10 > h: self._home_logo = None
+            lw = self._home_logo.width() if self._home_logo else 0
+            name_font = ("Tahoma", 30 if self.compact else 52, "bold")
+            tag_font = ("Tahoma", 16 if self.compact else 26)
+            gap = 40
+            tid = banner.create_text(0, 0, text=company, font=name_font, anchor="ne")
+            bx = banner.bbox(tid); tw = bx[2] - bx[0]; banner.delete(tid)
+            total_w = lw + gap + tw
+            x_right = (w + total_w) / 2
+            cy = h / 2
+            if self._home_logo:
+                banner.create_image(x_right, cy, image=self._home_logo, anchor="e")
+            tx = x_right - lw - gap
+            banner.create_text(tx + 3, cy - (18 if tagline else 0) + 3, text=company, font=name_font, fill="#a9c4e0", anchor="e")
+            banner.create_text(tx, cy - (18 if tagline else 0), text=company, font=name_font, fill=NAVY, anchor="e")
+            if tagline:
+                banner.create_text(tx, cy + (28 if self.compact else 48), text=tagline, font=tag_font, fill="#1f6fd1", anchor="e")
+            banner.create_text(w - 16, h - 12, text=f"ال{AR_DAYS[(date.today().weekday() + 2) % 7]}  {today}", font=("Tahoma", 12, "bold"), fill=NAVY, anchor="se")
+        banner.bind("<Configure>", draw)
+        # ---- فواتير اليوم (التلت اللي تحت) ----
+        lower = tk.Frame(self.body, bg=BG); lower.pack(fill="x", pady=(8, 0))
+        hdr = tk.Frame(lower, bg=BG); hdr.pack(fill="x")
+        tk.Label(hdr, text=" فواتير اليوم", image=make_icon("invoice", "#16a34a", 1 if self.compact else 2), compound="right",
+                 font=("Tahoma", 15, "bold"), bg=BG, fg=NAVY).pack(side="right")
+        tk.Label(hdr, text="ضغطتين على فاتورة = فتحها", bg=BG, fg="#50647b", font=("Tahoma", 11)).pack(side="left")
+        box = tk.Frame(lower, bg=BG); box.pack(fill="x")
+        rows_h = 4 if self.compact else 7
+        t = self.tree(box, ("id", "kind", "number", "time", "party", "rep", "pay", "due", "total"),
+                      ("ID", "النوع", "رقم الفاتورة", "الوقت", "العميل / المورد", "المندوب", "الدفع", "الاستحقاق", "الصافي"),
+                      [45, 120, 100, 90, 300, 130, 80, 110, 130], height=rows_h)
+        box.pack_configure(expand=False)
+        t.tag_configure("future", foreground="#c2410c")
+        sums = {}
+        for r in rows:
+            rep = (r["rep"] or OFFICE) if r["kind"] == "مبيعات" else ""
+            fut = bool(r["due_date"]) and r["due_date"] > today
+            t.insert("", "end", iid=str(r["id"]), values=(r["id"], r["kind"], r["number"], fmt_time(r["created_at"]), r["party"] or "", rep, r["pay_type"] or "",
+                                                         r["due_date"] or "", fmt(r["total"])), tags=("future",) if fut else ())
+            sums[r["kind"]] = sums.get(r["kind"], 0.0) + float(r["total"] or 0)
+        t.bind("<Double-1>", lambda e: t.selection() and self.view_invoice(int(t.selection()[0])))
+        self.total_bar(lower, [("عدد فواتير اليوم", str(len(rows)))] + [(k, fmt(v)) for k, v in sums.items()], title="اليوم")
+
+    def show_dashboard(self):
+        self.clear(); self.title_label("لوحة أرقام اليوم")
+        today = date.today().isoformat(); since = (date.today() - timedelta(days=29)).isoformat()
+        with db() as c:
+            sales_today = c.execute(f"SELECT COALESCE(SUM({SIGNED_SALES_SQL}),0) FROM invoices i WHERE COALESCE(NULLIF(i.due_date,''), i.inv_date)=?", (today,)).fetchone()[0]
+            col_today = c.execute("SELECT COALESCE(SUM(amount),0) FROM payments WHERE kind='تحصيل' AND pay_date=?", (today,)).fetchone()[0]
+            exp_today = c.execute("SELECT COALESCE(SUM(amount),0) FROM expenses WHERE exp_date=? AND kind<>'عمولة'", (today,)).fetchone()[0]
+            cash = cash_balance(c)
+            daily = {r["d"]: float(r["t"]) for r in c.execute(f"SELECT COALESCE(NULLIF(i.due_date,''), i.inv_date) d,SUM({SIGNED_SALES_SQL}) t FROM invoices i WHERE COALESCE(NULLIF(i.due_date,''), i.inv_date)>=? GROUP BY COALESCE(NULLIF(i.due_date,''), i.inv_date)", (since,))}
+            top_items = c.execute("SELECT MIN(l.item_name) n,SUM(l.qty) q,SUM(l.qty*l.price) a FROM invoice_lines l JOIN invoices i ON i.id=l.invoice_id WHERE i.kind='مبيعات' AND COALESCE(NULLIF(i.due_date,''), i.inv_date)>=? GROUP BY l.item_id ORDER BY a DESC LIMIT 5", (since,)).fetchall()
+            top_cust = c.execute(f"SELECT p.name n,SUM({NET_SQL}) t FROM invoices i JOIN parties p ON p.id=i.party_id WHERE i.kind='مبيعات' AND COALESCE(NULLIF(i.due_date,''), i.inv_date)>=? GROUP BY p.id ORDER BY t DESC LIMIT 5", (since,)).fetchall()
+            debts = []
+            for p in c.execute("SELECT id,name FROM parties").fetchall():
+                b = party_balance(c, p["id"])
+                if b > 0.005: debts.append((p["name"], b))
+            debts.sort(key=lambda x: -x[1])
+            low = []
+            for it in c.execute("SELECT id,name,min_stock FROM items WHERE COALESCE(min_stock,0)>0").fetchall():
+                st = stock_of(c, it["id"])
+                if st <= it["min_stock"]: low.append((it["name"], st, it["min_stock"]))
+            low.sort(key=lambda x: x[1])
+        ps = profit_summary(today, today)
+        cards = tk.Frame(self.body, bg=BG); cards.pack(fill="x")
+        for title, val, color in [("مبيعات اليوم (صافي)", sales_today, "#1762a5"), ("المحصّل نقدًا اليوم", col_today, "#1c7c4d"),
+                                  ("مصروفات اليوم", exp_today, "#b45309")] + ([("صافي الربح اليوم 🔒", ps["actual"], "#6d28d9")] if is_owner() else []) + [("رصيد الخزنة", cash, NAVY)]:
+            light = "#%02x%02x%02x" % tuple(int(int(color[i:i + 2], 16) * 0.10 + 255 * 0.90) for i in (1, 3, 5))
+            card = tk.Frame(cards, bg=light, highlightbackground=color, highlightthickness=2)
+            card.pack(side="right", expand=True, fill="x", padx=5)
+            tk.Label(card, text=title, bg=color, fg="white", font=("Tahoma", 12, "bold"), pady=3).pack(fill="x")
+            tk.Label(card, text=fmt(val), bg=light, fg=color, font=("Tahoma", 20, "bold")).pack(pady=6)
+        mid = tk.Frame(self.body, bg=BG); mid.pack(fill="both", expand=True, pady=(10, 4))
+        left = tk.Frame(mid, bg=BG); left.pack(side="left", fill="both", expand=True, padx=(0, 6))
+        right = tk.Frame(mid, bg=BG); right.pack(side="right", fill="both", expand=True, padx=(6, 0))
+        tk.Label(right, text="مبيعات آخر 30 يوم (الصافي)", bg=BG, fg=NAVY, font=("Tahoma", 13, "bold")).pack(anchor="e")
+        cv = tk.Canvas(right, height=150, bg="white", highlightthickness=1, highlightbackground="#cbd8e7"); cv.pack(fill="both", expand=True)
+        days = [(date.today() - timedelta(days=29 - i)).isoformat() for i in range(30)]
+        vals = [daily.get(d, 0.0) for d in days]
+        def draw(e=None):
+            cv.delete("all"); w = cv.winfo_width(); h = cv.winfo_height()
+            if w < 60 or h < 60: return
+            mx = max(max(vals), 1.0); bw = (w - 50) / 30.0; base = h - 20
+            for i, v in enumerate(vals):
+                x0 = 40 + i * bw + 1; x1 = x0 + bw - 2; y0 = base - (max(v, 0) / mx) * (h - 45)
+                cv.create_rectangle(x0, y0, x1, base, fill="#1762a5", outline="")
+            cv.create_line(40, base, w - 5, base, fill="#999")
+            cv.create_text(38, 8, text=fmt(mx), anchor="ne", font=("Tahoma", 10), fill="#555")
+            cv.create_text(40, h - 8, text=days[0], anchor="w", font=("Tahoma", 10), fill="#555")
+            cv.create_text(w - 5, h - 8, text=days[-1], anchor="e", font=("Tahoma", 10), fill="#555")
+        cv.bind("<Configure>", draw)
+        tk.Label(left, text="أكثر 5 أصناف مبيعًا (آخر 30 يوم)", bg=BG, fg=NAVY, font=("Tahoma", 13, "bold")).pack(anchor="e")
+        t1 = self.tree(left, ("n", "q", "a"), ("الصنف", "الكمية", "المبيعات"), [220, 90, 120], height=5)
+        for r in top_items: t1.insert("", "end", values=(r["n"], fmt(r["q"]), fmt(r["a"])))
+        bot = tk.Frame(self.body, bg=BG); bot.pack(fill="both", expand=True, pady=(4, 0))
+        for title, cols, heads, widths, rows in [
+            ("أكثر 5 عملاء شراءً (آخر 30 يوم)", ("n", "t"), ("العميل", "المشتريات"), [200, 110], [(r["n"], fmt(r["t"])) for r in top_cust]),
+            ("أكبر 5 ديون على العملاء", ("n", "t"), ("العميل", "المستحق"), [200, 110], [(n, fmt(b)) for n, b in debts[:5]]),
+            ("أصناف قربت تخلص", ("n", "s", "m"), ("الصنف", "الرصيد", "الحد الأدنى"), [170, 80, 90], [(n, fmt(s), fmt(m)) for n, s, m in low[:8]])]:
+            f = tk.Frame(bot, bg=BG); f.pack(side="right", fill="both", expand=True, padx=5)
+            tk.Label(f, text=title, bg=BG, fg=NAVY, font=("Tahoma", 13, "bold")).pack(anchor="e")
+            t = self.tree(f, cols, heads, widths, height=5)
+            for row in rows: t.insert("", "end", values=row)
+        tk.Label(self.body, text="مهم: النسخة الاحتياطية التلقائية تُحفظ يوميًا — ومع ذلك انسخ مجلد النسخ على فلاشة أو قرص آخر من وقت لآخر.", fg="#9b2c2c", bg=BG, font=("Tahoma", 12, "bold")).pack(anchor="e", pady=(4, 0))
+
+    # ================= الأصناف =================
+    def show_items(self):
+        self.clear(); self.title_label("إدارة الأصناف"); self.item_edit_id = None
+        form = tk.LabelFrame(self.body, text="بيانات الصنف", padx=10, pady=8); form.pack(fill="x", pady=(0, 8))
+        self.item_fields = [("code", "كود الصنف"), ("name", "اسم الصنف"), ("unit", "الوحدة"), ("buy", "سعر الشراء"), ("sell", "سعر البيع"), ("min", "حد أدنى للتنبيه"), ("opening", "رصيد أول المدة")]
+        self.item_vars = {k: tk.StringVar() for k, _ in self.item_fields}
+        self.reset_item_form()
+        for chunk in (self.item_fields[:3], self.item_fields[3:]):      # صفين علشان كل الخانات تبان في الشاشات الصغيرة
+            irow = tk.Frame(form); irow.pack(fill="x")
+            for k, label in chunk: self.field(irow, label, self.item_vars[k])
+        actions = tk.Frame(form); actions.pack(fill="x", pady=6)
+        ttk.Button(actions, text="حفظ الصنف", command=self.save_item).pack(side="right", padx=4)
+        ttk.Button(actions, text="تفريغ الحقول", command=self.reset_item_form).pack(side="right", padx=4)
+        if is_owner(): ttk.Button(actions, text="استيراد أصناف من Excel", command=lambda: self.import_excel("items")).pack(side="right", padx=4)
+        tk.Label(actions, text="رصيد أول المدة = الكمية اللي كانت موجودة قبل البرنامج", fg="#50647b").pack(side="left")
+        self.item_q = tk.StringVar()
+        self.search_bar("بحث سريع (الكود أو الاسم):", self.item_q)
+        self.item_q.trace_add("write", lambda *a: self.refresh_items())
+        self.items_tree = self.tree(self.body, ("id", "code", "name", "unit", "buy", "sell", "min", "opening", "stock"), ("ID", "الكود", "اسم الصنف", "الوحدة", "سعر الشراء", "سعر البيع", "حد أدنى", "أول المدة", "الرصيد"), [45, 100, 260, 80, 105, 105, 80, 90, 100])
+        self.items_tree.tag_configure("low", foreground="#b91c1c")
+        self.items_tree.bind("<Double-1>", lambda e: self.item_invoices_selected(self.items_tree))
+        bar = tk.Frame(self.body, bg=BG); bar.pack(fill="x", pady=6)
+        ttk.Button(bar, text="فواتير الصنف المحدد", command=lambda: self.item_invoices_selected(self.items_tree)).pack(side="right", padx=4)
+        ttk.Button(bar, text="تعديل المحدد", command=self.edit_selected_item).pack(side="right", padx=4)
+        ttk.Button(bar, text="حذف المحدد", command=self.delete_selected_item).pack(side="right", padx=4)
+        self.refresh_items()
+
+    def reset_item_form(self):
+        self.item_edit_id = None
+        for k, v in self.item_vars.items(): v.set("قطعة" if k == "unit" else "0" if k in ("buy", "sell", "min", "opening") else "")
+
+    def save_item(self):
+        v = {k: x.get().strip() for k, x in self.item_vars.items()}
+        if not v["name"]: return messagebox.showwarning("تنبيه", "اسم الصنف مطلوب")
+        try: buy = float(v["buy"] or 0); sell = float(v["sell"] or 0); mn = float(v["min"] or 0); oq = float(v["opening"] or 0)
+        except ValueError: return messagebox.showerror("خطأ", "راجع الأسعار والحد الأدنى ورصيد أول المدة؛ يجب أن تكون أرقامًا")
+        if oq < 0 and not getattr(_TLS, "allow_neg", None):
+            who = self.allow_negative(f"رصيد أول المدة لـ«{v['name']}» = {fmt(oq)}.")
+            if not who: return self.status.config(text="ماتحفظش — الرصيد بالسالب محتاج كلمة سر المالك")
+            return self._with_neg(who, self.save_item)
+        try:
+            with db() as c:
+                if self.item_edit_id:
+                    old = c.execute("SELECT * FROM items WHERE id=?", (self.item_edit_id,)).fetchone()
+                    c.execute("UPDATE items SET code=?,name=?,unit=?,buy_price=?,sell_price=?,min_stock=?,opening_qty=? WHERE id=?", (v["code"] or None, v["name"], v["unit"] or "قطعة", buy, sell, mn, oq, self.item_edit_id))
+                    check_stock(c, [self.item_edit_id])
+                    ch = []
+                    if abs(float(old["opening_qty"] or 0) - oq) > 1e-9: ch.append(f"رصيد أول المدة {fmt(old['opening_qty'] or 0)}←{fmt(oq)}")
+                    if abs(float(old["buy_price"] or 0) - buy) > 1e-9: ch.append(f"سعر الشراء {fmt(old['buy_price'])}←{fmt(buy)}")
+                    if abs(float(old["sell_price"] or 0) - sell) > 1e-9: ch.append(f"سعر البيع {fmt(old['sell_price'])}←{fmt(sell)}")
+                    if old["name"] != v["name"]: ch.append(f"الاسم {old['name']}←{v['name']}")
+                    log(c, "تعديل صنف", f"{v['name']}: " + ("، ".join(ch) or "بدون تغيير في الأسعار"))
+                else:
+                    c.execute("INSERT INTO items(code,name,unit,buy_price,sell_price,min_stock,opening_qty) VALUES(?,?,?,?,?,?,?)", (v["code"] or None, v["name"], v["unit"] or "قطعة", buy, sell, mn, oq))
+                    log(c, "إضافة صنف", f"{v['name']} (شراء {fmt(buy)} / بيع {fmt(sell)}" + (f" / رصيد أول المدة {fmt(oq)}" if oq else "") + ")")
+            self.status.config(text="تم حفظ الصنف")
+            self.reset_item_form(); self.refresh_items()
+        except DBIntegrityError: messagebox.showerror("خطأ", "كود الصنف مستخدم بالفعل")
+        except NegativeStock as e:
+            who = self.allow_negative(f"{e}\nرصيد أول المدة الجديد أقل من اللي اتباع فعلًا.")
+            if who: self._with_neg(who, self.save_item)
+
+    def refresh_items(self):
+        if not hasattr(self, "items_tree") or not self.items_tree.winfo_exists(): return
+        for x in self.items_tree.get_children(): self.items_tree.delete(x)
+        q = self.item_q.get().strip().lower() if hasattr(self, "item_q") else ""
+        with db() as c:
+            rows = c.execute("SELECT * FROM items ORDER BY name").fetchall()
+            for r in rows:
+                if q and q not in (r["name"] or "").lower() and q not in (r["code"] or "").lower(): continue
+                st = stock_of(c, r["id"]); mn = float(r["min_stock"] or 0)
+                self.items_tree.insert("", "end", iid=str(r["id"]), values=(r["id"], r["code"] or "", r["name"], r["unit"], fmt(r["buy_price"]), fmt(r["sell_price"]), fmt(mn), fmt(r["opening_qty"] or 0), fmt(st)),
+                                       tags=("low",) if mn > 0 and st <= mn else ())
+
+    def edit_selected_item(self):
+        sel = self.items_tree.selection()
+        if not sel: return messagebox.showwarning("تنبيه", "حدد صنفًا أولًا")
+        with db() as c: r = c.execute("SELECT * FROM items WHERE id=?", (int(sel[0]),)).fetchone()
+        self.item_edit_id = r["id"]
+        for k, val in (("code", r["code"] or ""), ("name", r["name"]), ("unit", r["unit"]), ("buy", r["buy_price"]), ("sell", r["sell_price"]), ("min", r["min_stock"] or 0), ("opening", r["opening_qty"] or 0)):
+            self.item_vars[k].set(str(val))
+        self.status.config(text=f"جاري تعديل الصنف «{r['name']}» — عدّل الحقول واضغط «حفظ الصنف»")
+
+    def delete_selected_item(self):
+        sel = self.items_tree.selection()
+        if not sel: return messagebox.showwarning("تنبيه", "حدد صنفًا أولًا")
+        iid = int(sel[0])
+        with db() as c:
+            used = c.execute("SELECT (SELECT COUNT(*) FROM invoice_lines WHERE item_id=?)+(SELECT COUNT(*) FROM damaged WHERE item_id=?)", (iid, iid)).fetchone()[0]
+            name = c.execute("SELECT name FROM items WHERE id=?", (iid,)).fetchone()["name"]
+        if used: return messagebox.showwarning("لا يمكن الحذف", "الصنف مستخدم في فواتير أو هالك. يمكنك تعديله فقط.")
+        if messagebox.askyesno("تأكيد", f"حذف الصنف «{name}»؟"):
+            with db() as c:
+                c.execute("DELETE FROM items WHERE id=?", (iid,)); log(c, "حذف صنف", name)
+            self.refresh_items()
+
+    # ================= استيراد من Excel =================
+    def import_excel(self, what):
+        """استيراد أصناف أو عملاء/موردين من ملف Excel: يقرا العناوين لوحده، يعرض ملخص، وياخد نسخة احتياطية قبل الحفظ."""
+        if not is_owner(): return messagebox.showwarning("غير مسموح", "الاستيراد للمالك بس")
+        title = "استيراد أصناف" if what == "items" else "استيراد عملاء وموردين"
+        path = filedialog.askopenfilename(title=title, filetypes=[("ملف Excel", "*.xlsx"), ("كل الملفات", "*.*")])
+        if not path: return
+        try: rows, hr, cols, found = import_found_date(path, what)
+        except ImportProblem as e: return messagebox.showerror(title, str(e))
+        asof = simpledialog.askstring(title, "الأرصدة اللي في الملف ده لحد أنهي يوم؟ (YYYY-MM-DD)\n\n"
+                                      "• الفواتير والسندات اللي في البرنامج بتاريخ بعد اليوم ده هتتحسب فوق الأرصدة (مثلًا مبيعات 1/11 تتخصم من المخزن).\n"
+                                      "• اللي بتاريخه أو قبله مش هتتحسب تاني (لأنها جوه أرصدة الملف).\n\n"
+                                      "سيبها فاضية = الأرصدة دي هي أول المدة والفواتير كلها بتتحسب فوقها.", initialvalue=found or "")
+        if asof is None: return
+        asof = asof.strip()
+        if asof:
+            try: asof = check_date(asof.replace("/", "-"))
+            except ValueError: return messagebox.showerror(title, "التاريخ مش مظبوط — اكتبه كده: 2026-10-31")
+        try: ctx = import_plan(what, path, asof)
+        except ImportProblem as e: return messagebox.showerror(title, str(e))
+        msg = ctx["msg"]
+        ans = messagebox.askyesnocancel(title, msg)
+        if ans is None: return
+        replace = bool(ans)
+        try: done = import_apply(ctx, replace)
+        except ImportNeedsConfirm as e:
+            if not messagebox.askyesno(title, str(e)): return
+            done = import_apply(ctx, replace, force_no_backup=True)
+        except ImportProblem as e: return messagebox.showerror(title, str(e))
+        messagebox.showinfo(title, done)
+        (self.show_items if what == "items" else self.show_party_list)()
+    def _plan_items(self, rows, cols, first_line):
+        plan, warns, seen = [], [], set()
+        with db() as c:
+            by_code = {r["code"]: r["id"] for r in c.execute("SELECT id,code FROM items WHERE code IS NOT NULL AND code<>''")}
+            its = c.execute("SELECT id,name FROM items").fetchall()
+            by_name = {_norm(r["name"]): r["id"] for r in its}; by_loose = {_loose(r["name"]): r["id"] for r in its}
+        g = lambda row, k: row[cols[k]] if k in cols and cols[k] < len(row) else ""
+        for n, row in enumerate(rows, first_line):
+            name = _cell_text(g(row, "name"))
+            if not name or _norm(name) in ("الاجمالي", "اجمالي", "الاجمالـي") or "اجمال" in _norm(name).replace(" ", ""): continue
+            code = _cell_text(g(row, "code")); key = code or "n:" + _norm(name)
+            if key in seen: warns.append(f"سطر {n}: «{name}» متكرر في الملف — اتاخد أول مرة بس"); continue
+            seen.add(key)
+            f = {"name": name}
+            if code: f["code"] = code
+            unit = _cell_text(g(row, "unit"))
+            if unit: f["unit"] = unit
+            bad = False
+            for k, col in (("buy", "buy_price"), ("sell", "sell_price"), ("min", "min_stock"), ("qty", "opening_qty")):
+                v = _num(g(row, k))
+                if v == "bad": warns.append(f"سطر {n}: «{name}» — {k} مش رقم"); bad = True; continue
+                if v is None: continue
+                if k == "qty" and v < 0: warns.append(f"سطر {n}: «{name}» رصيده بالسالب ({fmt(v)}) — اتحط صفر، راجع الجرد"); v = 0.0
+                f[col] = v
+            if bad and len(f) <= 2: continue
+            iid = by_code.get(code) if code else None
+            if iid is None: iid = by_name.get(_norm(name))
+            if iid is None: iid = by_loose.get(_loose(name))
+            if iid is None: f.setdefault("unit", "قطعة")
+            # في وضع الاستبدال: الخانة الفاضية في الملف = صفر
+            blank = {col: 0.0 for k, col in (("buy", "buy_price"), ("sell", "sell_price"), ("min", "min_stock"), ("qty", "opening_qty")) if k in cols and col not in f}
+            plan.append({"id": iid, "f": f, "label": name, "blank": blank})
+        return plan, warns
+
+    def _plan_parties(self, rows, cols, first_line):
+        plan, warns, seen = [], [], set()
+        # الصندوق الرئيسي ← رصيد الخزنة • الصندوق الفرعي ← الصندوق الفرعي • حسابات المصروفات/المبيعات/المشتريات بتتجاهل
+        sp = self._import_special = {"cash": None, "sub": None, "skipped": [], "drop": []}
+        with db() as c:
+            prs = c.execute("SELECT id,name FROM parties").fetchall()
+            by_name = {_norm(r["name"]): r["id"] for r in prs}; by_loose = {_loose(r["name"]): r["id"] for r in prs}
+            reps = {_norm(r["name"]): r["id"] for r in c.execute("SELECT id,name FROM employees WHERE kind='مندوب'")}
+        g = lambda row, k: row[cols[k]] if k in cols and cols[k] < len(row) else ""
+        for n, row in enumerate(rows, first_line):
+            name = _cell_text(g(row, "name"))
+            if not name or any(w in _norm(name).replace(" ", "") for w in ("اجمال", "الصافي")) or _norm(name) == "الرصيد": continue   # صفوف الإجمالي
+            acct = _cell_text(g(row, "acct")).split(".")[0].strip()
+            nn = _norm(name).replace(" ", "")
+            if "صندوق" in nn or nn in ("الخزنه", "خزنه", "الخزينه", "خزينه"):
+                d_, c_ = _num(g(row, "debit")), _num(g(row, "credit"))
+                bal = ((d_ if isinstance(d_, float) else 0) - (c_ if isinstance(c_, float) else 0)) if ("debit" in cols or "credit" in cols) else (_num(g(row, "opening")) or 0)
+                key = "sub" if "فرعي" in nn else "cash"
+                if sp[key] is None: sp[key] = (name, float(bal or 0))
+                if _norm(name) in by_name: sp["drop"].append(by_name[_norm(name)])
+                continue
+            if acct.isdigit() and len(acct) >= 4 and acct[0] in "345":       # 3xxx مصروفات ومشتريات • 4xxx مبيعات — مش عملاء ولا موردين
+                sp["skipped"].append(name)
+                if _norm(name) in by_name: sp["drop"].append(by_name[_norm(name)])
+                continue
+            if _norm(name) in seen: warns.append(f"سطر {n}: «{name}» متكرر في الملف — اتاخد أول مرة بس"); continue
+            seen.add(_norm(name))
+            f = {"name": name}
+            if acct.startswith("21"): f["kind"] = "مورد"
+            elif acct.startswith("11"): f["kind"] = "عميل"
+            kind = _norm(_cell_text(g(row, "kind")))
+            if kind: f["kind"] = "عميل/مورد" if ("عميل" in kind and "مورد" in kind) else "مورد" if "مورد" in kind else "عميل"
+            nums = {k: _num(g(row, k)) for k in ("debit", "credit", "opening", "limit")}
+            for k, v in nums.items():
+                if v == "bad": warns.append(f"سطر {n}: «{name}» — {k} مش رقم"); nums[k] = None
+            if nums["debit"] is not None or nums["credit"] is not None: f["opening"] = (nums["debit"] or 0) - (nums["credit"] or 0)
+            elif nums["opening"] is not None: f["opening"] = nums["opening"]
+            if nums["limit"] is not None: f["credit_limit"] = max(nums["limit"], 0)
+            for k in ("phone", "address"):
+                t = _cell_text(g(row, k))
+                if t: f[k] = t
+            rep = _cell_text(g(row, "rep"))
+            if rep and _norm(rep) not in (_norm(OFFICE), ""):
+                if _norm(rep) in reps: f["rep_id"] = reps[_norm(rep)]
+                else: warns.append(f"سطر {n}: المندوب «{rep}» مش موجود في الموظفين — «{name}» اتسجل على المكتب")
+            pid = by_name.get(_norm(name))
+            if pid is None: pid = by_loose.get(_loose(name))       # نفس الحساب بس اسمه كان ناقصه «لا» ← بيتصلّح
+            if pid is None: f.setdefault("kind", "مورد" if f.get("opening", 0) < 0 else "عميل")   # من غير عمود نوع: الدائن غالبًا مورد
+            blank = {}
+            if any(k in cols for k in ("debit", "credit", "opening")) and "opening" not in f: blank["opening"] = 0.0
+            if "limit" in cols and "credit_limit" not in f: blank["credit_limit"] = 0.0
+            for k in ("phone", "address"):
+                if k in cols and k not in f: blank[k] = ""
+            if "rep" in cols and "rep_id" not in f: blank["rep_id"] = None
+            plan.append({"id": pid, "f": f, "label": name, "blank": blank})
+        return plan, warns
+
+    def item_invoices_selected(self, tree):
+        sel = tree.selection()
+        if not sel: return messagebox.showwarning("تنبيه", "حدد صنفًا أولًا")
+        self.show_item_invoices(int(sel[0]))
+
+    def show_item_invoices(self, item_id, d_from=None, d_to=None, kinds=None):
+        """فواتير الصنف. لو جاي من شاشة المبيعات/المشتريات: بس فواتير الفترة المختارة ونوعها."""
+        cond, args = "", [item_id]
+        if d_from and d_to: cond += f" AND {EFFECTIVE_DATE_SQL} BETWEEN ? AND ?"; args += [d_from, d_to]
+        if kinds: cond += " AND i.kind IN (" + ",".join("?" * len(kinds)) + ")"; args += list(kinds)
+        with db() as c:
+            it = c.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
+            rows = c.execute("SELECT i.id,i.inv_date,i.created_at,i.number,i.kind,p.name party,l.qty,l.price,l.qty*l.price amt FROM invoice_lines l JOIN invoices i ON i.id=l.invoice_id LEFT JOIN parties p ON p.id=i.party_id WHERE l.item_id=?" + cond + " ORDER BY i.inv_date DESC,i.id DESC", args).fetchall()
+            st = stock_of(c, item_id)
+        win = tk.Toplevel(self); win.title(f"فواتير الصنف: {it['name']}"); win.geometry("920x560"); win.configure(bg=BG); win.transient(self)
+        tk.Label(win, text=f"فواتير الصنف: {it['name']}", font=("Tahoma", 18, "bold"), bg=BG, fg=NAVY).pack(anchor="e", padx=15, pady=(12, 2))
+        buy = sum(r["qty"] for r in rows if r["kind"] == "مشتريات"); sell = sum(r["qty"] for r in rows if r["kind"] == "مبيعات")
+        rs = sum(r["qty"] for r in rows if r["kind"] == "مرتجع مبيعات"); rp = sum(r["qty"] for r in rows if r["kind"] == "مرتجع مشتريات")
+        if d_from:
+            per = d_from if d_from == d_to else f"من {d_from} إلى {d_to}"
+            sg = lambda r: -1 if r["kind"].startswith("مرتجع") else 1
+            tk.Label(win, text=f"الفترة: {per}   عدد الفواتير: {len({r['id'] for r in rows})}   الكمية: {fmt(sum(sg(r) * r['qty'] for r in rows))}   القيمة: {fmt(sum(sg(r) * r['amt'] for r in rows))}   الرصيد الحالي: {fmt(st)}", bg=BG, fg=NAVY, font=("Tahoma", 12, "bold")).pack(anchor="e", padx=15)
+        else: tk.Label(win, text=f"رصيد أول المدة: {fmt(it['opening_qty'] or 0)}   مشتريات: {fmt(buy)}   مبيعات: {fmt(sell)}   مرتجع مبيعات: {fmt(rs)}   مرتجع مشتريات: {fmt(rp)}   الرصيد الحالي: {fmt(st)}", bg=BG, font=("Tahoma", 12, "bold")).pack(anchor="e", padx=15)
+        tk.Label(win, text="ضغطتين على أي فاتورة تفتح مكوناتها", bg=BG, fg="#50647b", font=("Tahoma", 11)).pack(anchor="e", padx=15)
+        box = tk.Frame(win, bg=BG); box.pack(fill="both", expand=True, padx=15, pady=8)
+        t = self.tree(box, ("date", "time", "number", "kind", "party", "qty", "price", "amt"), ("التاريخ", "الوقت", "رقم الفاتورة", "النوع", "العميل / المورد", "الكمية", "السعر", "الإجمالي"), [95, 75, 105, 115, 210, 85, 95, 105])
+        for n, r in enumerate(rows): t.insert("", "end", iid=f"{r['id']}_{n}", values=(r["inv_date"], fmt_time(r["created_at"]), r["number"], r["kind"], r["party"] or "", fmt(r["qty"]), fmt(r["price"]), fmt(r["amt"])))
+        t.bind("<Double-1>", lambda e: (t.selection() and self.view_invoice(int(t.selection()[0].split("_")[0]))))
+        ttk.Button(win, text="إغلاق", command=win.destroy).pack(anchor="e", padx=15, pady=8)
+
+    # ================= العملاء والموردون =================
+    def show_parties(self, edit_id=None):
+        """شاشة إضافة / تعديل عميل أو مورد (السجل في شاشة لوحده)."""
+        self.clear(); self.title_label("تعديل عميل / مورد" if edit_id else "إضافة عميل / مورد"); self.party_edit_id = None
+        form = tk.LabelFrame(self.body, text="بيانات عميل / مورد", padx=10, pady=8); form.pack(fill="x", pady=(0, 8))
+        self.party_vars = {k: tk.StringVar() for k in ("name", "kind", "phone", "address", "opening", "rep", "limit")}
+        self.party_vars["kind"].set("عميل"); self.party_vars["opening"].set("0"); self.party_vars["rep"].set(OFFICE); self.party_vars["limit"].set("0")
+        with db() as c: self.party_rep_lookup = rep_lookup(c)
+        pf = [("name", "الاسم"), ("kind", "النوع"), ("phone", "الهاتف"), ("address", "العنوان"), ("opening", "الرصيد الافتتاحي"), ("rep", "المندوب (للعملاء)"), ("limit", "الحد الائتماني 🔒 (0 = بدون)")]
+        for chunk in (pf[:4], pf[4:]):      # صفين علشان كل الخانات تبان حتى في الشاشات الصغيرة
+            prow = tk.Frame(form); prow.pack(fill="x")
+            for k, label in chunk:
+                self.field(prow, label, self.party_vars[k], ["عميل", "مورد", "عميل/مورد"] if k == "kind" else list(self.party_rep_lookup) if k == "rep" else None)
+        tk.Label(form, text="الرصيد الافتتاحي: موجب = على العميل ، سالب = للمورد  •  الحد الائتماني يتحط ويتغيّر بكلمة سر المالك", fg="#50647b").pack(anchor="e")
+        brow = tk.Frame(form); brow.pack(fill="x", pady=6)
+        ttk.Button(brow, text="حفظ التعديل" if edit_id else "حفظ / إضافة", command=self.save_party).pack(side="right")
+        if edit_id: ttk.Button(brow, text="إلغاء والرجوع للسجل", command=self.show_party_list).pack(side="right", padx=6)
+        else: ttk.Button(brow, text="تفريغ الخانات", command=self.show_parties).pack(side="right", padx=6)
+        ttk.Button(brow, text="سجل العملاء والموردين", command=self.show_party_list).pack(side="left", padx=6)
+        if is_owner(): ttk.Button(brow, text="استيراد من Excel", command=lambda: self.import_excel("parties")).pack(side="left", padx=6)
+        self.party_recent = tk.Label(self.body, text="", bg=BG, fg="#0f7b3d", font=("Tahoma", 12, "bold"), anchor="e", justify="right")
+        self.party_recent.pack(fill="x", pady=(4, 0))
+        if edit_id: self.load_party_into_form(edit_id)
+
+    def show_party_list(self, select_id=None):
+        """سجل العملاء والموردين: بحث، أرصدة، كشف حساب، تعديل وحذف."""
+        self.clear(); self.title_label("سجل العملاء والموردين")
+        top = tk.Frame(self.body, bg=BG); top.pack(fill="x", pady=(0, 4))
+        ttk.Button(top, text="إضافة عميل / مورد", command=self.show_parties).pack(side="right", padx=4)
+        if is_owner(): ttk.Button(top, text="استيراد من Excel", command=lambda: self.import_excel("parties")).pack(side="right", padx=4)
+        self.party_kind_f = tk.StringVar(value="الكل")
+        cb = ttk.Combobox(top, textvariable=self.party_kind_f, values=["الكل", "عملاء", "موردين", "عليهم فلوس", "ليهم فلوس", "عدّوا الحد الائتماني"], state="readonly", width=18, justify="right")
+        cb.pack(side="left", padx=4); tk.Label(top, text="عرض:", bg=BG).pack(side="left")
+        self.party_kind_f.trace_add("write", lambda *a: self.refresh_parties())
+        self.party_q = tk.StringVar()
+        self.search_bar("بحث سريع (الاسم أو الهاتف أو المندوب):", self.party_q)
+        self.party_q.trace_add("write", lambda *a: self.refresh_parties())
+        self.parties_tree = self.tree(self.body, ("id", "name", "kind", "rep", "phone", "address", "opening", "balance", "limit", "last_col", "last_pay"),
+                                      ("ID", "الاسم", "النوع", "المندوب", "الهاتف", "العنوان", "الرصيد الافتتاحي", "الرصيد الحالي", "الحد الائتماني", "آخر تحصيل", "آخر دفع"), [40, 170, 70, 95, 100, 130, 100, 105, 100, 90, 90])
+        self.parties_tree.tag_configure("over", foreground="#b91c1c")
+        self.parties_tree.bind("<Double-1>", lambda e: self.party_statement())
+        self.party_note = tk.Label(self.body, text="", bg=BG, fg="#6b7280", font=("Tahoma", 11), anchor="e"); self.party_note.pack(fill="x")
+        self.parties_tree.bind("<<TreeviewSelect>>", self.party_selected)
+        self.party_totals = tk.Frame(self.body, bg=BG); self.party_totals.pack(fill="x")
+        bar = tk.Frame(self.body, bg=BG); bar.pack(fill="x", pady=6)
+        ttk.Button(bar, text="كشف حساب المحدد (فواتير + سندات)", command=self.party_statement).pack(side="right", padx=4)
+        ttk.Button(bar, text="سند جديد للمحدد", command=self.party_voucher).pack(side="right", padx=4)
+        ttk.Button(bar, text="تعديل المحدد", command=self.edit_selected_party).pack(side="right", padx=4)
+        ttk.Button(bar, text="حذف المحدد", command=self.delete_selected_party).pack(side="right", padx=4)
+        tk.Label(bar, text="ضغطتين = كشف الحساب", bg=BG, fg="#50647b", font=("Tahoma", 11)).pack(side="left")
+        self.refresh_parties()
+        if select_id and self.parties_tree.exists(str(select_id)):
+            self.parties_tree.selection_set(str(select_id)); self.parties_tree.see(str(select_id))
+
+    def party_selected(self, e=None):
+        sel = self.parties_tree.selection()
+        if not sel: return
+        with db() as c: self.party_note.config(text=party_last_text(c, int(sel[0])))
+
+    def selected_party_id(self):
+        sel = self.parties_tree.selection()
+        if not sel:
+            messagebox.showwarning("تنبيه", "حدد عميلًا أو موردًا من القائمة أولًا"); return None
+        return int(sel[0])
+
+    def party_statement(self):
+        pid = self.selected_party_id()
+        if pid: self.show_account(pid)
+
+    def party_voucher(self):
+        pid = self.selected_party_id()
+        if pid: self.show_payments(pid)
+
+    def save_party(self):
+        v = {k: x.get().strip() for k, x in self.party_vars.items()}
+        if not v["name"]: return messagebox.showwarning("تنبيه", "الاسم مطلوب")
+        try: opening = float(v["opening"] or 0)
+        except ValueError: return messagebox.showerror("خطأ", "الرصيد الافتتاحي يجب أن يكون رقمًا")
+        rep_id = self.party_rep_lookup.get(self.party_vars["rep"].get())
+        try: limit = float(v["limit"] or 0)
+        except ValueError: return messagebox.showerror("خطأ", "الحد الائتماني يجب أن يكون رقمًا")
+        if limit < 0: return messagebox.showerror("خطأ", "الحد الائتماني لا يكون بالسالب")
+        old_limit = 0.0
+        if self.party_edit_id:
+            with db() as c: old_limit = float(c.execute("SELECT COALESCE(credit_limit,0) FROM parties WHERE id=?", (self.party_edit_id,)).fetchone()[0])
+        limit_who = None
+        if abs(limit - old_limit) > 1e-9:
+            limit_who = self.ask_owner_password(f"تغيير الحد الائتماني لـ«{v['name']}» من {fmt(old_limit)} إلى {fmt(limit)}.\n\nاكتب كلمة سر المالك:")
+            if not limit_who: return self.status.config(text="لم يُحفظ — تغيير الحد الائتماني يحتاج كلمة سر المالك")
+        with db() as c:
+            rep_txt = f" — المندوب: {rep_name_of(c, rep_id)}"
+            if limit_who: rep_txt += f" — الحد الائتماني {fmt(old_limit)}←{fmt(limit)} (بموافقة {limit_who})"
+            if self.party_edit_id:
+                old = c.execute("SELECT * FROM parties WHERE id=?", (self.party_edit_id,)).fetchone()
+                c.execute("UPDATE parties SET name=?,kind=?,phone=?,address=?,opening=?,rep_id=?,credit_limit=? WHERE id=?", (v["name"], v["kind"], v["phone"], v["address"], opening, rep_id, limit, self.party_edit_id))
+                extra = f" (الرصيد الافتتاحي {fmt(old['opening'])}←{fmt(opening)})" if abs(float(old["opening"] or 0) - opening) > 1e-9 else ""
+                log(c, "تعديل عميل/مورد", v["name"] + extra + rep_txt)
+            else:
+                c.execute("INSERT INTO parties(name,kind,phone,address,opening,rep_id,credit_limit) VALUES(?,?,?,?,?,?,?)", (v["name"], v["kind"], v["phone"], v["address"], opening, rep_id, limit))
+                log(c, "إضافة عميل/مورد", f"{v['name']} (رصيد افتتاحي {fmt(opening)})" + rep_txt)
+        edited = self.party_edit_id
+        self.party_edit_id = None
+        if edited:
+            self.show_party_list(edited); self.status.config(text=f"تم حفظ تعديل «{v['name']}»"); return
+        for k in ("name", "phone", "address"): self.party_vars[k].set("")
+        self.party_vars["opening"].set("0"); self.party_vars["kind"].set("عميل"); self.party_vars["rep"].set(OFFICE); self.party_vars["limit"].set("0")
+        self.status.config(text="تم حفظ العميل / المورد")
+        try: self.party_recent.config(text=f"✔ اتضاف «{v['name']}» ({v['kind']}) — تقدر تضيف اللي بعده، أو تفتح السجل")
+        except tk.TclError: pass
+
+    def refresh_parties(self):
+        if not hasattr(self, "parties_tree") or not self.parties_tree.winfo_exists(): return
+        for x in self.parties_tree.get_children(): self.parties_tree.delete(x)
+        q = self.party_q.get().strip().lower() if hasattr(self, "party_q") else ""
+        kf = self.party_kind_f.get() if hasattr(self, "party_kind_f") else "الكل"
+        n = recv = pay = 0.0
+        with db() as c:
+            for r in c.execute("SELECT p.*,m.name rname FROM parties p LEFT JOIN employees m ON m.id=p.rep_id ORDER BY p.name").fetchall():
+                if q and q not in (r["name"] or "").lower() and q not in (r["phone"] or "").lower() and q not in (r["rname"] or "").lower(): continue
+                if kf == "عملاء" and r["kind"] == "مورد": continue
+                if kf == "موردين" and r["kind"] == "عميل": continue
+                bal = party_balance(c, r["id"])
+                if kf == "عليهم فلوس" and bal <= 0.005: continue
+                if kf == "ليهم فلوس" and bal >= -0.005: continue
+                if kf == "عدّوا الحد الائتماني" and not (float(r["credit_limit"] or 0) and bal > float(r["credit_limit"] or 0) + 0.005): continue
+                n += 1
+                if bal > 0: recv += bal
+                else: pay -= bal
+                if "_ld" not in locals(): _ld = last_dates(c)
+                lc = _ld[0].get(r["id"]) or ""; lp = _ld[1].get(r["id"]) or ""
+                rep = (r["rname"] or OFFICE) if r["kind"] != "مورد" else ""
+                lim = float(r["credit_limit"] or 0)
+                self.parties_tree.insert("", "end", iid=str(r["id"]), values=(r["id"], r["name"], r["kind"], rep, r["phone"], r["address"], fmt(r["opening"]), fmt(bal), fmt(lim) if lim else "—", lc, lp),
+                                         tags=("over",) if lim and bal > lim + 0.005 else ())
+        if hasattr(self, "party_totals") and self.party_totals.winfo_exists():
+            for w in self.party_totals.winfo_children(): w.destroy()
+            self.total_bar(self.party_totals, [("العدد", str(int(n))), ("إجمالي اللي علينا لهم", fmt(pay)), ("إجمالي اللي لينا عندهم", fmt(recv))])
+
+    def edit_selected_party(self):
+        pid = self.selected_party_id()
+        if pid: self.show_parties(pid)
+
+    def load_party_into_form(self, pid):
+        with db() as c: r = c.execute("SELECT * FROM parties WHERE id=?", (pid,)).fetchone()
+        self.party_edit_id = pid
+        for k, val in (("name", r["name"]), ("kind", r["kind"]), ("phone", r["phone"]), ("address", r["address"]), ("opening", r["opening"]), ("limit", r["credit_limit"] or 0)): self.party_vars[k].set(str(val))
+        rep = OFFICE
+        if r["rep_id"]:
+            if r["rep_id"] not in self.party_rep_lookup.values():
+                with db() as c: self.party_rep_lookup.update(rep_lookup(c, r["rep_id"]))
+            rep = next((k for k, v in self.party_rep_lookup.items() if v == r["rep_id"]), OFFICE)
+        self.party_vars["rep"].set(rep)
+        self.status.config(text=f"جاري تعديل «{r['name']}» — عدّل الحقول واضغط «حفظ / إضافة»")
+
+    def delete_selected_party(self):
+        pid = self.selected_party_id()
+        if not pid: return
+        with db() as c:
+            used = c.execute("SELECT (SELECT COUNT(*) FROM invoices WHERE party_id=?)+(SELECT COUNT(*) FROM payments WHERE party_id=?)", (pid, pid)).fetchone()[0]
+            name = c.execute("SELECT name FROM parties WHERE id=?", (pid,)).fetchone()["name"]
+        if used: return messagebox.showwarning("لا يمكن الحذف", "له فواتير أو سندات. يمكنك تعديل بياناته فقط.")
+        if messagebox.askyesno("تأكيد", f"حذف «{name}»؟"):
+            with db() as c:
+                c.execute("DELETE FROM parties WHERE id=?", (pid,)); log(c, "حذف عميل/مورد", name)
+            self.refresh_parties()
+
+    # ================= الفواتير =================
+    def show_invoice(self, kind, edit_id=None):
+        self.clear(); self.invoice_kind = kind; self.current_lines = []; self.edit_id = edit_id; self.inv_neg_owner = None
+        self.title_label(("تعديل " if edit_id else "") + "فاتورة " + kind)
+        with db() as c:
+            parties = c.execute("SELECT id,name,address,phone,rep_id FROM parties ORDER BY name").fetchall()
+            items = c.execute("SELECT id,code,name,unit,buy_price,sell_price FROM items ORDER BY name").fetchall()
+            old = lines = None; paid_old = 0.0
+            if edit_id:
+                old = c.execute("SELECT * FROM invoices WHERE id=?", (edit_id,)).fetchone()
+                lines = c.execute("SELECT * FROM invoice_lines WHERE invoice_id=?", (edit_id,)).fetchall()
+                paid_old = float(c.execute("SELECT COALESCE(SUM(amount),0) FROM payments WHERE invoice_id=?", (edit_id,)).fetchone()[0])
+            self.inv_rep_lookup = rep_lookup(c, old["rep_id"] if old else None) if kind == "مبيعات" else {}
+        form = tk.LabelFrame(self.body, text="بيانات الفاتورة", padx=10, pady=3); form.pack(fill="x")
+        self.inv_no = tk.StringVar(value=old["number"] if old else next_no(kind))
+        self._auto_no = None if old else self.inv_no.get()
+        self.inv_date = tk.StringVar(value=old["inv_date"] if old else date.today().isoformat())
+        self.inv_due = tk.StringVar(value=(old["due_date"] or "") if old else "")
+        self.inv_party = tk.StringVar(); self.inv_notes = tk.StringVar(value=old["notes"] if old else "")
+        self.inv_discount = tk.StringVar(value=str(old["discount"] or 0) if old else "0")
+        self.inv_paid = tk.StringVar(value=str(paid_old) if old else "0")
+        self.party_lookup = {party_label(p): p["id"] for p in parties}
+        self.party_rep_of = {p["id"]: p["rep_id"] for p in parties}
+        self.item_lookup = {item_label(p): dict(p) for p in items}
+        if old:
+            for k, v in self.party_lookup.items():
+                if v == old["party_id"]: self.inv_party.set(k)
+            self.current_lines = [{"item_id": l["item_id"], "name": l["item_name"], "unit": l["unit"], "qty": l["qty"], "price": l["price"], "damaged": int(l["damaged"] or 0)} for l in lines]
+        self.field(form, "رقم الفاتورة", self.inv_no)
+        self.field(form, "التاريخ", self.inv_date)
+        self.field(form, "تاريخ الاستحقاق (اختياري)", self.inv_due)
+        party_w = self.field(form, "العميل / المورد", self.inv_party, list(self.party_lookup), search=True)
+        party_w.bind("<<ComboboxSelected>>", lambda e: self.invoice_party_changed(), add="+")
+        self.inv_rep = tk.StringVar(value=OFFICE)
+        if kind == "مبيعات":
+            if old and old["rep_id"]:
+                for k, v in self.inv_rep_lookup.items():
+                    if v == old["rep_id"]: self.inv_rep.set(k)
+            self.field(form, "المندوب", self.inv_rep, list(self.inv_rep_lookup))
+        self.field(form, "ملاحظات", self.inv_notes)
+        add = tk.LabelFrame(self.body, text="إضافة صنف للفاتورة", padx=10, pady=3); add.pack(fill="x", pady=5)
+        self.inv_item = tk.StringVar(); self.inv_qty = tk.StringVar(value="1"); self.inv_price = tk.StringVar(value="0")
+        cb = self.field(add, "الصنف", self.inv_item, list(self.item_lookup), search=True)
+        def price_changed(_=None):
+            item = self.item_lookup.get(self.inv_item.get())
+            if item: self.inv_price.set(str(item["sell_price"] if kind in ("مبيعات", "مرتجع مبيعات") else item["buy_price"]))
+            self.update_last_price()
+        cb.bind("<<ComboboxSelected>>", price_changed, add="+")
+        self.field(add, "الكمية", self.inv_qty); price_w = self.field(add, "سعر الوحدة", self.inv_price)
+        def price_enter(e):
+            n = len(self.current_lines); self.add_invoice_line()
+            if len(self.current_lines) > n: self.after(1, lambda: focus_input(cb))
+            return "break"
+        price_w.bind("<Return>", price_enter); price_w.bind("<KP_Enter>", price_enter)
+        self.inv_damaged = tk.BooleanVar(value=False)
+        if kind == "مرتجع مبيعات":
+            tk.Checkbutton(add, text="هالك (لا يرجع للمخزن)", variable=self.inv_damaged, font=("Tahoma", 12, "bold"), fg="#b91c1c").pack(side="right", padx=8, pady=(18, 0))
+        ttk.Button(add, text="إضافة الصنف", command=self.add_invoice_line).pack(side="right", padx=10, pady=(18, 0))
+        info = tk.Frame(self.body, bg=BG); info.pack(fill="x", pady=(0, 4)); self.inv_info_row = info
+        self.inv_chips = {}
+        for key, title, color in (("party", "رصيد الحساب", "#0d9488"), ("stock", "رصيد الصنف في المخزن", "#ea7a0c")):
+            chip = tk.Frame(info, bg=color, padx=2, pady=2); chip.pack(side="right", padx=4)
+            tk.Label(chip, text=title, bg=color, fg="white", font=("Tahoma", 11, "bold"), padx=8).pack(side="right")
+            self.inv_chips[key] = tk.Label(chip, text="—", bg="white", fg=_shade(color, 0.6), font=("Tahoma", 13, "bold"), padx=10)
+            self.inv_chips[key].pack(side="right")
+        self.inv_last_label = tk.Label(info, text="", bg=BG, fg="#6d28d9", font=("Tahoma", 12, "bold"), anchor="e")
+        self.inv_last_label.pack(side="right", fill="x", expand=True, padx=8)
+        if kind == "مبيعات" and is_owner():
+            self.inv_tree = self.tree(self.body, ("name", "qty", "unit", "price", "total", "cost", "profit"),
+                                      ("الصنف", "الكمية", "الوحدة", "سعر الوحدة", "الإجمالي", "التكلفة 🔒", "الربح 🔒"), [330, 100, 90, 130, 140, 140, 130])
+            self.inv_tree.tag_configure("loss", foreground="#b91c1c")
+        elif kind == "مرتجع مبيعات":
+            self.inv_tree = self.tree(self.body, ("name", "qty", "unit", "price", "total", "dmg"), ("الصنف", "الكمية", "الوحدة", "سعر الوحدة", "الإجمالي", "هالك؟"), [360, 110, 100, 140, 150, 130])
+            self.inv_tree.tag_configure("dmg", foreground="#b91c1c")
+        else:
+            self.inv_tree = self.tree(self.body, ("name", "qty", "unit", "price", "total"), ("الصنف", "الكمية", "الوحدة", "سعر الوحدة", "الإجمالي"), [380, 120, 100, 150, 160])
+        self.inv_tree.bind("<Double-1>", lambda e: self.inv_tree.identify_row(e.y) and self.edit_invoice_line(int(self.inv_tree.identify_row(e.y))))
+        self.inv_tree.bind("<Delete>", lambda e: self.remove_invoice_line())
+        # مربعات ملونة للإجماليات (زي الـ highlights)
+        self.inv_tiles = self.color_tiles(self.body, [("total", "الإجمالي", "#f59e0b"), ("disc", "الخصم", "#84cc16"), ("net", "الصافي", "#16a34a"),
+                                                      ("paid", PAID_LABEL[kind], "#8b5cf6"), ("rest", "الباقي", "#ef4444")])
+        bottom = tk.Frame(self.body, bg=BG); bottom.pack(fill="x", pady=6)
+        self.inv_total_label = tk.Label(bottom, text="", bg=BG)
+        self.inv_paytype = tk.StringVar(value=(old["pay_type"] if old and old["pay_type"] else "آجل"))
+        if kind in PAYTYPE_KINDS:
+            pt = tk.Frame(bottom, bg=BG); pt.pack(side="right", padx=14)
+            for v in ("نقدي", "آجل"):
+                tk.Radiobutton(pt, text=v, value=v, variable=self.inv_paytype, bg=BG, font=("Tahoma", 13, "bold"), fg=NAVY,
+                               activebackground=BG, command=self.paytype_changed).pack(side="right", padx=4)
+        for label, var in (("الخصم", self.inv_discount), (PAID_LABEL[kind], self.inv_paid)):
+            f = tk.Frame(bottom, bg=BG); f.pack(side="right", padx=14)
+            tk.Label(f, text=label, bg=BG).pack(side="right", padx=4)
+            e = ttk.Entry(f, textvariable=var, width=11, justify="right"); e.pack(side="right")
+            if var is self.inv_paid: self.inv_paid_entry = e
+        actions = bottom   # الأزرار في نفس صف الخصم والمدفوع (توفير مساحة)
+        ttk.Button(actions, text="حفظ التعديل وطباعة" if edit_id else "حفظ وطباعة", command=lambda: self.save_invoice(do_print=True)).pack(side="left", padx=4)
+        ttk.Button(actions, text="حفظ التعديل" if edit_id else "حفظ", command=lambda: self.save_invoice(do_print=False)).pack(side="left", padx=4)
+        ttk.Button(actions, text="🗑 حذف الصنف", command=self.remove_invoice_line).pack(side="left", padx=4)
+        ttk.Button(actions, text="✏ تعديل الصنف", command=self.edit_invoice_line).pack(side="left", padx=4)
+        if edit_id: ttk.Button(actions, text="إلغاء", command=self.show_invoices).pack(side="left", padx=4)
+        if kind == "مبيعات" and is_owner():
+            self.inv_profit_label = tk.Label(self.inv_info_row, text="", font=("Tahoma", 12, "bold"), bg=BG, fg="#1c7c4d"); self.inv_profit_label.pack(side="left", padx=6)
+            self.inv_date.trace_add("write", lambda *a: self.refresh_invoice_lines())
+        self.inv_discount.trace_add("write", lambda *a: self.refresh_invoice_lines())
+        self.inv_paid.trace_add("write", lambda *a: self.update_invoice_tiles())
+        if not edit_id: self.inv_date.trace_add("write", lambda *a: self.invoice_date_changed())
+        self.paytype_changed(initial=True)
+        self.refresh_invoice_lines()
+
+    def invoice_date_changed(self):
+        """فاتورة جديدة: لو غيّرت التاريخ، الرقم يتحسب لليوم ده (طالما ماكتبتش رقم بإيدك)."""
+        try: d = check_date(self.inv_date.get())
+        except ValueError: return
+        if self.inv_no.get().strip() in ("", self._auto_no):
+            self._auto_no = next_no(self.invoice_kind, d); self.inv_no.set(self._auto_no)
+
+    def color_tiles(self, parent, specs, size=17):
+        if self.compact: size = min(size, 14)
+        """صف مربعات ملونة: specs = [(key, العنوان, اللون)]. بيرجع dict بالـ Labels."""
+        row = tk.Frame(parent, bg=BG); row.pack(fill="x", pady=(6, 2))
+        out = {}
+        for key, title, color in specs:
+            light = "#%02x%02x%02x" % tuple(int(int(color[i:i + 2], 16) * 0.18 + 255 * 0.82) for i in (1, 3, 5))
+            box = tk.Frame(row, bg=light, highlightbackground=color, highlightthickness=2)
+            box.pack(side="right", expand=True, fill="x", padx=4)
+            tk.Label(box, text=title, bg=color, fg="white", font=("Tahoma", 11 if self.compact else 12, "bold"), pady=1 if self.compact else 3).pack(fill="x")
+            out[key] = tk.Label(box, text="0.00", bg=light, fg=_shade(color, 0.55), font=("Tahoma", size, "bold"), pady=1 if self.compact else 4)
+            out[key].pack(fill="x")
+        return out
+
+    def update_invoice_tiles(self, total=None):
+        if not hasattr(self, "inv_tiles"): return
+        try:
+            if not self.inv_tiles["total"].winfo_exists(): return
+        except tk.TclError: return
+        if total is None: total = sum(l["qty"] * l["price"] for l in self.current_lines)
+        disc = self.get_discount(); net = total - disc
+        try: paid = float(self.inv_paid.get() or 0)
+        except ValueError: paid = 0.0
+        for k, v in (("total", total), ("disc", disc), ("net", net), ("paid", paid), ("rest", net - paid)):
+            self.inv_tiles[k].config(text=fmt(v))
+
+    def paytype_changed(self, initial=False):
+        """نقدي = المدفوع بيساوي صافي الفاتورة (مقفول)، آجل = تكتب المدفوع بإيدك."""
+        if self.invoice_kind not in PAYTYPE_KINDS or not hasattr(self, "inv_paid_entry"): return
+        if self.inv_paytype.get() == "نقدي":
+            self.inv_paid_entry.config(state="disabled"); self.refresh_invoice_lines()
+        else:
+            self.inv_paid_entry.config(state="normal")
+            if not initial: self.inv_paid.set("0")
+
+    def add_invoice_line(self):
+        item = self.item_lookup.get(self.inv_item.get())
+        if not item: return messagebox.showwarning("تنبيه", "اختر الصنف")
+        try: qty = float(self.inv_qty.get()); price = float(self.inv_price.get())
+        except ValueError: return messagebox.showerror("خطأ", "الكمية والسعر يجب أن يكونا أرقامًا")
+        if qty <= 0 or price < 0: return messagebox.showerror("خطأ", "الكمية يجب أن تكون أكبر من صفر والسعر غير سالب")
+        if SIGN[self.invoice_kind] < 0 and not self.edit_id:
+            with db() as c: st = min(stock_of(c, item["id"]), stock_of(c, item["id"], None))
+            st -= sum(l["qty"] for l in self.current_lines if l["item_id"] == item["id"])
+            if qty > st:
+                who = getattr(self, "inv_neg_owner", None) or self.allow_negative(f"الرصيد المتاح من «{item['name']}» هو {fmt(st)} بس، وانت كاتب {fmt(qty)}.")
+                if not who: return
+                self.inv_neg_owner = who
+        dmg = 1 if (self.invoice_kind == "مرتجع مبيعات" and self.inv_damaged.get()) else 0
+        self.current_lines.append({"item_id": item["id"], "name": item["name"], "unit": item["unit"], "qty": qty, "price": price, "damaged": dmg})
+        self.inv_damaged.set(False)
+        self.refresh_invoice_lines()
+        # الصنف اللي فوق يرجع فاضي علشان تكتب اللي بعده
+        self.inv_item.set(""); self.inv_qty.set("1"); self.inv_price.set("0")
+        try: self.update_last_price()
+        except Exception: pass
+
+    def invoice_party_changed(self):
+        """لما يتغير العميل: المندوب يتملى من بيانات العميل (فاتورة المبيعات)، ويتحدث آخر سعر."""
+        pid = self.party_lookup.get(self.inv_party.get())
+        if self.invoice_kind == "مبيعات" and pid:
+            rid = self.party_rep_of.get(pid)
+            if rid and rid not in self.inv_rep_lookup.values():
+                with db() as c: self.inv_rep_lookup.update(rep_lookup(c, rid))
+            self.inv_rep.set(next((k for k, v in self.inv_rep_lookup.items() if v == rid), OFFICE) if rid else OFFICE)
+        self.update_last_price()
+
+    def update_last_price(self):
+        """آخر سعر للصنف ده مع العميل/المورد ده."""
+        if not hasattr(self, "inv_last_label") or not self.inv_last_label.winfo_exists(): return
+        pid = self.party_lookup.get(self.inv_party.get()); item = self.item_lookup.get(self.inv_item.get())
+        with db() as c:
+            self.inv_chips["party"].config(text=fmt(party_balance(c, pid)) if pid else "—")
+            if item:
+                st_now = stock_of(c, item["id"]); res = reserved_of(c, item["id"])
+                self.inv_chips["stock"].config(text=fmt(st_now) + " " + (item["unit"] or "") + (f"  (محجوز لفواتير قادمة {fmt(res)})" if res > 1e-9 else ""))
+            else: self.inv_chips["stock"].config(text="—")
+        if not pid or not item: return self.inv_last_label.config(text="")
+        sale_side = self.invoice_kind in ("مبيعات", "مرتجع مبيعات")
+        k = "مبيعات" if sale_side else "مشتريات"
+        with db() as c:
+            r = c.execute("SELECT l.price,i.inv_date,i.number FROM invoice_lines l JOIN invoices i ON i.id=l.invoice_id "
+                          "WHERE i.kind=? AND i.party_id=? AND l.item_id=? AND i.id<>? ORDER BY i.inv_date DESC,i.id DESC LIMIT 1",
+                          (k, pid, item["id"], self.edit_id or -1)).fetchone()
+        who = "للعميل ده" if sale_side else "من المورد ده"
+        if r: self.inv_last_label.config(text=f"آخر سعر {'بيع' if sale_side else 'شراء'} {who}: {fmt(r['price'])} ج.م — بتاريخ {r['inv_date']} (فاتورة {r['number']})")
+        else: self.inv_last_label.config(text=f"أول مرة: الصنف ده {'ما اتباعش' if sale_side else 'ما اتشراش'} {who} قبل كده")
+
+    def remove_invoice_line(self):
+        """بيحذف الأصناف المحددة في الجدول (أو آخر صنف لو مفيش تحديد)."""
+        if not self.current_lines: return
+        sel = sorted({int(x) for x in self.inv_tree.selection()}, reverse=True) if hasattr(self, "inv_tree") else []
+        if not sel: sel = [len(self.current_lines) - 1]
+        elif len(sel) > 1 and not messagebox.askyesno("حذف", f"تحذف {len(sel)} صنف من الفاتورة؟"): return
+        for i in sel:
+            if 0 <= i < len(self.current_lines): self.current_lines.pop(i)
+        self.refresh_invoice_lines()
+
+    def edit_invoice_line(self, idx=None):
+        """تعديل كمية/سعر صنف في الفاتورة (ضغطتين على الصنف أو زرار «تعديل الصنف»)."""
+        if idx is None:
+            sel = self.inv_tree.selection() if hasattr(self, "inv_tree") else ()
+            if not sel: return messagebox.showwarning("تنبيه", "حدد الصنف من الجدول الأول")
+            idx = int(sel[0])
+        if not (0 <= idx < len(self.current_lines)): return
+        l = self.current_lines[idx]
+        w = tk.Toplevel(self); w.title("تعديل الصنف"); w.configure(bg=BG, padx=16, pady=12); w.transient(self); w.resizable(False, False)
+        tk.Label(w, text=l["name"], bg=BG, fg=NAVY, font=("Tahoma", 14, "bold")).pack(anchor="e", pady=(0, 8))
+        qv, pv = tk.StringVar(value=f"{l['qty']:g}"), tk.StringVar(value=f"{l['price']:g}"); dv = tk.BooleanVar(value=bool(l.get("damaged")))
+        tk.Label(w, text=f"الكمية ({l['unit']})", bg=BG).pack(anchor="e"); qe = ttk.Entry(w, textvariable=qv, justify="right", width=28); qe.pack(fill="x", pady=(0, 6))
+        tk.Label(w, text="سعر الوحدة", bg=BG).pack(anchor="e"); ttk.Entry(w, textvariable=pv, justify="right", width=28).pack(fill="x", pady=(0, 6))
+        if self.invoice_kind == "مرتجع مبيعات":
+            tk.Checkbutton(w, text="هالك (لا يرجع للمخزن)", variable=dv, bg=BG, fg="#b91c1c").pack(anchor="e")
+        def ok(*a):
+            try: q = float(qv.get().translate(_AR_DIGITS).replace(",", "")); p = float(pv.get().translate(_AR_DIGITS).replace(",", ""))
+            except ValueError: return messagebox.showerror("خطأ", "الكمية والسعر لازم يكونوا أرقام", parent=w)
+            if q <= 0 or p < 0: return messagebox.showerror("خطأ", "الكمية لازم تكون أكبر من صفر والسعر مش بالسالب", parent=w)
+            if SIGN[self.invoice_kind] < 0 and not self.edit_id and l["item_id"] and q > l["qty"]:
+                with db() as c: st = min(stock_of(c, l["item_id"]), stock_of(c, l["item_id"], None))
+                st -= sum(x["qty"] for i, x in enumerate(self.current_lines) if x["item_id"] == l["item_id"] and i != idx)
+                if q > st:
+                    who = getattr(self, "inv_neg_owner", None) or self.allow_negative(f"الرصيد المتاح من «{l['name']}» هو {fmt(st)} بس.")
+                    if not who: return
+                    self.inv_neg_owner = who
+            l["qty"], l["price"] = q, p
+            if self.invoice_kind == "مرتجع مبيعات": l["damaged"] = 1 if dv.get() else 0
+            w.destroy(); self.refresh_invoice_lines()
+            if self.inv_tree.exists(str(idx)): self.inv_tree.selection_set(str(idx))
+        bf = tk.Frame(w, bg=BG); bf.pack(fill="x", pady=(8, 0))
+        ttk.Button(bf, text="حفظ", command=ok).pack(side="right", padx=4); ttk.Button(bf, text="إلغاء", command=w.destroy).pack(side="right")
+        w.bind("<Return>", ok); w.bind("<Escape>", lambda e: w.destroy())
+        w.update_idletasks(); _center(w, max(w.winfo_reqwidth(), 360), w.winfo_reqheight())
+        w.grab_set(); qe.focus_set(); qe.icursor("end")
+
+    def get_discount(self):
+        try: return float(self.inv_discount.get() or 0)
+        except ValueError: return 0.0
+
+    def refresh_invoice_lines(self):
+        if not hasattr(self, "inv_tree") or not self.inv_tree.winfo_exists(): return
+        for x in self.inv_tree.get_children(): self.inv_tree.delete(x)
+        total = 0
+        show_profit = self.invoice_kind == "مبيعات" and is_owner()
+        if show_profit:
+            try: upto = check_date(self.inv_date.get())
+            except ValueError: upto = date.today().isoformat()
+            with db() as c: pre = fifo_preview(c, [(l["item_id"], l["qty"]) for l in self.current_lines], skip_invoice=self.edit_id)
+        profit = 0.0
+        for li, l in enumerate(self.current_lines):
+            amount = l["qty"] * l["price"]; total += amount
+            if show_profit:
+                cost = pre[li] if l["item_id"] else 0.0; p = amount - l["qty"] * cost; profit += p
+                self.inv_tree.insert("", "end", iid=str(li), values=(l["name"], fmt(l["qty"]), l["unit"], fmt(l["price"]), fmt(amount), fmt(cost), fmt(p)), tags=("loss",) if p < -1e-9 else ())
+            elif self.invoice_kind == "مرتجع مبيعات":
+                d = l.get("damaged")
+                self.inv_tree.insert("", "end", iid=str(li), values=(l["name"], fmt(l["qty"]), l["unit"], fmt(l["price"]), fmt(amount), "✔ هالك" if d else "يرجع للمخزن"), tags=("dmg",) if d else ())
+            else:
+                self.inv_tree.insert("", "end", iid=str(li), values=(l["name"], fmt(l["qty"]), l["unit"], fmt(l["price"]), fmt(amount)))
+        if self.invoice_kind in PAYTYPE_KINDS and getattr(self, "inv_paytype", None) and self.inv_paytype.get() == "نقدي":
+            v = f"{max(total - self.get_discount(), 0):.2f}"
+            if self.inv_paid.get() != v: self.inv_paid.set(v)
+        self.update_invoice_tiles(total)
+        if show_profit and hasattr(self, "inv_profit_label"):
+            pr = profit - self.get_discount()
+            self.inv_profit_label.config(text=f"🔒 ربح الفاتورة: {fmt(pr)} ج.م (لا يُطبع)", fg="#b91c1c" if pr < 0 else "#1c7c4d")
+
+    def save_invoice(self, do_print=False, override=False):
+        party = self.party_lookup.get(self.inv_party.get())
+        try:
+            d = prepare_invoice(self.invoice_kind, self.current_lines, party, self.inv_no.get(), self.inv_date.get(), self.inv_due.get(),
+                                self.inv_discount.get(), self.inv_paid.get(), self.inv_paytype.get() if self.invoice_kind in PAYTYPE_KINDS else None,
+                                self.inv_notes.get(), self.inv_rep_lookup.get(self.inv_rep.get()) if self.invoice_kind == "مبيعات" else None, self.edit_id)
+        except InvoiceInputError as e:
+            return (messagebox.showwarning if e.warn else messagebox.showerror)(e.title, str(e))
+        kind = d["kind"]; edit_id = d["edit_id"]
+        try:
+            inv_id, number = persist_invoice(d, override=override, auto_no=(not edit_id) and d["number"] == getattr(self, "_auto_no", None))
+        except CreditLimitExceeded as e:
+            who = self.ask_owner_password(
+                f"العميل «{e.name}» هيعدّي الحد الائتماني:\n\nالحد: {fmt(e.limit)}\nالرصيد قبل الفاتورة: {fmt(e.before)}\n"
+                f"الرصيد بعد الفاتورة: {fmt(e.after)}\nالزيادة عن الحد: {fmt(e.after - e.limit)}\n\nالفاتورة متقفلة. لفتحها اكتب كلمة سر المالك:")
+            if who: return self.save_invoice(do_print=do_print, override=who)
+            return self.status.config(text="لم تُحفظ الفاتورة — تجاوز الحد الائتماني")
+        except DBIntegrityError: return messagebox.showerror("خطأ", "رقم الفاتورة ده موجود بالفعل في نفس اليوم؛ غيّر الرقم")
+        except NegativeStock as e:
+            if getattr(_TLS, "allow_neg", None): return messagebox.showerror("خطأ", str(e))
+            who = getattr(self, "inv_neg_owner", None) or self.allow_negative(str(e))
+            if not who: return self.status.config(text="لم تُحفظ الفاتورة — الرصيد هيبقى بالسالب")
+            self.inv_neg_owner = who
+            return self._with_neg(who, lambda: self.save_invoice(do_print=do_print, override=override))
+        except ValueError as e: return messagebox.showerror("خطأ", str(e))
+        self._exp_cache = (0, None); self.after(300, self.update_bell)
+        if do_print: self.print_invoice(inv_id, quiet=True)
+        if edit_id: self.show_invoices()
+        else: self.show_invoice(kind)
+        self.status.config(text=f"✔ تم حفظ فاتورة {kind} رقم {number}" + (" وفتحها للطباعة (Ctrl+P)" if do_print else " — تقدر تطبعها من سجل الفواتير"))
+
+    def allow_negative(self, what):
+        """الرصيد هيبقى بالسالب: مسموح بس بكلمة سر المالك. بيرجع اسم المالك أو None."""
+        return self.ask_owner_password(f"{what}\n\nالرصيد هيبقى بالسالب — مسموح بس بكلمة سر المالك.\nاكتب كلمة سر المالك علشان تكمّل:")
+
+    def _with_neg(self, who, fn):
+        _TLS.allow_neg = who
+        try: return fn()
+        finally: _TLS.allow_neg = None
+
+    def ask_owner_password(self, message):
+        """يطلب كلمة سر المالك؛ يرجع اسمه لو صحيحة."""
+        while True:
+            pw = simpledialog.askstring("مقفول — كلمة سر المالك", message, show="•", parent=self)
+            if pw is None: return None
+            who = verify_owner_password(pw)
+            if who: return who
+            messagebox.showerror("خطأ", "كلمة السر غير صحيحة", parent=self)
+
+    def invoice_html(self, inv_id):
+        with db() as c:
+            inv = c.execute("SELECT i.*,p.name party_name,p.phone party_phone,p.address party_address,p.opening party_opening FROM invoices i LEFT JOIN parties p ON p.id=i.party_id WHERE i.id=?", (inv_id,)).fetchone()
+            lines = c.execute("SELECT * FROM invoice_lines WHERE invoice_id=?", (inv_id,)).fetchall()
+            settings = c.execute("SELECT * FROM settings WHERE id=1").fetchone()
+            moves = party_moves(c, inv["party_id"]) if inv["party_id"] else []
+            paid = float(c.execute("SELECT COALESCE(SUM(amount),0) FROM payments WHERE invoice_id=?", (inv_id,)).fetchone()[0])
+            # آخر دفع = آخر سند (تحصيل للعميل / دفع للمورد) لنفس الحساب لحد وقت الفاتورة
+            last_pay = None
+            if inv["party_id"]:
+                _d = inv["due_date"] or inv["inv_date"]
+                last_pay = c.execute("SELECT pay_date, amount FROM payments WHERE party_id=? AND kind=? AND invoice_id IS NULL "
+                                     "AND (pay_date<? OR (pay_date=? AND COALESCE(created_at,'')<=?)) ORDER BY pay_date DESC, created_at DESC, id DESC LIMIT 1",
+                                     (inv["party_id"], "تحصيل" if inv["kind"] in ("مبيعات", "مرتجع مبيعات") else "دفع", _d, _d, inv["created_at"] or "9999")).fetchone()
+            rep_div = f"<div>المندوب: <b>{esc(rep_name_of(c, inv['rep_id']))}</b></div>" if inv["kind"] == "مبيعات" else ""
+            if inv["kind"] == "مبيعات":
+                vn = c.execute("SELECT name FROM vehicles WHERE id=?", (inv["vehicle_id"],)).fetchone() if ("vehicle_id" in inv.keys() and inv["vehicle_id"]) else None
+                rep_div += f"<div>التوصيل: <b>{esc(vn[0]) if vn else 'استلام مكتب'}</b></div>"
+        pay_div = f"<div>طريقة الدفع: <b>{esc(inv['pay_type'])}</b></div>" if inv["kind"] in PAYTYPE_KINDS and inv["pay_type"] else ""
+        total = sum(x["qty"] * x["price"] for x in lines)
+        discount = float(inv["discount"] or 0); net = total - discount
+        prior = float(inv["party_opening"] or 0)
+        for m in moves:
+            if m[7] < move_key(inv["due_date"] or inv["inv_date"], inv["created_at"], 0, inv_id): prior += m[5] - m[6]
+        paid_effect = -paid if PAID_KIND[inv["kind"]] == "تحصيل" else paid
+        current = prior + (net if inv["kind"] in DEBIT_KINDS else -net) + paid_effect
+        rows = "".join(f"<tr><td>{n}</td><td>{esc(l['item_name'])}</td><td>{fmt(l['qty'])}</td><td>{esc(l['unit'])}</td><td>{fmt(l['price'])}</td><td>{fmt(l['qty']*l['price'])}</td></tr>" for n, l in enumerate(lines, 1))
+        company = esc(settings["company"]) or "اسم الشركة"
+        paid_div = f"<div>{esc(PAID_LABEL[inv['kind']])}: {fmt(paid)} ج.م</div>" if paid > 0 else ""
+        copy = f"""<section class="copy"><div class="content">
+          <div class="head">{logo_img_tag("height:20mm;float:left;margin:0 2mm")}<div class="brand"><h1>{company}</h1><div>{esc(settings['english'])}</div><div>{esc(settings['address'])}　 {esc(settings['phone'])}</div></div>
+          <h2>فاتورة {esc(inv['kind'])}　{esc(inv['number'])}</h2></div>
+          <div class="meta"><div>التاريخ: <b>{esc(inv['inv_date'])}</b>　{esc(fmt_time(inv['created_at']))}{f"</div><div>تاريخ الاستحقاق: <b>{esc(inv['due_date'])}</b>" if inv['due_date'] else ""}</div><div>اسم الحساب: <b>{esc(inv['party_name'])}</b></div><div>الهاتف: {esc(inv['party_phone'])}</div>{pay_div}{rep_div}</div>
+          <table><thead><tr><th>م</th><th>اسم الصنف</th><th>الكمية</th><th>الوحدة</th><th>السعر</th><th>الإجمالي</th></tr></thead><tbody>{rows}</tbody></table>
+          <div class="sum"><div>الإجمالي: {fmt(total)} ج.م</div><div>الخصم: {fmt(discount)} ج.م</div>{f"<div>الصافي: {fmt(net)} ج.م</div>" if discount else ""}<div>آخر دفع: {f"{fmt(last_pay[1])} ج.م <small>({esc(last_pay[0])})</small>" if last_pay else "—"}</div>{paid_div}</div>
+          <div class="balance"><div>الرصيد السابق: {fmt(prior)} ج.م</div><div>الرصيد الحالي: {fmt(current)} ج.م</div></div>
+          <div class="notes">ملاحظات: {esc(inv['notes'])}</div>
+          </div><div class="sign"><span>توقيع المستلم</span><span>توقيع البائع</span></div>
+        </section>"""
+        return f"""<!doctype html><html lang="ar" dir="rtl"><meta charset="utf-8"><title>فاتورة {esc(inv['number'])}</title><style>
+        @page{{size:A4 landscape;margin:7mm}}
+        *{{box-sizing:border-box}}
+        html,body{{margin:0;padding:0}}body{{font-family:Tahoma,Arial,sans-serif;color:#000;font-size:15px;font-weight:bold}}
+        .sheet{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:5mm;width:100%}}
+        @media print{{.sheet{{width:283mm;height:195mm;margin:0;overflow:hidden}}.copy{{height:195mm}}}}
+        .copy{{border:1.5px solid #000;border-radius:8px;padding:5mm;min-height:185mm;position:relative;break-inside:avoid;overflow:hidden}}
+        .head{{text-align:center;border:1.5px solid #000;border-radius:8px;padding:5px 3px;margin-bottom:6px;overflow:hidden}}
+        h1{{font-size:25px;margin:1px 0 3px}}h2{{font-size:22px;margin:6px 0 1px}}
+        .brand{{line-height:1.55}}.meta{{border:1.5px solid #000;border-radius:6px;padding:5px;display:grid;grid-template-columns:1fr 1fr;gap:4px;margin-bottom:6px;font-size:15px}}
+        table{{width:100%;border-collapse:collapse;font-size:14px;font-weight:bold}}
+        th,td{{border:1.5px solid #000;padding:4px 3px;text-align:center;white-space:nowrap}}
+        td:nth-child(2){{white-space:normal;overflow-wrap:break-word;width:99%}}
+        th{{background:#ddd;font-size:14px}}.sum{{display:flex;flex-wrap:wrap;justify-content:space-between;gap:4px 10px;border:1.5px solid #000;padding:6px 4px;margin-top:6px;font-weight:bold;font-size:16px}}
+        .sum>div,.balance>div{{white-space:nowrap}}
+        .balance{{display:flex;flex-wrap:wrap;justify-content:space-between;gap:4px 10px;border:1.5px solid #000;padding:6px 4px;margin-top:5px;font-weight:bold;font-size:16px}}
+        .notes{{margin-top:6px;min-height:12px}}.content{{min-height:88mm}}.sign{{margin-top:6mm;display:flex;justify-content:space-between;border-top:1.5px solid #000;padding-top:5px;font-size:16px}}
+        @media screen{{body{{background:#e9eef4;padding:12px}}.sheet{{max-width:1100px;margin:auto}}.copy{{background:white;min-height:650px;box-shadow:0 2px 9px #0002}}}}
+        </style><div class="sheet">{copy}{copy}</div></html>"""
+
+    def print_invoice(self, inv_id, quiet=False):
+        os.makedirs(PRINT_DIR, exist_ok=True)
+        path = os.path.join(PRINT_DIR, f"invoice_{inv_id}.html")
+        with open(path, "w", encoding="utf-8") as f: f.write(self.invoice_html(inv_id))
+        try: self.status.config(text="⏳ بيجهّز الفاتورة للطباعة ...")
+        except Exception: pass
+        print_page(path)
+        try:
+            with db() as c: c.execute("UPDATE invoices SET printed_at=?, print_count=COALESCE(print_count,0)+1 WHERE id=?", (now_ts(), inv_id))
+        except Exception: pass
+        try: self.status.config(text="🖨 شاشة الطباعة هتفتح خلال ثواني ...")
+        except Exception: pass
+
+    def view_invoice(self, inv_id):
+        with db() as c:
+            inv = c.execute("SELECT i.*,p.name pname,p.phone pphone FROM invoices i LEFT JOIN parties p ON p.id=i.party_id WHERE i.id=?", (inv_id,)).fetchone()
+            lines = c.execute("SELECT * FROM invoice_lines WHERE invoice_id=?", (inv_id,)).fetchall()
+            paid = float(c.execute("SELECT COALESCE(SUM(amount),0) FROM payments WHERE invoice_id=?", (inv_id,)).fetchone()[0])
+            rep = rep_name_of(c, inv["rep_id"]) if inv and inv["kind"] == "مبيعات" else ""
+            costs = ({l["id"]: fifo_engine(c)["line"].get(l["id"], 0.0) for l in lines}) if inv and inv["kind"] == "مبيعات" and is_owner() else None
+        if not inv: return
+        win = tk.Toplevel(self); win.title(f"فاتورة {inv['kind']} {inv['number']}"); win.geometry("840x560"); win.configure(bg=BG); win.transient(self)
+        total = sum(l["qty"] * l["price"] for l in lines); discount = float(inv["discount"] or 0)
+        tk.Label(win, text=f"فاتورة {inv['kind']}  رقم {inv['number']}", font=("Tahoma", 18, "bold"), bg=BG, fg=NAVY).pack(anchor="e", padx=15, pady=(12, 2))
+        tk.Label(win, text=f"التاريخ: {inv['inv_date']}  {fmt_time(inv['created_at'])}      الاسم: {inv['pname'] or ''}      الهاتف: {inv['pphone'] or ''}" + (f"      المندوب: {rep}" if rep else ""), bg=BG, font=("Tahoma", 12)).pack(anchor="e", padx=15)
+        if inv["notes"]: tk.Label(win, text="ملاحظات: " + inv["notes"], bg=BG, font=("Tahoma", 12)).pack(anchor="e", padx=15)
+        box = tk.Frame(win, bg=BG); box.pack(fill="both", expand=True, padx=15, pady=10)
+        if costs is not None:
+            win.geometry("1000x580")
+            t = self.tree(box, ("n", "name", "qty", "unit", "price", "total", "cost", "profit"), ("م", "الصنف", "الكمية", "الوحدة", "السعر", "الإجمالي", "التكلفة 🔒", "الربح 🔒"), [40, 260, 90, 80, 110, 120, 130, 120])
+            t.tag_configure("loss", foreground="#b91c1c"); profit = 0.0
+            for n, l in enumerate(lines, 1):
+                cost = costs.get(l["id"], 0.0); p = l["qty"] * (l["price"] - cost); profit += p
+                t.insert("", "end", values=(n, l["item_name"], fmt(l["qty"]), l["unit"], fmt(l["price"]), fmt(l["qty"] * l["price"]), fmt(cost), fmt(p)), tags=("loss",) if p < -1e-9 else ())
+        else:
+            t = self.tree(box, ("n", "name", "qty", "unit", "price", "total"), ("م", "الصنف", "الكمية", "الوحدة", "السعر", "الإجمالي"), [40, 300, 100, 90, 120, 130])
+            t.tag_configure("dmg", foreground="#b91c1c")
+            for n, l in enumerate(lines, 1):
+                d = inv["kind"] == "مرتجع مبيعات" and l["damaged"]
+                t.insert("", "end", values=(n, l["item_name"] + ("  (هالك)" if d else ""), fmt(l["qty"]), l["unit"], fmt(l["price"]), fmt(l["qty"] * l["price"])), tags=("dmg",) if d else ())
+        tk.Label(win, text=f"الإجمالي: {fmt(total)}     الخصم: {fmt(discount)}     الصافي: {fmt(total - discount)} ج.م" + (f"     المدفوع: {fmt(paid)}" if paid else ""), font=("Tahoma", 15, "bold"), bg=BG, fg=NAVY).pack(anchor="e", padx=15)
+        _bags = sum(l["qty"] * (BAGS_PER_TON if "طن" in (l["unit"] or "") else 1) for l in lines if "طن" in (l["unit"] or "") or "شك" in (l["unit"] or "") or "شيك" in (l["unit"] or ""))
+        if _bags: tk.Label(win, text=f"الكمية: {qty_text(_bags, _bags / BAGS_PER_TON)}", font=("Tahoma", 13, "bold"), bg=BG, fg="#1f6fd1").pack(anchor="e", padx=15)
+        if costs is not None:
+            pr = profit - discount
+            tk.Label(win, text=f"🔒 ربح الفاتورة (بعد الخصم): {fmt(pr)} ج.م  —  للعرض فقط ولا يُطبع", font=("Tahoma", 13, "bold"), bg=BG, fg="#b91c1c" if pr < 0 else "#1c7c4d").pack(anchor="e", padx=15)
+        bar = tk.Frame(win, bg=BG); bar.pack(fill="x", padx=15, pady=10)
+        ttk.Button(bar, text="طباعة", command=lambda: self.print_invoice(inv_id)).pack(side="right")
+        ttk.Button(bar, text="تعديل الفاتورة", command=lambda: (win.destroy(), self.show_invoice(inv["kind"], inv_id))).pack(side="right", padx=6)
+        ttk.Button(bar, text="إغلاق", command=win.destroy).pack(side="right", padx=6)
+
+    # ---------------- سجل الفواتير ----------------
+    def show_invoices(self):
+        self.clear(); self.title_label("سجل الفواتير")
+        with db() as c:
+            all_rows = c.execute(f"SELECT i.id,i.number,i.kind,i.inv_date,i.due_date,i.created_at,i.rep_id,i.printed_at,i.print_count,p.name party,r.name rep,{NET_SQL} total "
+                                 "FROM invoices i LEFT JOIN parties p ON p.id=i.party_id LEFT JOIN employees r ON r.id=i.rep_id ORDER BY i.id DESC").fetchall()
+            reps = rep_lookup(c)
+        flt = tk.Frame(self.body, bg=BG); flt.pack(fill="x", pady=(0, 6))
+        q_var = tk.StringVar(); rep_var = tk.StringVar(value="الكل"); kind_var = tk.StringVar(value="الكل")
+        from_var = tk.StringVar(value=date.today().isoformat()); to_var = tk.StringVar(value=date.today().isoformat())
+        self.field(flt, "من تاريخ", from_var); self.field(flt, "إلى تاريخ", to_var)
+        self.field(flt, "النوع", kind_var, ["الكل"] + list(PREFIX))
+        rep_values = ["الكل"] + list(reps)
+        self.field(flt, "المندوب (فواتير المبيعات)", rep_var, rep_values)
+        flt2 = tk.Frame(self.body, bg=BG); flt2.pack(fill="x", pady=(0, 6))
+        self.field(flt2, "بحث سريع (رقم الفاتورة / الاسم / النوع)", q_var)
+        def all_dates():
+            from_var.set(""); to_var.set("")
+        ttk.Button(flt2, text="عرض كل الفواتير (من غير تاريخ)", command=all_dates).pack(side="left", padx=6, pady=(22, 0))
+        self._inv_prints = {}
+        tree = self.tree(self.body, ("id", "kind", "number", "date", "time", "due", "party", "rep", "total", "printed"),
+                         ("ID", "النوع", "رقم الفاتورة", "التاريخ", "الوقت", "الاستحقاق", "العميل / المورد", "المندوب", "الصافي", "الطباعة"), [45, 110, 100, 100, 80, 110, 230, 120, 125, 130])
+        tree.tag_configure("future", foreground="#c2410c")
+        tk.Label(self.body, text="البرتقاني = فاتورة تاريخ استحقاقها لسه ماجاش (مش مأثرة على رصيد المخزن لسه)", bg=BG, fg="#c2410c", font=("Tahoma", 11)).pack(anchor="e")
+        totals = tk.Frame(self.body, bg=BG); totals.pack(fill="x")
+        def fill(*a):
+            for x in tree.get_children(): tree.delete(x)
+            for w in totals.winfo_children(): w.destroy()
+            shown_inv.clear()
+            q = q_var.get().strip().lower(); rv = rep_var.get(); kv = kind_var.get()
+            fd, td = from_var.get().strip(), to_var.get().strip()
+            try:
+                if fd: check_date(fd)
+                if td: check_date(td)
+            except ValueError: return   # لسه بيكتب التاريخ
+            n = 0; tot = 0.0; sums = {}
+            for r in all_rows:
+                hay = " ".join(str(r[k] or "") for k in ("number", "kind", "inv_date", "due_date", "party", "rep")).lower()
+                if q and q not in hay: continue
+                if fd and r["inv_date"] < fd: continue
+                if td and r["inv_date"] > td: continue
+                if kv != "الكل" and r["kind"] != kv: continue
+                if rv != "الكل":
+                    if r["kind"] != "مبيعات" or reps.get(rv) != r["rep_id"]: continue
+                rep = (r["rep"] or OFFICE) if r["kind"] == "مبيعات" else ""
+                fut = bool(r["due_date"]) and r["due_date"] > date.today().isoformat()
+                pc = int(r["print_count"] or 0) + self._inv_prints.get(r["id"], 0)
+                pr = (f"🖨 تم الطباعة" + (f" ({pc})" if pc > 1 else "")) if pc or r["printed_at"] else ""
+                tree.insert("", "end", iid=str(r["id"]), values=(r["id"], r["kind"], r["number"], r["inv_date"], fmt_time(r["created_at"]), r["due_date"] or "", r["party"] or "", rep, fmt(r["total"]), pr),
+                            tags=("future",) if fut else ())
+                n += 1; tot += float(r["total"] or 0); sums[r["kind"]] = sums.get(r["kind"], 0.0) + float(r["total"] or 0)
+                shown_inv[str(r["id"])] = (r["kind"], float(r["total"] or 0))
+            inv_total()
+        shown_inv = {}
+        def inv_total(*a):
+            """الشريط الأزرق: لو محدد أكتر من فاتورة = عددها وإجمالي كل نوع، وإلا إجمالي اللي ظاهر."""
+            sel = [i for i in tree.selection() if i in shown_inv]
+            data, title = ([shown_inv[i] for i in sel], "إجمالي المحدد") if len(sel) > 1 else (list(shown_inv.values()), "الإجمالي")
+            sums = {}
+            for k, v in data: sums[k] = sums.get(k, 0.0) + v
+            for w in totals.winfo_children(): w.destroy()
+            self.total_bar(totals, [("عدد الفواتير", str(len(data)))] + [(k, fmt(v)) for k, v in sums.items()], title=title)
+        tree.bind("<<TreeviewSelect>>", inv_total, add="+")
+        for v in (q_var, rep_var, kind_var, from_var, to_var): v.trace_add("write", fill)
+        fill()
+        tree.bind("<Double-1>", lambda e: self.view_selected(tree))
+        bar = tk.Frame(self.body, bg=BG); bar.pack(fill="x", pady=8)
+        ttk.Button(bar, text="عرض مكونات الفاتورة", command=lambda: self.view_selected(tree)).pack(side="right", padx=4)
+        ttk.Button(bar, text="تعديل", command=lambda: self.edit_selected_invoice(tree)).pack(side="right", padx=4)
+        ttk.Button(bar, text="طباعة", command=lambda: self.print_selected(tree)).pack(side="right", padx=4)
+        ttk.Button(bar, text="حذف", command=lambda: self.delete_invoice(tree)).pack(side="right", padx=4)
+
+    def selected_invoice(self, tree):
+        sel = tree.selection()
+        if not sel:
+            messagebox.showwarning("تنبيه", "حدد فاتورة أولًا"); return None
+        v = tree.item(sel[0], "values"); return int(v[0]), v[1]
+
+    def view_selected(self, tree):
+        s = self.selected_invoice(tree)
+        if s: self.view_invoice(s[0])
+
+    def print_selected(self, tree):
+        s = self.selected_invoice(tree)
+        if not s: return
+        self.print_invoice(s[0])
+        ip = self.__dict__.setdefault("_inv_prints", {}); ip[s[0]] = ip.get(s[0], 0) + 1
+        try:
+            with db() as c: pc = int(c.execute("SELECT COALESCE(print_count,0) FROM invoices WHERE id=?", (s[0],)).fetchone()[0])
+            if tree.exists(str(s[0])): tree.set(str(s[0]), "printed", "🖨 تم الطباعة" + (f" ({pc})" if pc > 1 else ""))
+        except Exception: pass
+
+    def edit_selected_invoice(self, tree):
+        s = self.selected_invoice(tree)
+        if s: self.show_invoice(s[1], s[0])
+
+    def _delete_invoice_id(self, inv_id):
+        with db() as c:
+            inv = c.execute("SELECT * FROM invoices WHERE id=?", (inv_id,)).fetchone()
+            item_ids = [r[0] for r in c.execute("SELECT DISTINCT item_id FROM invoice_lines WHERE invoice_id=?", (inv_id,))]
+            total = c.execute(f"SELECT {NET_SQL} FROM invoices i WHERE i.id=?", (inv_id,)).fetchone()[0]
+            c.execute("DELETE FROM payments WHERE invoice_id=?", (inv_id,))
+            c.execute("DELETE FROM invoices WHERE id=?", (inv_id,))
+            check_stock(c, item_ids)
+            log(c, "حذف فاتورة", f"{inv['kind']} رقم {inv['number']} بتاريخ {inv['inv_date']} وصافي {fmt(total)}" + (f" — رصيد بالسالب بموافقة {_TLS.allow_neg}" if getattr(_TLS, "allow_neg", None) else ""))
+
+    def delete_invoice(self, tree):
+        s = self.selected_invoice(tree)
+        if not s: return
+        inv_id = s[0]
+        with db() as c:
+            o = c.execute("SELECT inv_date FROM invoices WHERE id=?", (inv_id,)).fetchone()
+        msg = check_locked(o[0] if o else None) or check_day(o[0] if o else None)
+        if msg: return messagebox.showerror("الشهر مقفول", msg)
+        if not messagebox.askyesno("تأكيد", "حذف الفاتورة نهائيًا؟ سيتغير رصيد المخزون وحساب العميل/المورد، وسيُحذف أي مبلغ مدفوع مسجّل معها."): return
+        try: self._delete_invoice_id(inv_id)
+        except NegativeStock as e:
+            who = self.allow_negative(str(e))
+            if not who: return
+            try: self._with_neg(who, lambda: self._delete_invoice_id(inv_id))
+            except ValueError as e2: return messagebox.showerror("لا يمكن الحذف", str(e2))
+        except ValueError as e:
+            return messagebox.showerror("لا يمكن الحذف", str(e))
+        self.show_invoices()
+
+    # ================= السندات (تحصيل / دفع / مصروفات) =================
+    def show_payments(self, pid=None, edit=None):
+        self.clear(); self.title_label(f"تعديل سند رقم {edit[1]}" if edit else "سند جديد: تحصيل من عميل / دفع لمورد / مصروفات"); self.pay_edit = None
+        with db() as c:
+            parties = c.execute("SELECT id,name,address,phone,rep_id FROM parties ORDER BY name").fetchall()
+            cats = [r["name"] for r in c.execute("SELECT name FROM expense_cats ORDER BY name")]
+            self.pay_rep_lookup = rep_lookup(c)
+        self.pay_party_rep = {p["id"]: p["rep_id"] for p in parties}
+        self.pay_lookup = {party_label(p): p["id"] for p in parties}
+        self.pay_kinds = {"تحصيل من عميل": "تحصيل", "دفع لمورد": "دفع", "مصروفات": "مصروف", DISC_KIND: DISC_KIND}
+        self.pay_form = form = tk.LabelFrame(self.body, text="سند جديد", padx=14, pady=12); form.pack(fill="x", pady=(0, 6))
+        self.pay_party = tk.StringVar(); self.pay_kind = tk.StringVar(value="تحصيل من عميل"); self.pay_cat = tk.StringVar()
+        self.pay_date = tk.StringVar(value=date.today().isoformat()); self.pay_amount = tk.StringVar(); self.pay_notes = tk.StringVar()
+        self.pay_rep = tk.StringVar(value=OFFICE)
+        for k, v in self.pay_lookup.items():
+            if v == pid: self.pay_party.set(k)
+        frow = tk.Frame(form); frow.pack(fill="x")
+        brow = tk.Frame(form); brow.pack(fill="x", pady=(6, 0))
+        self.pay_save_btn = ttk.Button(brow, text="حفظ السند", command=self.save_payment); self.pay_save_btn.pack(side="right", padx=4)
+        self.pay_print_btn = ttk.Button(brow, text="حفظ وطباعة إيصال", command=lambda: self.save_payment(do_print=True)); self.pay_print_btn.pack(side="right", padx=4)
+        ttk.Button(brow, text="+ بند جديد (للمصروفات)", command=self.add_category).pack(side="right", padx=4)
+        self.pay_cancel_btn = ttk.Button(brow, text="إلغاء التعديل", command=self.cancel_payment_edit)
+        self.pay_kind_w = self.field(frow, "نوع السند", self.pay_kind, list(self.pay_kinds))
+        self.pay_party_w = self.field(frow, "العميل / المورد", self.pay_party, list(self.pay_lookup), search=True)
+        self.pay_party_w.bind("<<ComboboxSelected>>", lambda e: self.payment_party_changed(), add="+")
+        self.pay_rep_w = self.field(frow, "المندوب (للتحصيل)", self.pay_rep, list(self.pay_rep_lookup))
+        self.pay_cat_w = self.field(frow, "البند (للمصروفات)", self.pay_cat, cats)
+        frow2 = tk.Frame(form); frow2.pack(fill="x", before=brow, pady=(4, 0))
+        self.field(frow2, "التاريخ YYYY-MM-DD", self.pay_date)
+        self.field(frow2, "المبلغ", self.pay_amount)
+        self.field(frow2, "ملاحظات", self.pay_notes)
+        def toggle(*a):
+            k = self.pay_kinds[self.pay_kind.get()]
+            self.pay_party_w.config(state="disabled" if k == "مصروف" else "normal")
+            self.pay_cat_w.config(state="readonly" if k == "مصروف" else "disabled")
+            self.pay_rep_w.config(state="readonly" if k == "تحصيل" else "disabled")
+            if hasattr(self, "pay_print_btn"): self.pay_print_btn.config(state="disabled" if k == "مصروف" else "normal")
+        self.pay_kind.trace_add("write", toggle); toggle()
+        # مربعات ملونة: رصيد الحساب قبل وبعد السند
+        self.pay_tiles = self.color_tiles(self.body, [("before", "رصيد الحساب الحالي", "#0d9488"), ("amount", "مبلغ السند", "#8b5cf6"),
+                                                      ("after", "الرصيد بعد السند", "#f59e0b")], size=19)
+        for v in (self.pay_party, self.pay_amount, self.pay_kind): v.trace_add("write", lambda *a: self.update_payment_tiles())
+        self.update_payment_tiles()
+        nav = tk.Frame(self.body, bg=BG); nav.pack(fill="x", pady=(10, 0))
+        ttk.Button(nav, text="📋 سجل السندات", command=self.show_vouchers).pack(side="right", padx=4)
+        tk.Label(nav, text="التعديل والحذف والطباعة من «سجل السندات»", bg=BG, fg="#50647b", font=("Tahoma", 11)).pack(side="right", padx=8)
+        if edit: self._load_payment(*edit)
+
+    def show_vouchers(self):
+        self.clear(); self.title_label("سجل السندات"); self.pay_edit = None
+        with db() as c: self.pay_rep_lookup = rep_lookup(c)
+        top = tk.Frame(self.body, bg=BG); top.pack(fill="x", pady=(0, 6))
+        ttk.Button(top, text="+ سند جديد", command=self.show_payments).pack(side="right", padx=4)
+        flt = tk.LabelFrame(self.body, text="بحث وفلترة", padx=8, pady=4); flt.pack(fill="x", pady=(0, 4))
+        self.vf_type = tk.StringVar(value="الكل"); self.vf_q = tk.StringVar(); self.vf_rep = tk.StringVar(value="الكل")
+        self.vf_from = tk.StringVar(value=date.today().isoformat()); self.vf_to = tk.StringVar(value=date.today().isoformat())
+        self.field(flt, "النوع", self.vf_type, ["الكل", "تحصيل من عميل", "دفع لمورد", DISC_KIND, "مصروفات", "مرتبات", "سلف", "عمولات"])
+        self.field(flt, "المندوب (التحصيل)", self.vf_rep, ["الكل"] + list(self.pay_rep_lookup))
+        self.field(flt, "من", self.vf_from); self.field(flt, "إلى", self.vf_to)
+        flt2 = tk.Frame(flt.master, bg=BG); flt2.pack(fill="x", pady=(0, 4), after=flt)
+        self.field(flt2, "بحث (الاسم / البند / ملاحظات)", self.vf_q)
+        ttk.Button(flt2, text="عرض", command=self.refresh_payments).pack(side="left", padx=6, pady=(22, 0))
+        self.pay_tree = self.tree(self.body, ("date", "time", "type", "name", "rep", "amount", "notes"),
+                                  ("التاريخ", "الوقت", "النوع", "الاسم / البند", "المندوب", "المبلغ", "ملاحظات"), [100, 75, 120, 260, 120, 120, 330])
+        self.pay_tree.bind("<Double-1>", lambda e: self.edit_payment())
+        self.pay_tree.bind("<<TreeviewSelect>>", self.pay_totals_update, add="+")
+        self.pay_totals = tk.Frame(self.body, bg=BG); self.pay_totals.pack(fill="x")
+        bar = tk.Frame(self.body, bg=BG); bar.pack(fill="x", pady=4)
+        ttk.Button(bar, text="🖨 طباعة إيصال", command=self.print_selected_receipt).pack(side="right", padx=4)
+        ttk.Button(bar, text="تعديل السند المحدد", command=self.edit_payment).pack(side="right", padx=4)
+        ttk.Button(bar, text="حذف السند المحدد", command=self.delete_payment).pack(side="right", padx=4)
+        ttk.Button(bar, text="ملخص البنود للفترة", command=self.voucher_summary).pack(side="right", padx=4)
+        tk.Label(bar, text="ضغطتين على سند = تعديله", bg=BG, fg="#50647b", font=("Tahoma", 11)).pack(side="left")
+        self.refresh_payments()
+
+    def add_category(self):
+        name = simpledialog.askstring("بند جديد", "اسم البند (مثال: صيانة، كهربا، شيال):", parent=self)
+        if not name or not name.strip(): return
+        name = name.strip()
+        with db() as c:
+            c.execute("INSERT OR IGNORE INTO expense_cats(name) VALUES(?)", (name,)); log(c, "إضافة بند مصروفات", name)
+            cats = [r["name"] for r in c.execute("SELECT name FROM expense_cats ORDER BY name")]
+        self.pay_cat_w["values"] = cats; self.pay_cat.set(name)
+
+    def update_payment_tiles(self):
+        try:
+            if not self.pay_tiles["before"].winfo_exists(): return
+        except (AttributeError, tk.TclError): return
+        k = self.pay_kinds.get(self.pay_kind.get())
+        try: amt = float(self.pay_amount.get() or 0)
+        except ValueError: amt = 0.0
+        pid = self.pay_lookup.get(self.pay_party.get()) if k != "مصروف" else None
+        if not pid:
+            for key in ("before", "after"): self.pay_tiles[key].config(text="—")
+            self.pay_tiles["amount"].config(text=fmt(amt)); return
+        with db() as c: bal = party_balance(c, pid)
+        if self.pay_edit and self.pay_edit[0] == "p":   # في التعديل: نشيل أثر السند القديم الأول
+            with db() as c: old = c.execute("SELECT kind,amount,party_id FROM payments WHERE id=?", (self.pay_edit[1],)).fetchone()
+            if old and old["party_id"] == pid: bal += float(old["amount"]) if old["kind"] in ("تحصيل", DISC_KIND) else -float(old["amount"])
+        after = bal - amt if k in ("تحصيل", DISC_KIND) else bal + amt
+        self.pay_tiles["before"].config(text=fmt(bal)); self.pay_tiles["amount"].config(text=fmt(amt)); self.pay_tiles["after"].config(text=fmt(after))
+
+    def payment_party_changed(self):
+        """سند التحصيل: المندوب يتملى من بيانات العميل (وتقدر تغيّره)."""
+        if self.pay_kinds[self.pay_kind.get()] != "تحصيل": return
+        pid = self.pay_lookup.get(self.pay_party.get())
+        rid = self.pay_party_rep.get(pid) if pid else None
+        if rid and rid not in self.pay_rep_lookup.values():
+            with db() as c: self.pay_rep_lookup.update(rep_lookup(c, rid))
+            self.pay_rep_w["values"] = list(self.pay_rep_lookup)
+        self.pay_rep.set(next((k for k, v in self.pay_rep_lookup.items() if v == rid), OFFICE) if rid else OFFICE)
+
+    def reset_payment_form(self):
+        self.pay_edit = None
+        self.pay_form.config(text="سند جديد"); self.pay_save_btn.config(text="حفظ السند")
+        self.pay_cancel_btn.pack_forget()
+        self.pay_kind_w.config(state="readonly"); self.pay_kind.set(self.pay_kind.get())
+        self.pay_amount.set(""); self.pay_notes.set(""); self.pay_date.set(date.today().isoformat())
+        self.pay_party.set(""); self.pay_rep.set(OFFICE)        # خانة العميل/المورد ترجع فاضية للسند اللي بعده
+
+    def cancel_payment_edit(self):
+        self.show_vouchers(); self.status.config(text="تم إلغاء التعديل")
+
+    def edit_payment(self):
+        sel = self.pay_tree.selection()
+        if not sel: return messagebox.showwarning("تنبيه", "حدد سندًا أولًا")
+        typ, rid = sel[0].split("-"); rid = int(rid)
+        with db() as c:
+            if typ == "p":
+                r = c.execute("SELECT p.invoice_id, i.kind FROM payments p LEFT JOIN invoices i ON i.id=p.invoice_id WHERE p.id=?", (rid,)).fetchone()
+                if r and r["invoice_id"]:
+                    if not r["kind"]: return messagebox.showwarning("سند مرتبط بفاتورة", "الفاتورة بتاعة السند ده مش موجودة.")
+                    self.show_invoice(r["kind"], r["invoice_id"])        # السند جزء من فاتورة: نفتح الفاتورة نفسها
+                    try: self.status.config(text="السند ده دفعة مع الفاتورة — المبلغ المدفوع بيتعدّل من هنا")
+                    except Exception: pass
+                    return
+            else:
+                r = c.execute("SELECT kind FROM expenses WHERE id=?", (rid,)).fetchone()
+                if r and r["kind"] != "مصروف": return messagebox.showwarning("تنبيه", "المرتبات والسلف والعمولات لا تُعدّل من هنا. احذف السند وسجّله من جديد من شاشة الموظفين.")
+        self.show_payments(edit=(typ, rid))
+
+    def _load_payment(self, typ, rid):
+        with db() as c:
+            if typ == "p":
+                r = c.execute("SELECT * FROM payments WHERE id=?", (rid,)).fetchone()
+                if not r: return
+                if r["invoice_id"]: return messagebox.showwarning("سند مرتبط بفاتورة", "هذا السند جزء من فاتورة. عدّل المبلغ المدفوع من تعديل الفاتورة.")
+                kind_label = DISC_KIND if r["kind"] == DISC_KIND else "تحصيل من عميل" if r["kind"] == "تحصيل" else "دفع لمورد"
+                party = next((k for k, v in self.pay_lookup.items() if v == r["party_id"]), "")
+                rep = OFFICE
+                if r["rep_id"]:
+                    if r["rep_id"] not in self.pay_rep_lookup.values():
+                        self.pay_rep_lookup.update(rep_lookup(c, r["rep_id"])); self.pay_rep_w["values"] = list(self.pay_rep_lookup)
+                    rep = next((k for k, v in self.pay_rep_lookup.items() if v == r["rep_id"]), OFFICE)
+                vals = (r["pay_date"], r["amount"], r["notes"] or "")
+            else:
+                r = c.execute("SELECT * FROM expenses WHERE id=?", (rid,)).fetchone()
+                if not r: return
+                if r["kind"] != "مصروف": return messagebox.showwarning("تنبيه", "المرتبات والسلف والعمولات لا تُعدّل من هنا. احذف السند وسجّله من جديد من شاشة الموظفين.")
+                kind_label = "مصروفات"; party = ""; rep = OFFICE
+                vals = (r["exp_date"], r["amount"], r["notes"] or "")
+                self.pay_cat.set(r["category"] or "")
+        self.pay_kind_w.config(state="readonly"); self.pay_kind.set(kind_label)
+        self.pay_party.set(party); self.pay_rep.set(rep)
+        self.pay_date.set(vals[0]); self.pay_amount.set(str(vals[1])); self.pay_notes.set(vals[2])
+        self.pay_kind_w.config(state="disabled")
+        self.pay_edit = (typ, rid)
+        self.pay_form.config(text=f"تعديل سند رقم {rid}"); self.pay_save_btn.config(text="حفظ التعديل")
+        self.pay_cancel_btn.pack(side="right", padx=4)
+        self.status.config(text=f"جاري تعديل السند رقم {rid} — عدّل الحقول واضغط «حفظ التعديل»")
+
+    def save_payment(self, do_print=False):
+        kind = self.pay_kinds[self.pay_kind.get()]
+        try: amount = float(self.pay_amount.get())
+        except ValueError: return messagebox.showerror("خطأ", "المبلغ يجب أن يكون رقمًا")
+        if amount <= 0: return messagebox.showerror("خطأ", "المبلغ يجب أن يكون أكبر من صفر")
+        try: d = check_date(self.pay_date.get())
+        except ValueError: return messagebox.showerror("خطأ", "صيغة التاريخ غير صحيحة (YYYY-MM-DD)")
+        notes = self.pay_notes.get().strip(); edit = self.pay_edit
+        old_date = None
+        if edit:
+            with db() as c:
+                o = c.execute("SELECT exp_date FROM expenses WHERE id=?" if kind == "مصروف" else "SELECT pay_date FROM payments WHERE id=?", (edit[1],)).fetchone()
+                old_date = o[0] if o else None
+        msg = check_locked(d, old_date) or check_day(d, old_date)
+        if msg: return messagebox.showerror("الشهر مقفول", msg)
+        if kind == "مصروف":
+            cat = self.pay_cat.get().strip()
+            if not cat: return messagebox.showwarning("تنبيه", "اختر البند (أو أضف بندًا جديدًا)")
+            with db() as c:
+                if edit:
+                    old = c.execute("SELECT * FROM expenses WHERE id=?", (edit[1],)).fetchone()
+                    c.execute("UPDATE expenses SET exp_date=?,category=?,amount=?,notes=? WHERE id=?", (d, cat, amount, notes, edit[1]))
+                    log(c, "تعديل مصروف", f"رقم {edit[1]}: {old['category']} {fmt(old['amount'])} بتاريخ {old['exp_date']} ← {cat} {fmt(amount)} بتاريخ {d}")
+                else:
+                    c.execute("INSERT INTO expenses(exp_date,kind,category,amount,notes,created_at) VALUES(?,?,?,?,?,?)", (d, "مصروف", cat, amount, notes, now_ts()))
+                    log(c, "مصروف", f"{cat}: {fmt(amount)} بتاريخ {d}")
+        else:
+            pid = self.pay_lookup.get(self.pay_party.get())
+            if not pid: return messagebox.showwarning("تنبيه", "اختر الاسم")
+            rep_id = self.pay_rep_lookup.get(self.pay_rep.get()) if kind == "تحصيل" else None
+            with db() as c:
+                rep_txt = f" — المندوب: {rep_name_of(c, rep_id)}" if kind == "تحصيل" else ""
+                if edit:
+                    old = c.execute("SELECT p.*,pt.name pname FROM payments p JOIN parties pt ON pt.id=p.party_id WHERE p.id=?", (edit[1],)).fetchone()
+                    c.execute("UPDATE payments SET party_id=?,pay_date=?,amount=?,notes=?,rep_id=? WHERE id=?", (pid, d, amount, notes, rep_id, edit[1]))
+                    saved_pid = edit[1]
+                    log(c, "تعديل سند", f"سند رقم {edit[1]}: {old['pname']} {fmt(old['amount'])} بتاريخ {old['pay_date']} ← {self.pay_party.get()} {fmt(amount)} بتاريخ {d}" + rep_txt)
+                else:
+                    saved_pid = c.execute("INSERT INTO payments(party_id,pay_date,kind,amount,notes,rep_id,created_at) VALUES(?,?,?,?,?,?,?)", (pid, d, kind, amount, notes, rep_id, now_ts())).lastrowid
+                    log(c, DISC_KIND if kind == DISC_KIND else "سند " + ("تحصيل" if kind == "تحصيل" else "دفع"), f"{self.pay_party.get()}: {fmt(amount)} بتاريخ {d}" + rep_txt)
+        self.reset_payment_form()
+        if edit: self.show_vouchers()
+        elif hasattr(self, "pay_tree") and self.pay_tree.winfo_exists(): self.refresh_payments()
+        self.status.config(text="✔ تم حفظ التعديل" if edit else "✔ تم حفظ السند — تلاقيه في «سجل السندات»")
+        if do_print and kind != "مصروف": self.print_receipt(saved_pid)
+
+    def refresh_payments(self):
+        for x in self.pay_tree.get_children(): self.pay_tree.delete(x)
+        try: s = check_date(self.vf_from.get()); e = check_date(self.vf_to.get())
+        except ValueError: return messagebox.showerror("خطأ", "صيغة التاريخ غير صحيحة (YYYY-MM-DD)")
+        rows = []
+        with db() as c:
+            for r in c.execute("SELECT p.*,pt.name pname,m.name rname FROM payments p JOIN parties pt ON pt.id=p.party_id LEFT JOIN employees m ON m.id=p.rep_id WHERE p.pay_date BETWEEN ? AND ?", (s, e)):
+                col = r["kind"] == "تحصيل"
+                rows.append((r["pay_date"], f"p-{r['id']}", DISC_KIND if r["kind"] == DISC_KIND else "تحصيل من عميل" if col else "دفع لمورد", r["pname"], float(r["amount"]), r["notes"] or "",
+                             r["created_at"], (r["rname"] or OFFICE) if col else "", r["rep_id"]))
+            for r in c.execute("SELECT e.*,m.name ename FROM expenses e LEFT JOIN employees m ON m.id=e.employee_id WHERE e.exp_date BETWEEN ? AND ?", (s, e)):
+                typ = {"مصروف": "مصروفات", "مرتب": "مرتبات", "سلفة": "سلف", "عمولة": "عمولات"}.get(r["kind"], r["kind"])
+                if r["kind"] == "مرتب" and r["category"] in WAGE_CATS: typ += f" ({r['category']})"
+                name = r["category"] if r["kind"] == "مصروف" else (r["ename"] or "")
+                rows.append((r["exp_date"], f"e-{r['id']}", typ, name, float(r["amount"]), r["notes"] or "", r["created_at"], "", None))
+        t = self.vf_type.get(); q = self.vf_q.get().strip().lower(); rv = self.vf_rep.get()
+        rows = [r for r in rows if (t == "الكل" or r[2].split(" (")[0] == t) and (not q or q in (r[3] + " " + r[5]).lower())]
+        if rv != "الكل":
+            rid = self.pay_rep_lookup.get(rv)
+            rows = [r for r in rows if r[2] == "تحصيل من عميل" and r[8] == rid]
+        rows.sort(key=lambda r: (r[0], r[6] or "", r[1]), reverse=True)
+        self.vouchers_rows = rows
+        for r in rows: self.pay_tree.insert("", "end", iid=r[1], values=(r[0], fmt_time(r[6]), r[2], r[3], r[7], fmt(r[4]), r[5]))
+        self.pay_totals_update()
+
+    def pay_totals_update(self, *a):
+        """الشريط الأزرق في سجل السندات: لو محدد أكتر من سند = إجمالي المحدد، وإلا إجمالي اللي ظاهر."""
+        if not hasattr(self, "pay_totals") or not self.pay_totals.winfo_exists(): return
+        rows = getattr(self, "vouchers_rows", [])
+        sel = set(self.pay_tree.selection()); title = "الإجمالي"
+        if len(sel) > 1: rows = [r for r in rows if r[1] in sel]; title = "إجمالي المحدد"
+        for w in self.pay_totals.winfo_children(): w.destroy()
+        inn = sum(r[4] for r in rows if r[2] == "تحصيل من عميل")
+        out = sum(r[4] for r in rows if r[2] == "دفع لمورد")
+        exp = sum(r[4] for r in rows if r[2].split(" (")[0] in ("مصروفات", "مرتبات", "سلف", "عمولات"))
+        dsc = sum(r[4] for r in rows if r[2] == DISC_KIND)
+        self.total_bar(self.pay_totals, [("عدد السندات", str(len(rows))), ("التحصيلات (وارد)", fmt(inn)), ("المدفوعات (صادر)", fmt(out)), ("المصروفات والمرتبات والسلف والعمولات", fmt(exp))]
+                       + ([(DISC_KIND, fmt(dsc))] if dsc else []) + [("الصافي", fmt(inn - out - exp))], title=title)
+
+    def print_selected_receipt(self):
+        sel = self.pay_tree.selection()
+        if not sel: return messagebox.showwarning("تنبيه", "حدد سندًا أولًا")
+        if not sel[0].startswith("p-"): return messagebox.showwarning("تنبيه", "الإيصال لسندات التحصيل والدفع بس.")
+        self.print_receipt(int(sel[0][2:]))
+
+    def receipt_html(self, pay_id):
+        with db() as c:
+            p = c.execute("SELECT p.*,pt.name pname,pt.phone pphone,pt.opening FROM payments p JOIN parties pt ON pt.id=p.party_id WHERE p.id=?", (pay_id,)).fetchone()
+            st = c.execute("SELECT * FROM settings WHERE id=1").fetchone()
+            moves = party_moves(c, p["party_id"])
+            rep = rep_name_of(c, p["rep_id"]) if p["kind"] == "تحصيل" else ""
+            inv_no = c.execute("SELECT number FROM invoices WHERE id=?", (p["invoice_id"],)).fetchone() if p["invoice_id"] else None
+        key = next(m[7] for m in moves if m[1] == 1 and m[2] == pay_id)
+        before = float(p["opening"] or 0) + sum(m[5] - m[6] for m in moves if m[7] < key)
+        amt = float(p["amount"]); col = p["kind"] in ("تحصيل", DISC_KIND)
+        after = before - amt if col else before + amt
+        title = "إشعار خصم مسموح به" if p["kind"] == DISC_KIND else "إيصال استلام نقدية" if col else "إيصال صرف نقدية"
+        verb = "تم خصم مبلغ لصالح السيد / السادة" if p["kind"] == DISC_KIND else "استلمنا من السيد / السادة" if col else "صرفنا إلى السيد / السادة"
+        company = esc(st["company"]) or DEFAULT_COMPANY
+        extra = (f"<div>المندوب: <b>{esc(rep)}</b></div>" if col else "") + (f"<div>مرتبط بفاتورة رقم: <b>{esc(inv_no['number'])}</b></div>" if inv_no else "")
+        copy = f"""<section class="copy">
+          <div class="head">{logo_img_tag("height:20mm;float:left;margin:0 2mm")}<h1>{company}</h1><div>{esc(st['tagline'] or '')}</div><div>{esc(st['address'])}　 {esc(st['phone'])}</div>
+          <h2>{title}</h2></div>
+          <div class="meta"><div>رقم السند: <b>{pay_id}</b></div><div>التاريخ: <b>{esc(p['pay_date'])}</b>　{esc(fmt_time(p['created_at']))}</div>{extra}</div>
+          <div class="line">{verb}: <b>{esc(p['pname'])}</b></div>
+          <div class="amount">مبلغ وقدره: <b>{fmt(amt)} ج.م</b></div>
+          <div class="words">{esc(money_words(amt))}</div>
+          <div class="line">وذلك عن: {esc(p['notes'] or ('تحصيل من الحساب' if col else 'دفعة من الحساب'))}</div>
+          <div class="balance"><div>الرصيد قبل السند: {fmt(before)} ج.م</div><div>الرصيد بعد السند: {fmt(after)} ج.م</div></div>
+          <div class="sign"><span>توقيع المستلم</span><span>توقيع المسلِّم</span></div>
+        </section>"""
+        return f"""<!doctype html><html lang="ar" dir="rtl"><meta charset="utf-8"><title>{title} {pay_id}</title><style>
+        @page{{size:A4 landscape;margin:0}}*{{box-sizing:border-box}}
+        body{{font-family:Tahoma,Arial,sans-serif;color:#111;margin:0;font-size:13px}}
+        .sheet{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6mm;width:100%}}
+        @media print{{.sheet{{width:277mm;margin:10mm auto 0}}}}
+        .copy{{border:1px solid #555;border-radius:8px;padding:6mm;min-height:120mm;position:relative;break-inside:avoid}}
+        .head{{text-align:center;border:1px solid #333;border-radius:8px;padding:6px;margin-bottom:8px;line-height:1.6;overflow:hidden}}
+        h1{{font-size:20px;margin:0}}h2{{font-size:17px;margin:6px 0 0;padding:4px;background:#eee;border-radius:6px}}
+        .meta{{display:grid;grid-template-columns:1fr 1fr;gap:4px;border:1px solid #555;border-radius:6px;padding:6px;margin-bottom:8px}}
+        .line{{margin:8px 2px;font-size:14px}}.amount{{margin:10px 2px;font-size:18px}}
+        .words{{border:1px dashed #555;border-radius:6px;padding:8px;font-weight:bold;font-size:15px;background:#fafafa}}
+        .balance{{display:flex;justify-content:space-between;border:1px solid #555;padding:6px;margin-top:10px;font-weight:bold}}
+        .sign{{position:absolute;bottom:8mm;left:6mm;right:6mm;display:flex;justify-content:space-between;border-top:1px solid #bbb;padding-top:6px}}
+        @media screen{{body{{background:#e9eef4;padding:12px}}.sheet{{max-width:1100px;margin:auto}}.copy{{background:white;min-height:470px;box-shadow:0 2px 9px #0002}}}}
+        </style><div class="sheet">{copy}{copy}</div></html>"""
+
+    def print_receipt(self, pay_id):
+        path = os.path.join(PRINT_DIR, f"receipt_{pay_id}.html")
+        with open(path, "w", encoding="utf-8") as f: f.write(self.receipt_html(pay_id))
+        print_page(path)
+        self.status.config(text=f"تم فتح إيصال السند رقم {pay_id} للطباعة (Ctrl+P)")
+
+    def voucher_summary(self):
+        rows = getattr(self, "vouchers_rows", [])
+        agg = {}
+        for r in rows: agg[(r[2], r[3])] = agg.get((r[2], r[3]), 0) + r[4]
+        win = tk.Toplevel(self); win.title("ملخص البنود"); win.geometry("560x480"); win.configure(bg=BG); win.transient(self)
+        tk.Label(win, text=f"ملخص السندات من {self.vf_from.get()} إلى {self.vf_to.get()}", font=("Tahoma", 15, "bold"), bg=BG, fg=NAVY).pack(anchor="e", padx=15, pady=10)
+        box = tk.Frame(win, bg=BG); box.pack(fill="both", expand=True, padx=15)
+        t = self.tree(box, ("type", "name", "total"), ("النوع", "الاسم / البند", "الإجمالي"), [140, 220, 140])
+        for (typ, name), v in sorted(agg.items(), key=lambda x: (x[0][0], -x[1])): t.insert("", "end", values=(typ, name, fmt(v)))
+        ttk.Button(win, text="إغلاق", command=win.destroy).pack(anchor="e", padx=15, pady=10)
+
+    def delete_payment(self):
+        sel = self.pay_tree.selection()
+        if not sel: return messagebox.showwarning("تنبيه", "حدد سندًا أولًا")
+        key = sel[0]; typ, rid = key.split("-"); rid = int(rid)
+        with db() as c:
+            if typ == "p":
+                p = c.execute("SELECT * FROM payments WHERE id=?", (rid,)).fetchone()
+                if p and p["invoice_id"]: return messagebox.showwarning("سند مرتبط بفاتورة", "هذا السند جزء من فاتورة. عدّل المبلغ المدفوع من تعديل الفاتورة.")
+                dd = p["pay_date"] if p else None
+            else:
+                x = c.execute("SELECT exp_date FROM expenses WHERE id=?", (rid,)).fetchone(); dd = x[0] if x else None
+        msg = check_locked(dd) or check_day(dd)
+        if msg: return messagebox.showerror("الشهر مقفول", msg)
+        if not messagebox.askyesno("تأكيد", "حذف السند المحدد نهائيًا؟"): return
+        with db() as c:
+            if typ == "p": c.execute("DELETE FROM payments WHERE id=?", (rid,)); log(c, "حذف سند", f"سند رقم {rid}")
+            else:
+                c.execute("UPDATE loading_logs SET expense_id=NULL WHERE expense_id=?", (rid,))   # التشوين يرجع «مستني الصرف»
+                c.execute("DELETE FROM expenses WHERE id=?", (rid,)); log(c, "حذف مصروف/مرتب/سلفة", f"رقم {rid}")
+        self.refresh_payments()
+
+    # ================= الموظفون =================
+    def show_employees(self):
+        self.clear(); self.title_label("الموظفون (مرتب وسلف)"); self.emp_edit_id = None
+        form = tk.LabelFrame(self.body, text="بيانات موظف", padx=10, pady=8); form.pack(fill="x", pady=(0, 8))
+        self.emp_vars = {k: tk.StringVar() for k in ("name", "kind", "job", "phone", "salary", "comm", "comm_unit")}
+        self.emp_vars["salary"].set("0"); self.emp_vars["kind"].set("موظف"); self.emp_vars["comm"].set("0"); self.emp_vars["comm_unit"].set("شيكارة")
+        ef = [("name", "الاسم"), ("kind", "النوع"), ("job", "الصفة (سواق، محاسب، شيال...)"), ("phone", "الهاتف"), ("salary", "المرتب الشهري (للعامل: اليومية)"), ("comm", "عمولة المندوب"), ("comm_unit", "العمولة على كل")]
+        for chunk in (ef[:3], ef[3:]):      # صفين علشان خانة العمولة تبان في الشاشات الصغيرة
+            erow = tk.Frame(form); erow.pack(fill="x")
+            for k, label in chunk:
+                w = self.field(erow, label, self.emp_vars[k], list(EMP_KINDS) if k == "kind" else list(COMM_UNITS) if k == "comm_unit" else None)
+                if k in ("comm", "comm_unit", "salary"): self._emp_cols = getattr(self, "_emp_cols", {}); self._emp_cols[k] = w.master
+        def kind_changed(*a):
+            if not self._emp_cols["comm"].winfo_exists(): return
+            rep_ = self.emp_vars["kind"].get() == "مندوب"
+            for k in ("comm", "comm_unit"):
+                col = self._emp_cols[k]
+                if rep_ and not col.winfo_ismapped(): col.pack(side="right", expand=True, fill="x", padx=5)
+                elif not rep_: col.pack_forget()
+            lab = self._emp_cols["salary"].winfo_children()[0]
+            lab.config(text="اليومية" if self.emp_vars["kind"].get() == "عامل" else "المرتب الشهري")
+        self.emp_vars["kind"].trace_add("write", kind_changed); self.after_idle(kind_changed)
+        start, grace = self.att_times()
+        self.emp_vars["t_start"] = tk.StringVar(value=time12(start)); self.emp_vars["t_grace"] = tk.StringVar(value=time12(grace))
+        trow = tk.Frame(form); trow.pack(fill="x", pady=(2, 0))
+        for k, label in (("t_start", "ميعاد الحضور"), ("t_grace", "آخر ميعاد من غير تأخير")):
+            col = tk.Frame(trow); col.pack(side="right", padx=5)
+            tk.Label(col, text=label, anchor="e").pack(fill="x")
+            self.time_field(col, self.emp_vars[k], width=12).pack(fill="x")
+        ttk.Button(trow, text="حفظ", command=self.save_employee).pack(side="left", padx=4, pady=(18, 0))
+        tk.Label(trow, text="بعد «آخر ميعاد» يتحسب تأخير", fg="#50647b").pack(side="right", padx=8, pady=(18, 0))
+        flt = tk.Frame(self.body, bg=BG); flt.pack(fill="x", pady=(0, 6))
+        self.emp_filter = tk.StringVar(value="الكل")
+        tk.Label(flt, text="عرض:", bg=BG).pack(side="right", padx=4)
+        cb = ttk.Combobox(flt, textvariable=self.emp_filter, values=["الكل"] + list(EMP_KINDS) + [EMP_LEFT], state="readonly", width=16, justify="right"); cb.pack(side="right")
+        self.emp_filter.trace_add("write", lambda *a: self.refresh_employees())
+        self.emp_tree = self.tree(self.body, ("id", "name", "kind", "job", "phone", "salary", "adv", "comm", "due", "sched"),
+                                  ("ID", "الاسم", "النوع", "الصفة", "الهاتف", "المرتب / اليومية", "رصيد السلف", "العمولة", "عمولة باقية له", "ميعاد الحضور"), [45, 190, 80, 120, 110, 100, 105, 100, 115, 150])
+        self.emp_tree.bind("<Double-1>", lambda e: self.employee_statement())
+        self.emp_totals = tk.Frame(self.body, bg=BG); self.emp_totals.pack(fill="x")
+        bar = tk.Frame(self.body, bg=BG); bar.pack(fill="x", pady=(8, 2))
+        self.emp_btns = {}
+        for key, text, fn in [("pay", "صرف مرتب", self.pay_salary), ("adv", "صرف سلفة", self.pay_advance), ("comm", "صرف عمولة", self.pay_commission),
+                              ("load_add", "➕ إضافة تشوين", self.add_loading), ("load_pay", "صرف تشوين اليوم", self.pay_loading_day), ("load_log", "سجل التشوين", self.loading_log),
+                              ("daily", "صرف يوميات العمال", self.pay_daily_all)]:
+            self.emp_btns[key] = ttk.Button(bar, text=text, command=fn)
+        self.emp_tree.bind("<<TreeviewSelect>>", lambda e: self.update_emp_buttons(), add="+")
+        self.update_emp_buttons()
+        bar2 = tk.Frame(self.body, bg=BG); bar2.pack(fill="x", pady=(2, 8))
+        for text, fn in [("كشف الموظف", self.employee_statement), ("تعديل المحدد", self.edit_employee), ("ساب الشغل / رجع", self.toggle_employee_active), ("حذف المحدد", self.delete_employee)]:
+            ttk.Button(bar2, text=text, command=fn).pack(side="right", padx=4)
+        tk.Label(bar2, text="ضغطتين على موظف = كشفه", bg=BG, fg="#50647b", font=("Tahoma", 11)).pack(side="left")
+        self.refresh_employees()
+
+    def update_emp_buttons(self):
+        """العمولة للمندوب بس، والتشوين للشيال بس، و«صرف يومية» للعامل."""
+        b = getattr(self, "emp_btns", None)
+        if not b: return
+        sel = self.emp_tree.selection() if self.emp_tree.winfo_exists() else ()
+        kind = job = ""
+        if sel:
+            with db() as c: r = c.execute("SELECT kind, job FROM employees WHERE id=?", (int(sel[0]),)).fetchone()
+            if r: kind, job = r["kind"] or "", r["job"] or ""
+        loader = is_loader(kind, job)
+        b["pay"].config(text="صرف يومية" if kind == "عامل" else "صرف مرتب")
+        show = ["pay", "adv"] + (["comm"] if kind == "مندوب" else []) + (["load_add", "load_pay", "load_log"] if loader else []) + ["daily"]
+        for k, w in b.items(): w.pack_forget()
+        for k in show: b[k].pack(side="right", padx=4)
+
+    def emp_advance(self, c, eid):
+        r = c.execute("SELECT COALESCE(SUM(CASE WHEN kind='سلفة' THEN amount ELSE 0 END),0)-COALESCE(SUM(CASE WHEN kind='مرتب' THEN deducted ELSE 0 END),0) FROM expenses WHERE employee_id=?", (eid,)).fetchone()
+        return float(r[0])
+
+    def refresh_employees(self):
+        for x in self.emp_tree.get_children(): self.emp_tree.delete(x)
+        f = self.emp_filter.get() if hasattr(self, "emp_filter") else "الكل"
+        n = sal = adv = due_t = daily_t = 0.0
+        with db() as c:
+            for r in c.execute("SELECT * FROM employees ORDER BY name").fetchall():
+                left = not (r["active"] if r["active"] is not None else 1)
+                if f == EMP_LEFT:
+                    if not left: continue
+                elif left or (f != "الكل" and (r["kind"] or "موظف") != f): continue
+                a = self.emp_advance(c, r["id"]); n += 1; adv += a
+                if r["kind"] == "عامل": daily_t += float(r["salary"] or 0)
+                else: sal += float(r["salary"] or 0)
+                earned, paid = rep_commission(c, r["id"]); due = earned - paid; due_t += due
+                is_rep = r["kind"] == "مندوب" or earned or paid
+                self.emp_tree.insert("", "end", iid=str(r["id"]), values=(r["id"], r["name"], (r["kind"] or "موظف") + (f" — ساب {r['left_date']}" if left else ""), r["job"] or "", r["phone"], fmt(r["salary"]), fmt(a),
+                                                                           f"{fmt(r['commission'] or 0)} / {r['comm_unit'] or 'شيكارة'}" if is_rep else "", fmt(due) if is_rep else "",
+                                                                           f"{time12(r['att_start'])} – {time12(r['att_grace'])}" if r["att_start"] else ""))
+        for w in self.emp_totals.winfo_children(): w.destroy()
+        self.total_bar(self.emp_totals, [("العدد", str(int(n))), ("إجمالي المرتبات الشهرية", fmt(sal)), ("يوميات العمال (لليوم)", fmt(daily_t)), ("إجمالي رصيد السلف", fmt(adv)), ("عمولات باقية للمناديب", fmt(due_t))])
+
+    def save_employee(self):
+        v = {k: x.get().strip() for k, x in self.emp_vars.items()}
+        if not v["name"]: return messagebox.showwarning("تنبيه", "الاسم مطلوب")
+        if v["kind"] not in EMP_KINDS: return messagebox.showwarning("تنبيه", "اختر النوع: موظف / عامل / مندوب")
+        try: sal = float(v["salary"] or 0); comm = float(v["comm"] or 0)
+        except ValueError: return messagebox.showerror("خطأ", "المرتب والعمولة يجب أن يكونا أرقامًا")
+        if comm < 0: return messagebox.showerror("خطأ", "العمولة لا تكون بالسالب")
+        cunit = v.get("comm_unit") if v.get("comm_unit") in COMM_UNITS else "شيكارة"
+        t_start, t_grace = parse_time(v["t_start"]), parse_time(v["t_grace"])
+        if not t_start or not t_grace: return messagebox.showerror("خطأ", "اختار ميعاد الحضور وآخر ميعاد من غير تأخير")
+        if minutes_of(t_grace) < minutes_of(t_start): return messagebox.showerror("خطأ", "«آخر ميعاد من غير تأخير» لازم يكون بعد ميعاد الحضور أو زيه")
+        ctxt = f"، عمولة {fmt(comm)}/{cunit}" if v["kind"] == "مندوب" else ""
+        with db() as c:
+            if self.emp_edit_id:
+                old = c.execute("SELECT commission, comm_unit FROM employees WHERE id=?", (self.emp_edit_id,)).fetchone()
+                if abs(float(old["commission"] or 0) - comm) > 1e-9 or (old["comm_unit"] or "شيكارة") != cunit:
+                    ctxt += f" (العمولة {fmt(old['commission'] or 0)}/{old['comm_unit'] or 'شيكارة'}←{fmt(comm)}/{cunit} — على الفواتير الجديدة فقط)"
+                c.execute("UPDATE employees SET name=?,kind=?,job=?,phone=?,salary=?,commission=?,comm_unit=?,att_start=?,att_grace=? WHERE id=?", (v["name"], v["kind"], v["job"], v["phone"], sal, comm, cunit, t_start, t_grace, self.emp_edit_id))
+                log(c, "تعديل موظف", f"{v['name']} ({v['kind']}{' - ' + v['job'] if v['job'] else ''}، مرتب {fmt(sal)}{ctxt})")
+            else:
+                c.execute("INSERT INTO employees(name,kind,job,phone,salary,commission,comm_unit,att_start,att_grace) VALUES(?,?,?,?,?,?,?,?,?)", (v["name"], v["kind"], v["job"], v["phone"], sal, comm, cunit, t_start, t_grace))
+                log(c, "إضافة موظف", f"{v['name']} ({v['kind']}{' - ' + v['job'] if v['job'] else ''}، مرتب {fmt(sal)}{ctxt})")
+        self.emp_edit_id = None
+        for k in ("name", "job", "phone"): self.emp_vars[k].set("")
+        self.emp_vars["salary"].set("0"); self.emp_vars["comm"].set("0"); self.emp_vars["comm_unit"].set("شيكارة"); self.emp_vars["kind"].set("موظف"); self.refresh_employees()
+        ds, dg = self.att_times(); self.emp_vars["t_start"].set(time12(ds)); self.emp_vars["t_grace"].set(time12(dg))
+        self.status.config(text="تم حفظ بيانات الموظف")
+
+    def selected_emp(self):
+        sel = self.emp_tree.selection()
+        if not sel:
+            messagebox.showwarning("تنبيه", "حدد موظفًا أولًا"); return None
+        return int(sel[0])
+
+    def edit_employee(self):
+        eid = self.selected_emp()
+        if not eid: return
+        with db() as c: r = c.execute("SELECT * FROM employees WHERE id=?", (eid,)).fetchone()
+        self.emp_edit_id = eid
+        for k in ("name", "job", "phone", "salary"): self.emp_vars[k].set(str(r[k] or ("0" if k == "salary" else "")))
+        self.emp_vars["comm"].set(str(r["commission"] or 0)); self.emp_vars["comm_unit"].set(r["comm_unit"] or "شيكارة")
+        self.emp_vars["kind"].set(r["kind"] if r["kind"] in EMP_KINDS else "موظف")
+        ds, dg = self.att_times()
+        self.emp_vars["t_start"].set(time12(r["att_start"] or ds)); self.emp_vars["t_grace"].set(time12(r["att_grace"] or dg))
+        self.status.config(text=f"جاري تعديل «{r['name']}» — عدّل الحقول واضغط «حفظ»")
+
+    def toggle_employee_active(self):
+        eid = self.selected_emp()
+        if not eid: return
+        self.set_employee_active(eid)
+
+    def set_employee_active(self, eid):
+        """الموظف اللي ساب الشغل بيختفي من الحضور وقايمة المناديب والموظفين، وكل سجله (مرتبات، سلف، حضور، فواتير) بيفضل زي ما هو."""
+        with db() as c:
+            e = c.execute("SELECT * FROM employees WHERE id=?", (eid,)).fetchone()
+            adv = self.emp_advance(c, eid); earned, paid = rep_commission(c, eid)
+        active = e["active"] if e["active"] is not None else 1
+        if active:
+            notes = []
+            if abs(adv) > 0.005: notes.append(f"• عليه سلف لسه: {fmt(adv)}")
+            if abs(earned - paid) > 0.005: notes.append(f"• ليه عمولة لسه متصرفتش: {fmt(earned - paid)}")
+            msg = (f"تسجيل إن «{e['name']}» ساب الشغل النهارده؟\n\nهيختفي من الحضور وقوايم الموظفين والمناديب، وسجله كله هيفضل محفوظ "
+                   f"(تلاقيه في «عرض: {EMP_LEFT}»).") + ("\n\nخد بالك:\n" + "\n".join(notes) if notes else "")
+            if not messagebox.askyesno("ساب الشغل", msg): return
+            with db() as c:
+                c.execute("UPDATE employees SET active=0, left_date=? WHERE id=?", (date.today().isoformat(), eid)); log(c, "موظف ساب الشغل", e["name"])
+            self.status.config(text=f"«{e['name']}» اتسجل إنه ساب الشغل")
+        else:
+            if not messagebox.askyesno("رجوع للشغل", f"«{e['name']}» رجع الشغل تاني؟"): return
+            with db() as c:
+                c.execute("UPDATE employees SET active=1, left_date='' WHERE id=?", (eid,)); log(c, "موظف رجع الشغل", e["name"])
+            self.status.config(text=f"«{e['name']}» رجع الشغل")
+        self.refresh_employees()
+
+    def delete_employee(self):
+        eid = self.selected_emp()
+        if not eid: return
+        with db() as c:
+            used = c.execute("SELECT (SELECT COUNT(*) FROM expenses WHERE employee_id=?)+(SELECT COUNT(*) FROM invoices WHERE rep_id=?)+(SELECT COUNT(*) FROM payments WHERE rep_id=?)+(SELECT COUNT(*) FROM attendance WHERE employee_id=?)", (eid, eid, eid, eid)).fetchone()[0]
+            name = c.execute("SELECT name FROM employees WHERE id=?", (eid,)).fetchone()["name"]
+        if used:
+            with db() as c: act = c.execute("SELECT COALESCE(active,1) FROM employees WHERE id=?", (eid,)).fetchone()[0]
+            if not act: return messagebox.showinfo("لا يمكن الحذف", f"«{name}» مسجّل إنه ساب الشغل، وسجله محفوظ علشان الحسابات القديمة تفضل مظبوطة.")
+            if messagebox.askyesno("لا يمكن الحذف", f"«{name}» ليه مرتبات أو سلف أو حضور أو فواتير، فلو اتمسح الحسابات القديمة هتبوظ.\n\n"
+                                   "تحب تسجّله إنه «ساب الشغل» بدل الحذف؟\nهيختفي من كل القوايم والحضور، وسجله يفضل محفوظ."):
+                self.set_employee_active(eid)
+            return
+        if messagebox.askyesno("تأكيد", f"حذف «{name}»؟"):
+            with db() as c: c.execute("DELETE FROM employees WHERE id=?", (eid,)); log(c, "حذف موظف", name)
+            self.refresh_employees()
+
+    # ================= الحضور والغياب =================
+    def att_times(self):
+        with db() as c: r = c.execute("SELECT att_start, att_grace FROM settings WHERE id=1").fetchone()
+        return (r["att_start"] or "09:00", r["att_grace"] or "09:30")
+
+    @staticmethod
+    def att_late(hhmm, grace):
+        """دقايق التأخير = بعد آخر ميعاد مسموح (مثال: آخر ميعاد 9:30 وجه 9:45 → 15 دقيقة)."""
+        return max(0, minutes_of(hhmm) - minutes_of(grace)) if hhmm else 0
+
+    def time_field(self, parent, var, on_pick=None, width=11):
+        row = tk.Frame(parent, bg=parent.cget("bg"))
+        e = ttk.Entry(row, textvariable=var, justify="center", width=width)
+        btn = tk.Button(row, image=make_icon("clock", "#1f6fd1"), relief="flat", bg="#e3eefa", activebackground="#cfe2f6", cursor="hand2", padx=6,
+                        command=lambda: TimePicker(e, var, on_pick))
+        btn.pack(side="left", fill="y", padx=(0, 2)); e.pack(side="right", fill="x", expand=True)
+        e.bind("<Double-1>", lambda ev: TimePicker(e, var, on_pick))
+        return row
+
+    def show_attendance(self, day=None):
+        self.clear(); self.title_label("الحضور والغياب")
+        start, grace = self.att_times()
+        top = tk.Frame(self.body, bg=BG); top.pack(fill="x")
+        self.att_date = tk.StringVar(value=day or date.today().isoformat())
+        df = tk.Frame(top, bg=BG); df.pack(side="right")
+        self.field(df, "التاريخ", self.att_date)
+        ttk.Button(top, text="عرض اليوم", command=lambda: self.show_attendance(self.att_date.get().strip())).pack(side="right", padx=6, pady=(22, 0))
+        info = tk.Frame(top, bg=BG); info.pack(side="right", fill="x", expand=True, padx=10)
+        tk.Label(info, text="كل موظف بميعاده (بيتحدد من شاشة الموظفين)  •  بعد «آخر ميعاد» يتحسب تأخير", bg=BG, fg=NAVY, font=("Tahoma", 12, "bold")).pack(anchor="e", pady=(22, 0))
+        d = self.att_date.get().strip()
+        try: datetime.strptime(d, "%Y-%m-%d")
+        except ValueError: return messagebox.showerror("خطأ", "التاريخ غير صحيح")
+        def date_changed(*_):
+            v = self.att_date.get().strip()
+            try: datetime.strptime(v, "%Y-%m-%d")
+            except ValueError: return
+            if v != d: self.after(10, lambda: self.show_attendance(v))
+        self.att_date.trace_add("write", date_changed)
+        with db() as c:
+            emps = c.execute("SELECT id,name,kind,job,att_start,att_grace FROM employees WHERE COALESCE(active,1)=1 OR id IN (SELECT employee_id FROM attendance WHERE a_date=?) "
+                             "ORDER BY CASE kind WHEN 'موظف' THEN 0 WHEN 'مندوب' THEN 1 ELSE 2 END, name", (d,)).fetchall()
+            recs = {r["employee_id"]: r for r in c.execute("SELECT * FROM attendance WHERE a_date=?", (d,))}
+        tk.Label(self.body, text=(f"يوم {d} متسجل — تقدر تعدّل وتحفظ تاني" if recs else f"يوم {d} لسه متسجلش  •  علّم على اللي حضر واختار ساعة وصوله (اللي مش متعلّم عليه = غياب)"),
+                 bg=BG, fg="#0f7b3d" if recs else "#b45309", font=("Tahoma", 12, "bold")).pack(anchor="e", pady=(6, 2))
+        bar = tk.Frame(self.body, bg=BG); bar.pack(side="bottom", fill="x", pady=6)
+        ttk.Button(bar, text="حفظ الحضور", command=self.save_attendance).pack(side="right", padx=4)
+        ttk.Button(bar, text="الكل حاضر في ميعاده", command=self.att_all).pack(side="right", padx=4)
+        ttk.Button(bar, text="سجل الحضور", command=self.show_attendance_log).pack(side="right", padx=4)
+        self.att_count = tk.Label(bar, text="", bg=BG, fg=NAVY, font=("Tahoma", 12, "bold")); self.att_count.pack(side="left", padx=8)
+        if not emps:
+            return tk.Label(self.body, text="مفيش موظفين — ضيفهم من شاشة الموظفين الأول", bg=BG, fg="#b91c1c", font=("Tahoma", 13)).pack(pady=20)
+        inner = self.scroll_area()
+        grid = tk.Frame(inner, bg="white", highlightbackground="#cbd8e7", highlightthickness=1); grid.pack(fill="x", padx=2, pady=2)
+        heads = ["ملاحظات", "الحالة", "ساعة الوصول", "حاضر", "ميعاده", "الموظف"]
+        for ci, h in enumerate(heads):
+            tk.Label(grid, text=h, bg="#cfe2f6", fg=NAVY, font=("Tahoma", 12, "bold"), pady=6).grid(row=0, column=ci, sticky="ew")
+        for ci, w in enumerate((3, 2, 2, 1, 2, 3)): grid.grid_columnconfigure(ci, weight=w)
+        self.att_rows = []
+        for n, e in enumerate(emps, 1):
+            bg = "white" if n % 2 else STRIPE
+            r = recs.get(e["id"])
+            pv = tk.IntVar(value=(r["present"] if r else 0)); tv = tk.StringVar(value=time12(r["check_in"]) if r and r["check_in"] else "")
+            nv = tk.StringVar(value=r["notes"] if r else "")
+            e_start, e_grace = e["att_start"] or start, e["att_grace"] or grace
+            tk.Label(grid, text=e["name"] + (f"  ({e['job'] or e['kind']})" if (e["job"] or e["kind"]) else ""), bg=bg, anchor="e", font=("Tahoma", 12), padx=8, pady=6).grid(row=n, column=5, sticky="ew")
+            tk.Label(grid, text=f"{time12(e_start)} – {time12(e_grace)}", bg=bg, fg="#50647b", font=("Tahoma", 11)).grid(row=n, column=4, sticky="ew")
+            tk.Checkbutton(grid, variable=pv, bg=bg, activebackground=bg, cursor="hand2").grid(row=n, column=3)
+            st = tk.Label(grid, text="", bg=bg, font=("Tahoma", 12, "bold")); st.grid(row=n, column=1, sticky="ew")
+            row = {"id": e["id"], "name": e["name"], "p": pv, "t": tv, "n": nv, "st": st, "start": e_start, "grace": e_grace}
+            tf = self.time_field(grid, tv)
+            tf.configure(bg=bg); tf.grid(row=n, column=2, sticky="ew", padx=6, pady=3)
+            ttk.Entry(grid, textvariable=nv, justify="right").grid(row=n, column=0, sticky="ew", padx=6)
+            pv.trace_add("write", lambda *a, row=row: self.att_status(row, row["grace"]))
+            tv.trace_add("write", lambda *a, row=row: (row["t"].get().strip() and row["p"].set(1), self.att_status(row, row["grace"])))   # اختيار ساعة = حاضر
+            self.att_rows.append(row); self.att_status(row, row["grace"])
+
+    def att_status(self, row, grace):
+        if not row["p"].get(): row["st"].config(text="غياب", fg="#b91c1c")
+        else:
+            t = parse_time(row["t"].get())
+            if t is None: row["st"].config(text="الساعة مش مظبوطة", fg="#b91c1c")
+            else:
+                late = self.att_late(t, grace)
+                row["st"].config(text=f"متأخر {fmt_minutes(late)}" if late else "في الميعاد ✔", fg="#c2410c" if late else "#0f7b3d")
+        if hasattr(self, "att_count") and self.att_count.winfo_exists():
+            pres = sum(1 for r in self.att_rows if r["p"].get())
+            self.att_count.config(text=f"حاضر: {pres}   غياب: {len(self.att_rows) - pres}")
+
+    def att_all(self, start=None):
+        for r in self.att_rows:
+            r["p"].set(1)
+            if not r["t"].get().strip(): r["t"].set(time12(start or r["start"]))
+
+    def save_attendance(self):
+        d = self.att_date.get().strip()
+        try: dd = datetime.strptime(d, "%Y-%m-%d").date()
+        except ValueError: return messagebox.showerror("خطأ", "التاريخ غير صحيح")
+        if dd > date.today(): return messagebox.showerror("خطأ", "مينفعش تسجّل حضور ليوم لسه مجاش")
+        data = []
+        for r in self.att_rows:
+            t = parse_time(r["t"].get()) if r["p"].get() else ""
+            if t is None: return messagebox.showerror("خطأ", f"ساعة وصول «{r['name']}» مش مظبوطة — اختارها من زرار الساعة")
+            data.append((r["id"], d, int(r["p"].get()), t, self.att_late(t, r["grace"]), r["n"].get().strip(), now_ts()))
+        with db() as c:
+            c.execute("DELETE FROM attendance WHERE a_date=?", (d,))
+            c.executemany("INSERT INTO attendance(employee_id,a_date,present,check_in,late_min,notes,created_at) VALUES(?,?,?,?,?,?,?)", data)
+            pres = sum(x[2] for x in data); late = sum(1 for x in data if x[4])
+            log(c, "تسجيل حضور", f"{d}: حاضر {pres} / غياب {len(data) - pres} / متأخر {late}")
+        self.status.config(text=f"تم حفظ حضور يوم {d}")
+        self.show_attendance(d)
+
+    def att_settings(self):
+        if not is_owner(): return
+        start, grace = self.att_times()
+        win = tk.Toplevel(self); win.title("مواعيد الحضور"); win.configure(bg=BG, padx=16, pady=12); win.transient(self); win.grab_set()
+        sv, gv = tk.StringVar(value=time12(start)), tk.StringVar(value=time12(grace))
+        for lab, var in (("ميعاد بداية الشغل", sv), ("آخر ميعاد من غير تأخير", gv)):
+            tk.Label(win, text=lab, bg=BG, font=("Tahoma", 12)).pack(anchor="e")
+            self.time_field(win, var, width=14).pack(fill="x", pady=(0, 8))
+        tk.Label(win, text="التغيير بيسري على الأيام اللي هتتسجل بعد كده بس", bg=BG, fg="#50647b").pack(anchor="e")
+        def save():
+            a, b = parse_time(sv.get()), parse_time(gv.get())
+            if not a or not b: return messagebox.showerror("خطأ", "اختار الساعتين", parent=win)
+            if minutes_of(b) < minutes_of(a): return messagebox.showerror("خطأ", "آخر ميعاد لازم يكون بعد ميعاد البداية", parent=win)
+            with db() as c:
+                c.execute("UPDATE settings SET att_start=?, att_grace=? WHERE id=1", (a, b)); log(c, "تغيير مواعيد الحضور", f"{time12(a)} - {time12(b)}")
+            win.destroy(); self.show_attendance(self.att_date.get().strip())
+        bb = tk.Frame(win, bg=BG); bb.pack(fill="x", pady=(8, 0))
+        ttk.Button(bb, text="حفظ", command=save).pack(side="right", padx=4)
+        ttk.Button(bb, text="إلغاء", command=win.destroy).pack(side="right", padx=4)
+
+    def show_attendance_log(self):
+        self.clear(); self.title_label("سجل الحضور")
+        f = tk.Frame(self.body, bg=BG); f.pack(fill="x")
+        self.al_from = tk.StringVar(value=date.today().replace(day=1).isoformat()); self.al_to = tk.StringVar(value=date.today().isoformat())
+        with db() as c: emps = c.execute("SELECT id,name FROM employees ORDER BY name").fetchall()
+        self.al_emps = {"الكل": None, **{e["name"]: e["id"] for e in emps}}
+        self.al_emp = tk.StringVar(value="الكل")
+        self.field(f, "من", self.al_from); self.field(f, "إلى", self.al_to); self.field(f, "الموظف", self.al_emp, list(self.al_emps))
+        ttk.Button(f, text="عرض", command=self.refresh_attendance_log).pack(side="right", padx=6, pady=(22, 0))
+        ttk.Button(f, text="تسجيل حضور اليوم", command=self.show_attendance).pack(side="left", padx=4, pady=(22, 0))
+        ttk.Button(f, text="طباعة السجل", command=self.print_attendance_log).pack(side="left", padx=4, pady=(22, 0))
+        ttk.Button(f, text="🗑 حذف السطر المحدد", command=self.delete_attendance_row).pack(side="left", padx=4, pady=(22, 0))
+        tk.Label(self.body, text="ملخص كل موظف (ضغطتين على موظف = أيامه بس)", bg=BG, fg=NAVY, font=("Tahoma", 12, "bold")).pack(anchor="e", pady=(8, 0))
+        self.al_sum = self.tree(self.body, ("id", "name", "pres", "abs", "late_n", "late_t"), ("ID", "الموظف", "أيام الحضور", "أيام الغياب", "مرات التأخير", "إجمالي التأخير"), [45, 200, 110, 110, 110, 170])
+        self.al_sum.bind("<Double-1>", lambda e: self.al_sum.selection() and (self.al_emp.set(self.al_sum.item(self.al_sum.selection()[0])["values"][1]), self.refresh_attendance_log()))
+        self.al_bar = tk.Frame(self.body, bg=BG); self.al_bar.pack(fill="x")
+        tk.Label(self.body, text="التفاصيل يوم بيوم", bg=BG, fg=NAVY, font=("Tahoma", 12, "bold")).pack(anchor="e", pady=(6, 0))
+        self.al_det = self.tree(self.body, ("date", "day", "name", "state", "in", "late", "notes"), ("التاريخ", "اليوم", "الموظف", "الحالة", "ساعة الوصول", "التأخير", "ملاحظات"), [100, 80, 180, 90, 100, 150, 220])
+        self.al_det.tag_configure("abs", foreground="#b91c1c"); self.al_det.tag_configure("late", foreground="#c2410c")
+        self.al_det.bind("<Double-1>", lambda e: self.al_det.selection() and self.show_attendance(self.al_det.item(self.al_det.selection()[0])["values"][0]))
+        self.refresh_attendance_log()
+
+    def delete_attendance_row(self):
+        sel = self.al_det.selection()
+        if not sel: return messagebox.showwarning("تنبيه", "حدد سطر من التفاصيل الأول")
+        with db() as c: r = c.execute("SELECT a.*, m.name FROM attendance a JOIN employees m ON m.id=a.employee_id WHERE a.id=?", (int(sel[0]),)).fetchone()
+        if not r: return
+        if not messagebox.askyesno("حذف", f"تحذف حضور «{r['name']}» يوم {r['a_date']}؟\n(اليوم ده هيبقى مش متسجل للموظف ده)"): return
+        with db() as c:
+            c.execute("DELETE FROM attendance WHERE id=?", (r["id"],))
+            log(c, "حذف حضور", f"{r['a_date']}: {r['name']}")
+        self.refresh_attendance_log()
+
+    def refresh_attendance_log(self):
+        s, e = self.al_from.get().strip(), self.al_to.get().strip()
+        eid = self.al_emps.get(self.al_emp.get())
+        cond, args = "a.a_date BETWEEN ? AND ?", [s, e]
+        if eid: cond += " AND a.employee_id=?"; args.append(eid)
+        with db() as c:
+            rows = c.execute(f"SELECT a.*, m.name FROM attendance a JOIN employees m ON m.id=a.employee_id WHERE {cond} ORDER BY a.a_date DESC, m.name", args).fetchall()
+            summ = c.execute(f"""SELECT m.id, m.name, SUM(a.present) pres, SUM(1-a.present) abs, SUM(CASE WHEN a.present=1 AND a.late_min>0 THEN 1 ELSE 0 END) late_n,
+                                 SUM(CASE WHEN a.present=1 THEN a.late_min ELSE 0 END) late_t FROM attendance a JOIN employees m ON m.id=a.employee_id
+                                 WHERE {cond} GROUP BY m.id ORDER BY m.name""", args).fetchall()
+        for t in (self.al_sum, self.al_det):
+            for x in t.get_children(): t.delete(x)
+        for r in summ:
+            self.al_sum.insert("", "end", iid=str(r["id"]), values=(r["id"], r["name"], r["pres"] or 0, r["abs"] or 0, r["late_n"] or 0, fmt_minutes(r["late_t"]) if r["late_t"] else "—"))
+        for r in rows:
+            dd = datetime.strptime(r["a_date"], "%Y-%m-%d").date()
+            day = "ال" + AR_DAYS[(dd.weekday() - 5) % 7]
+            if not r["present"]: state, tag = "غياب", ("abs",)
+            elif r["late_min"]: state, tag = "متأخر", ("late",)
+            else: state, tag = "حاضر", ()
+            self.al_det.insert("", "end", iid=str(r["id"]), values=(r["a_date"], day, r["name"], state, time12(r["check_in"]) if r["check_in"] else "—",
+                                                                    fmt_minutes(r["late_min"]) if r["present"] and r["late_min"] else "—", r["notes"] or ""), tags=tag)
+        self.al_total_late = sum(r["late_t"] or 0 for r in summ)
+        for w in self.al_bar.winfo_children(): w.destroy()
+        self.total_bar(self.al_bar, [("حضور", str(sum(r["pres"] or 0 for r in summ))), ("غياب", str(sum(r["abs"] or 0 for r in summ))),
+                                     ("مرات تأخير", str(sum(r["late_n"] or 0 for r in summ))), ("إجمالي التأخير", fmt_minutes(sum(r["late_t"] or 0 for r in summ)))])
+
+    def print_attendance_log(self):
+        """طباعة سجل الحضور للفترة والموظف المختارين: ملخص لكل موظف + التفاصيل يوم بيوم."""
+        self.refresh_attendance_log()
+        s_, e_ = self.al_from.get().strip(), self.al_to.get().strip(); emp = self.al_emp.get()
+        summ = [self.al_sum.item(i)["values"] for i in self.al_sum.get_children()]
+        det = [self.al_det.item(i)["values"] for i in self.al_det.get_children()]
+        if not det: return messagebox.showinfo("طباعة", "مفيش حضور متسجل في الفترة دي")
+        with db() as c:
+            st = c.execute("SELECT * FROM settings WHERE id=1").fetchone()
+        cls = {"غياب": "abs", "متأخر": "late"}
+        srows = "".join(f"<tr><td class='nm'>{esc(str(r[1]))}</td><td>{r[2]}</td><td class='abs'>{r[3]}</td><td>{r[4]}</td><td class='late'>{esc(str(r[5]))}</td></tr>" for r in summ)
+        tp = sum(int(r[2]) for r in summ); ta = sum(int(r[3]) for r in summ); tl = sum(int(r[4]) for r in summ)
+        drows = "".join(f"<tr class='{cls.get(r[3], '')}'><td>{r[0]}</td><td>{esc(str(r[1]))}</td><td class='nm'>{esc(str(r[2]))}</td><td>{esc(str(r[3]))}</td>"
+                        f"<td>{esc(str(r[4]))}</td><td>{esc(str(r[5]))}</td><td class='nm'>{esc(str(r[6]))}</td></tr>" for r in det)
+        title = "سجل الحضور والغياب" + ("" if emp == "الكل" else f" — {esc(emp)}")
+        html = f"""<!doctype html><html lang="ar" dir="rtl"><meta charset="utf-8"><title>{title}</title><style>
+        @page{{size:A4;margin:0}}*{{box-sizing:border-box}}body{{font-family:Tahoma,Arial,sans-serif;font-size:14px;color:#111;margin:0 auto;padding:12mm;width:210mm}}@media screen{{body{{width:auto;max-width:210mm}}}}
+        .hd{{display:flex;align-items:center;justify-content:space-between;border-bottom:2px solid #123b67;padding-bottom:6px}}.hd img{{height:60px}}
+        h1{{margin:0;font-size:22px;color:#123b67}}h2{{text-align:center;margin:10px 0 2px}}.sub{{text-align:center;color:#444;margin-bottom:6px}}
+        h3{{margin:14px 0 4px;color:#123b67}}table{{width:100%;border-collapse:collapse}}th,td{{border:1px solid #555;padding:5px 6px;text-align:center}}
+        td.nm{{text-align:right}}th{{background:#e8eef5}}tr:nth-child(even) td{{background:#f6fafd}}tfoot td{{font-weight:bold;background:#e8eef5}}
+        tr.abs td{{color:#b91c1c}}tr.late td{{color:#c2410c}}td.abs{{color:#b91c1c}}td.late{{color:#c2410c}}thead{{display:table-header-group}}tr{{break-inside:avoid}}
+        .ft{{margin-top:8px;color:#555;font-size:12px}}</style>
+        <div class="hd"><div><h1>{esc(st['company']) or DEFAULT_COMPANY}</h1><div>{esc(st['tagline'] or DEFAULT_TAGLINE)}</div></div><img src="{logo_data_uri()}"></div>
+        <h2>{title}</h2><div class="sub">من {s_} إلى {e_}  •  التأخير محسوب على ميعاد كل موظف</div>
+        <h3>الملخص</h3><table><thead><tr><th>الموظف</th><th>أيام الحضور</th><th>أيام الغياب</th><th>مرات التأخير</th><th>إجمالي التأخير</th></tr></thead>
+        <tbody>{srows}</tbody><tfoot><tr><td>الإجمالي</td><td>{tp}</td><td>{ta}</td><td>{tl}</td><td>{fmt_minutes(self.al_total_late) if self.al_total_late else "—"}</td></tr></tfoot></table>
+        <h3>التفاصيل يوم بيوم</h3><table><thead><tr><th>التاريخ</th><th>اليوم</th><th>الموظف</th><th>الحالة</th><th>ساعة الوصول</th><th>التأخير</th><th>ملاحظات</th></tr></thead>
+        <tbody>{drows}</tbody></table><div class="ft">طُبع في {date.today().isoformat()} — {fmt_time(now_ts())}</div></html>"""
+        path = os.path.join(PRINT_DIR, "attendance.html")
+        with open(path, "w", encoding="utf-8") as f: f.write(html)
+        print_page(path)
+
+    def fit_window(self, win):
+        try:
+            if not win.winfo_exists() or win.overrideredirect(): return
+            win.update_idletasks()
+            rw, rh = win.winfo_reqwidth(), win.winfo_reqheight()
+            w, h = win.winfo_width(), win.winfo_height()
+            sw, sh = win.winfo_screenwidth(), win.winfo_screenheight() - 80
+            nw, nh = min(max(w, rw), sw), min(max(h, rh), sh)
+            if (nw, nh) != (w, h):
+                x = max(0, min(win.winfo_x(), sw - nw)); y = max(0, min(win.winfo_y(), sh - nh))
+                win.geometry(f"{nw}x{nh}+{x}+{y}")
+        except tk.TclError:
+            pass
+
+    def small_form(self, title, fields, on_save, height=330):
+        win = tk.Toplevel(self); win.title(title); win.geometry(f"480x{height}"); win.configure(bg=BG); win.transient(self); win.grab_set()
+        tk.Label(win, text=title, font=("Tahoma", 15, "bold"), bg=BG, fg=NAVY, wraplength=450, justify="right").pack(anchor="e", padx=15, pady=10)
+        vars_ = {}
+        for key, label, default in fields:
+            vars_[key] = tk.StringVar(value=default)
+            tk.Label(win, text=label, bg=BG, anchor="e").pack(fill="x", padx=15)
+            if key == "date":
+                row = tk.Frame(win, bg=BG); row.pack(fill="x", padx=15, pady=(0, 6))
+                e = ttk.Entry(row, textvariable=vars_[key], justify="right")
+                tk.Button(row, image=make_icon("cal", "#1f6fd1"), relief="flat", bg="#e3eefa", cursor="hand2", command=lambda e=e, v=vars_[key]: DatePicker(e, v)).pack(side="left", fill="y")
+                e.pack(side="right", fill="x", expand=True)
+            else:
+                ttk.Entry(win, textvariable=vars_[key], justify="right").pack(fill="x", padx=15, pady=(0, 6))
+        bar = tk.Frame(win, bg=BG); bar.pack(fill="x", padx=15, pady=8)
+        ttk.Button(bar, text="حفظ", command=lambda: on_save(win, vars_)).pack(side="right")
+        ttk.Button(bar, text="إلغاء", command=win.destroy).pack(side="right", padx=6)
+        return win, vars_
+
+    # ----- العمال: يومية وتشوين -----
+    def _workers_dialog(self, title, note, build_extra, on_save, default_checked, loaders=False, ok_text="صرف"):
+        """شاشة فيها كل العمال الشغالين بمربع اختيار + خانة مبلغ لكل واحد. loaders=True: الشيالين بس."""
+        with db() as c: ws = c.execute("SELECT id,name,salary,job,kind FROM employees WHERE kind='عامل' AND COALESCE(active,1)=1 ORDER BY name").fetchall()
+        if loaders:
+            ws = [r for r in ws if is_loader(r["kind"], r["job"])]
+            if not ws: return messagebox.showwarning("تنبيه", "مفيش شيالين. اكتب «شيال» في خانة الصفة للعمال اللي بيشوّنوا.")
+        if not ws: return messagebox.showwarning("تنبيه", "مفيش موظفين نوعهم «عامل». ضيفهم الأول من نفس الشاشة (النوع: عامل).")
+        w = tk.Toplevel(self); w.title(title); w.configure(bg=BG); _center(w, 620, min(250 + 38 * len(ws) + 140, self.winfo_screenheight() - 80))
+        w.transient(self); w.grab_set()
+        tk.Label(w, text=title, font=("Tahoma", 15, "bold"), bg=BG, fg=NAVY).pack(anchor="e", padx=15, pady=(10, 0))
+        tk.Label(w, text=note, bg=BG, fg="#50647b", font=("Tahoma", 11), wraplength=580, justify="right").pack(anchor="e", padx=15)
+        dv = tk.StringVar(value=date.today().isoformat())
+        top = tk.Frame(w, bg=BG); top.pack(fill="x", padx=15, pady=6)
+        tk.Label(top, text="التاريخ", bg=BG).pack(side="right"); de = ttk.Entry(top, textvariable=dv, justify="right", width=14); de.pack(side="right", padx=6)
+        tk.Button(top, image=make_icon("cal", "#1f6fd1"), relief="flat", bg="#e3eefa", cursor="hand2", command=lambda: DatePicker(de, dv)).pack(side="right")
+        extra = build_extra(w)
+        lst = tk.Frame(w, bg="white", highlightbackground="#cbd8e7", highlightthickness=1); lst.pack(fill="both", expand=True, padx=15, pady=6)
+        rows = []
+        for r in ws:
+            f = tk.Frame(lst, bg="white"); f.pack(fill="x", padx=8, pady=2)
+            chk = tk.IntVar(value=1); amt = tk.StringVar()
+            tk.Checkbutton(f, text=r["name"], variable=chk, bg="white", anchor="e", width=24).pack(side="right")
+            info = tk.Label(f, text="", bg="white", fg="#9a6700", font=("Tahoma", 10)); info.pack(side="right", padx=6)
+            ttk.Entry(f, textvariable=amt, justify="center", width=12).pack(side="left")
+            rows.append(dict(id=r["id"], name=r["name"], wage=float(r["salary"] or 0), chk=chk, amt=amt, info=info))
+        def refresh_defaults(*a):
+            try: d = check_date(dv.get())
+            except ValueError: return
+            default_checked(d, rows)
+        dv.trace_add("write", refresh_defaults); refresh_defaults()
+        totl = tk.Label(w, text="", bg=BG, fg="#1c7c4d", font=("Tahoma", 13, "bold")); totl.pack(anchor="e", padx=15)
+        def upd_total(*a):
+            t = 0.0
+            for r in rows:
+                if r["chk"].get():
+                    try: t += float(r["amt"].get().replace(",", "") or 0)
+                    except ValueError: pass
+            totl.config(text=f"الإجمالي (هيتصرف من الخزنة): {fmt(t)} ج.م")
+        for r in rows: r["amt"].trace_add("write", upd_total); r["chk"].trace_add("write", upd_total)
+        upd_total()
+        def save():
+            try: d = check_date(dv.get())
+            except ValueError: return messagebox.showerror("خطأ", "صيغة التاريخ غلط", parent=w)
+            msg = check_locked(d)
+            if msg: return messagebox.showerror("الشهر مقفول", msg, parent=w)
+            picked = []
+            for r in rows:
+                if not r["chk"].get(): continue
+                try: a = float(r["amt"].get().replace(",", "") or 0)
+                except ValueError: return messagebox.showerror("خطأ", f"مبلغ «{r['name']}» مش رقم", parent=w)
+                if a < 0: return messagebox.showerror("خطأ", "مفيش مبالغ بالسالب", parent=w)
+                if a > 0: picked.append((r, a))
+            if not picked: return messagebox.showwarning("تنبيه", "مفيش حد متعلّم بمبلغ (اللي اتصرفلهم قبل كده في نفس اليوم والغايبين مش متعلّمين)", parent=w)
+            if on_save(w, d, picked, extra) is not False:
+                w.destroy(); self.refresh_employees()
+        bar = tk.Frame(w, bg=BG); bar.pack(fill="x", padx=15, pady=8)
+        ttk.Button(bar, text=ok_text, command=save).pack(side="right"); ttk.Button(bar, text="إلغاء", command=w.destroy).pack(side="right", padx=6)
+        return rows
+
+    def pay_daily_all(self):
+        def defaults(d, rows):
+            with db() as c:
+                att = {r[0]: r[1] for r in c.execute("SELECT employee_id, present FROM attendance WHERE a_date=?", (d,)).fetchall()}
+                paid = {r[0] for r in c.execute("SELECT employee_id FROM expenses WHERE kind='مرتب' AND category='يوميات' AND exp_date=?", (d,)).fetchall()}
+            for r in rows:
+                r["amt"].set(fmt(r["wage"]).replace(",", "") if r["wage"] else "")
+                notes = []
+                if r["id"] in paid: notes.append("✔ اتصرفله يومية اليوم ده")
+                if att and not att.get(r["id"]): notes.append("غايب")
+                r["chk"].set(0 if (r["id"] in paid or (att and not att.get(r["id"]))) else 1)
+                r["info"].config(text=" • ".join(notes))
+        def save(w, d, picked, extra):
+            with db() as c:
+                for r, a in picked:
+                    c.execute("INSERT INTO expenses(exp_date,kind,category,amount,notes,employee_id,deducted,created_at) VALUES(?,?,?,?,?,?,0,?)",
+                              (d, "مرتب", "يوميات", a, f"يومية يوم {d}", r["id"], now_ts()))
+                log(c, "صرف يوميات", f"{d}: {len(picked)} عامل بإجمالي {fmt(sum(a for _, a in picked))}")
+            self.status.config(text=f"✔ اتصرفت يومية {len(picked)} عامل")
+        self._workers_dialog("صرف يوميات العمال", "المعلّم = هيتصرفله. الغايب (حسب الحضور) واللي اتصرفله قبل كده في نفس اليوم مش متعلّمين. المبلغ = اليومية المسجلة للعامل وتقدر تغيّره.",
+                             lambda w: None, save, defaults)
+
+    def pay_loading(self):   # الاسم القديم
+        return self.add_loading()
+
+    def add_loading(self):
+        """إضافة تشوين (نقلة): الأطنان × سعر الطن، وبيتقسم على الشيالين المعلّمين. بيتسجل ومبيتصرفش غير آخر اليوم."""
+        state = {}
+        def build(w):
+            f = tk.LabelFrame(w, text="حساب التشوين", bg=BG, padx=10, pady=6); f.pack(fill="x", padx=15)
+            v = {k: tk.StringVar() for k in ("bags", "tons", "price")}
+            row = tk.Frame(f, bg=BG); row.pack(fill="x")
+            v["notes"] = tk.StringVar()
+            for k, lab, wd in (("tons", "عدد الأطنان", 10), ("bags", "أو عدد الشكاير", 10), ("price", "سعر الطن", 10), ("notes", "ملاحظات (العربية / المورد…)", 18)):
+                col = tk.Frame(row, bg=BG); col.pack(side="right", padx=6)
+                tk.Label(col, text=lab, bg=BG).pack(anchor="e"); ttk.Entry(col, textvariable=v[k], justify="center", width=wd).pack()
+            res = tk.Label(f, text="", bg=BG, fg=NAVY, font=("Tahoma", 12, "bold"), wraplength=560, justify="right"); res.pack(anchor="e", pady=(6, 0))
+            state.update(v=v, res=res, busy=False)
+            return v
+        def num(x):
+            try: return float(x.get().replace(",", "").strip() or 0)
+            except ValueError: return None
+        def recalc(*a):
+            if state.get("busy") or "rows" not in state: return
+            v = state["v"]; state["busy"] = True
+            try:
+                tons, price = num(v["tons"]), num(v["price"])
+                if a and a[0] == str(v["bags"]):
+                    b = num(v["bags"]); tons = (b / 20) if b else 0; v["tons"].set(f"{tons:g}" if b else "")
+                elif a and a[0] == str(v["tons"]):
+                    v["bags"].set(f"{(tons or 0) * 20:g}" if tons else "")
+                total = (tons or 0) * (price or 0)
+                picked = [r for r in state["rows"] if r["chk"].get()]
+                each = total / len(picked) if picked else 0
+                for r in state["rows"]: r["amt"].set(f"{each:.2f}" if r["chk"].get() and total else "")
+                state["res"].config(text=f"التشوين = {fmt(tons or 0)} طن × {fmt(price or 0)} = {fmt(total)} ج.م" + (f"\nلكل عامل: {fmt(each)} ({len(picked)} عامل)" if picked and total else ""))
+                state["total"], state["tons"], state["price"] = total, tons or 0, price or 0
+            finally: state["busy"] = False
+        sel = self.emp_tree.selection() if hasattr(self, "emp_tree") and self.emp_tree.winfo_exists() else ()
+        sel_id = int(sel[0]) if sel else None
+        def defaults(d, rows):
+            with db() as c:
+                acc = {r[0]: (r[1], r[2]) for r in c.execute("SELECT employee_id, COUNT(*), COALESCE(SUM(amount),0) FROM loading_logs WHERE l_date=? AND expense_id IS NULL GROUP BY employee_id", (d,)).fetchall()}
+            for r in rows:
+                n, a = acc.get(r["id"], (0, 0))
+                r["info"].config(text=f"متسجل النهارده: {n} نقلة = {fmt(a)}" if n else "")
+                if sel_id and any(x["id"] == sel_id for x in rows): r["chk"].set(1 if r["id"] == sel_id else 0)
+        def save(w, d, picked, extra):
+            tons, price = state.get("tons", 0), state.get("price", 0)
+            if tons <= 0 or price <= 0: messagebox.showerror("خطأ", "اكتب عدد الأطنان (أو الشكاير) وسعر الطن", parent=w); return False
+            notes = state["v"]["notes"].get().strip()
+            with db() as c:
+                for r, a in picked:
+                    c.execute("INSERT INTO loading_logs(l_date,employee_id,tons,price,amount,crew,notes,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                              (d, r["id"], tons, price, a, len(picked), notes, now_ts()))
+                log(c, "إضافة تشوين", f"{d}: {fmt(tons)} طن × {fmt(price)} = {fmt(tons * price)} على {len(picked)} عامل" + (f" — {notes}" if notes else ""))
+            self.status.config(text=f"✔ اتسجل تشوين {fmt(tons)} طن — بيتصرف من «صرف تشوين اليوم»")
+        rows = self._workers_dialog("➕ إضافة تشوين (نقلة)", "اكتب الأطنان (أو الشكاير: الطن = 20 شيكارة) وسعر الطن. المبلغ بيتقسم على الشيالين المعلّمين. التشوين بيتسجل بس، وبيتجمع ويتصرف آخر اليوم من «صرف تشوين اليوم».",
+                                    build, save, defaults, loaders=True, ok_text="إضافة")
+        if not rows: return
+        state["rows"] = rows
+        for k in ("bags", "tons", "price"): state["v"][k].trace_add("write", recalc)
+        for r in rows: r["chk"].trace_add("write", lambda *a: recalc())
+
+    def pay_loading_day(self):
+        """صرف التشوين المتجمّع لكل شيال في اليوم مرة واحدة."""
+        def defaults(d, rows):
+            with db() as c:
+                acc = {r[0]: (r[1], float(r[2]), float(r[3])) for r in c.execute(
+                    "SELECT employee_id, COUNT(*), COALESCE(SUM(amount),0), COALESCE(SUM(tons*1.0/crew),0) FROM loading_logs WHERE l_date=? AND expense_id IS NULL GROUP BY employee_id", (d,)).fetchall()}
+                paid = {r[0] for r in c.execute("SELECT DISTINCT employee_id FROM loading_logs WHERE l_date=? AND expense_id IS NOT NULL", (d,)).fetchall()}
+            for r in rows:
+                n, a, t = acc.get(r["id"], (0, 0.0, 0.0))
+                r["amt"].set(f"{a:.2f}" if a else ""); r["chk"].set(1 if a else 0)
+                r["info"].config(text=(f"{n} نقلة — نصيبه {fmt(t)} طن" if n else ("✔ اتصرفله" if r["id"] in paid else "مفيش تشوين")))
+        def save(w, d, picked, extra):
+            with db() as c:
+                for r, a in picked:
+                    logs = c.execute("SELECT id, tons, crew FROM loading_logs WHERE l_date=? AND employee_id=? AND expense_id IS NULL", (d, r["id"])).fetchall()
+                    t = sum(float(x["tons"]) / max(int(x["crew"] or 1), 1) for x in logs)
+                    eid = c.execute("INSERT INTO expenses(exp_date,kind,category,amount,notes,employee_id,deducted,created_at) VALUES(?,?,?,?,?,?,0,?)",
+                                    (d, "مرتب", "تشوين", a, f"تشوين يوم {d}: {len(logs)} نقلة — نصيبه {fmt(t)} طن", r["id"], now_ts())).lastrowid
+                    if logs: c.execute(f"UPDATE loading_logs SET expense_id=? WHERE id IN ({','.join('?' * len(logs))})", (eid, *[x["id"] for x in logs]))
+                log(c, "صرف تشوين", f"{d}: {len(picked)} شيال بإجمالي {fmt(sum(a for _, a in picked))}")
+            self.status.config(text=f"✔ اتصرف تشوين يوم {d} لـ {len(picked)} شيال")
+        self._workers_dialog("صرف تشوين اليوم", "المبلغ = مجموع التشوين المتسجل للشيال في اليوم ده ولسه ماتصرفش. تقدر تعدّله قبل الصرف.", lambda w: None, save, defaults, loaders=True)
+
+    def loading_log(self):
+        """سجل التشوين: كل النقلات، واللي لسه ماتصرفش يتمسح لو اتسجل غلط."""
+        w = tk.Toplevel(self); w.title("سجل التشوين"); w.configure(bg=BG); _center(w, 900, 560); w.transient(self)
+        tk.Label(w, text="سجل التشوين", font=("Tahoma", 15, "bold"), bg=BG, fg=NAVY).pack(anchor="e", padx=15, pady=(10, 0))
+        top = tk.Frame(w, bg=BG); top.pack(fill="x", padx=15, pady=6)
+        fv = tk.StringVar(value=date.today().isoformat()); tv = tk.StringVar(value=date.today().isoformat())
+        self.field(top, "من تاريخ", fv); self.field(top, "إلى تاريخ", tv)
+        box = tk.Frame(w, bg=BG); box.pack(fill="both", expand=True, padx=15)
+        tr = self.tree(box, ("id", "date", "name", "tons", "price", "share", "crew", "st", "notes"),
+                       ("رقم", "التاريخ", "الشيال", "الأطنان (النقلة)", "سعر الطن", "نصيبه", "عدد الشيالين", "الحالة", "ملاحظات"), [50, 95, 150, 110, 90, 100, 100, 110, 160], height=10)
+        tot = tk.Frame(w, bg=BG); tot.pack(fill="x", padx=15)
+        def fill(*a):
+            try: s_, e_ = check_date(fv.get()), check_date(tv.get())
+            except ValueError: return
+            for x in tr.get_children(): tr.delete(x)
+            with db() as c:
+                rows = c.execute("SELECT l.*, e.name FROM loading_logs l JOIN employees e ON e.id=l.employee_id WHERE l.l_date BETWEEN ? AND ? ORDER BY l.l_date DESC, l.id DESC", (s_, e_)).fetchall()
+            for r in rows:
+                tr.insert("", "end", iid=str(r["id"]), values=(r["id"], r["l_date"], r["name"], fmt(r["tons"]), fmt(r["price"]), fmt(r["amount"]), r["crew"],
+                                                             "✔ اتصرف" if r["expense_id"] else "⏳ مستني الصرف", r["notes"] or ""))
+            for x in tot.winfo_children(): x.destroy()
+            self.total_bar(tot, [("إجمالي التشوين", fmt(sum(float(r["amount"]) for r in rows))), ("اتصرف", fmt(sum(float(r["amount"]) for r in rows if r["expense_id"]))),
+                                 ("مستني الصرف", fmt(sum(float(r["amount"]) for r in rows if not r["expense_id"])))])
+        def delete():
+            sel = tr.selection()
+            if not sel: return messagebox.showwarning("تنبيه", "حدد سطر الأول", parent=w)
+            with db() as c: r = c.execute("SELECT * FROM loading_logs WHERE id=?", (int(sel[0]),)).fetchone()
+            if r["expense_id"]: return messagebox.showwarning("تنبيه", "السطر ده اتصرف خلاص. لو عايز تلغيه امسح صرفه من سجل السندات الأول.", parent=w)
+            if not messagebox.askyesno("حذف", "تمسح النقلة دي؟", parent=w): return
+            with db() as c:
+                c.execute("DELETE FROM loading_logs WHERE id=?", (r["id"],)); log(c, "حذف تشوين", f"{r['l_date']}: {fmt(r['tons'])} طن — {fmt(r['amount'])}")
+            fill()
+        bb = tk.Frame(w, bg=BG); bb.pack(fill="x", padx=15, pady=8)
+        ttk.Button(bb, text="عرض", command=fill).pack(side="right"); ttk.Button(bb, text="حذف السطر المحدد", command=delete).pack(side="right", padx=6)
+        ttk.Button(bb, text="إغلاق", command=w.destroy).pack(side="left")
+        fill()
+
+    def pay_daily(self, eid, e, adv):
+        def save(win, v):
+            try: a = float(v["amt"].get()); d = float(v["ded"].get() or 0); dt = check_date(v["date"].get())
+            except ValueError: return messagebox.showerror("خطأ", "راجع التاريخ والأرقام", parent=win)
+            if a <= 0 or d < 0 or d > a + 1e-9: return messagebox.showerror("خطأ", "الخصم من السلفة يجب أن يكون بين صفر واليومية", parent=win)
+            if d > adv + 1e-9: return messagebox.showerror("خطأ", f"رصيد السلفة الحالي {fmt(adv)} فقط", parent=win)
+            msg = check_locked(dt)
+            if msg: return messagebox.showerror("الشهر مقفول", msg, parent=win)
+            with db() as c:
+                if c.execute("SELECT 1 FROM expenses WHERE employee_id=? AND kind='مرتب' AND category='يوميات' AND exp_date=?", (eid, dt)).fetchone() \
+                   and not messagebox.askyesno("تنبيه", f"«{e['name']}» اتصرفله يومية يوم {dt} قبل كده. تصرف تاني؟", parent=win): return
+                c.execute("INSERT INTO expenses(exp_date,kind,category,amount,notes,employee_id,deducted,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                          (dt, "مرتب", "يوميات", a - d, f"يومية يوم {dt}" + (f" — {v['notes'].get().strip()}" if v["notes"].get().strip() else ""), eid, d, now_ts()))
+                log(c, "صرف يومية", f"{e['name']}: {fmt(a)} - خصم سلفة {fmt(d)} = مدفوع {fmt(a - d)} ({dt})")
+            win.destroy(); self.refresh_employees(); self.status.config(text="تم صرف اليومية")
+        self.small_form(f"صرف يومية: {e['name']}", [("date", "اليوم", date.today().isoformat()), ("amt", "اليومية", fmt(e["salary"] or 0).replace(",", "")),
+                                                    ("ded", "المخصوم من السلفة", "0"), ("notes", "ملاحظات", "")], save, 420)
+
+    def pay_salary(self):
+        eid = self.selected_emp()
+        if not eid: return
+        with db() as c: e = c.execute("SELECT * FROM employees WHERE id=?", (eid,)).fetchone(); adv = self.emp_advance(c, eid)
+        if e["kind"] == "عامل": return self.pay_daily(eid, e, adv)
+        sal = float(e["salary"] or 0)
+        def save(win, v):
+            try: s = float(v["sal"].get()); d = float(v["ded"].get() or 0); dt = check_date(v["date"].get())
+            except ValueError: return messagebox.showerror("خطأ", "راجع التاريخ والأرقام", parent=win)
+            if s <= 0 or d < 0 or d > s + 1e-9: return messagebox.showerror("خطأ", "الخصم من السلفة يجب أن يكون بين صفر والمرتب", parent=win)
+            if d > adv + 1e-9: return messagebox.showerror("خطأ", f"رصيد السلفة الحالي {fmt(adv)} فقط", parent=win)
+            with db() as c:
+                c.execute("INSERT INTO expenses(exp_date,kind,category,amount,notes,employee_id,deducted,created_at) VALUES(?,?,?,?,?,?,?,?)", (dt, "مرتب", "مرتبات", s - d, f"مرتب شهر {v['month'].get()}", eid, d, now_ts()))
+                log(c, "صرف مرتب", f"{e['name']}: المرتب {fmt(s)} - خصم سلفة {fmt(d)} = مدفوع {fmt(s - d)}")
+            win.destroy(); self.refresh_employees(); self.status.config(text="تم صرف المرتب")
+        win, v = self.small_form(f"صرف مرتب: {e['name']}",
+                                 [("date", "التاريخ", date.today().isoformat()), ("month", "عن شهر", date.today().strftime("%Y-%m")), ("sal", "المرتب", str(sal)), ("ded", "المخصوم من السلفة", str(min(adv, sal)))], save, 500)
+        # ملخص: المرتب − الخصم من السلفة = باقي المرتب (اللي هيتصرف من الخزنة)
+        bar = win.winfo_children()[-1]
+        box = tk.Frame(win, bg="white", highlightbackground="#cbd8e7", highlightthickness=1, padx=12, pady=8); box.pack(fill="x", padx=15, pady=(4, 0), before=bar)
+        labels = {}
+        for key, title in (("sal", "المرتب"), ("adv", "رصيد السلف الحالي"), ("ded", "المخصوم من السلفة"), ("rest", "باقي المرتب (هيتصرف)"), ("adv_after", "رصيد السلف بعد الخصم")):
+            row = tk.Frame(box, bg="white"); row.pack(fill="x")
+            tk.Label(row, text=title + ":", bg="white", fg="#50647b", font=("Tahoma", 12, "bold" if key == "rest" else "normal")).pack(side="right")
+            labels[key] = tk.Label(row, text="", bg="white", fg="#1c7c4d" if key == "rest" else NAVY, font=("Tahoma", 14 if key == "rest" else 10, "bold")); labels[key].pack(side="left")
+        def upd(*a):
+            try: sv = float(v["sal"].get() or 0)
+            except ValueError: sv = 0.0
+            try: dv = float(v["ded"].get() or 0)
+            except ValueError: dv = 0.0
+            labels["sal"].config(text=fmt(sv)); labels["adv"].config(text=fmt(adv)); labels["ded"].config(text=fmt(dv))
+            labels["rest"].config(text=fmt(sv - dv) + " ج.م"); labels["adv_after"].config(text=fmt(adv - dv))
+        v["sal"].trace_add("write", upd); v["ded"].trace_add("write", upd); upd()
+
+    def pay_advance(self):
+        eid = self.selected_emp()
+        if not eid: return
+        with db() as c: e = c.execute("SELECT * FROM employees WHERE id=?", (eid,)).fetchone()
+        def save(win, v):
+            try: a = float(v["amt"].get()); dt = check_date(v["date"].get())
+            except ValueError: return messagebox.showerror("خطأ", "راجع التاريخ والمبلغ", parent=win)
+            if a <= 0: return messagebox.showerror("خطأ", "المبلغ يجب أن يكون أكبر من صفر", parent=win)
+            with db() as c:
+                c.execute("INSERT INTO expenses(exp_date,kind,category,amount,notes,employee_id,created_at) VALUES(?,?,?,?,?,?,?)", (dt, "سلفة", "سلف", a, v["notes"].get().strip(), eid, now_ts()))
+                log(c, "صرف سلفة", f"{e['name']}: {fmt(a)}")
+            win.destroy(); self.refresh_employees(); self.status.config(text="تم صرف السلفة")
+        self.small_form(f"صرف سلفة: {e['name']}", [("date", "التاريخ", date.today().isoformat()), ("amt", "المبلغ", ""), ("notes", "ملاحظات", "")], save, 330)
+
+    def pay_commission(self):
+        eid = self.selected_emp()
+        if not eid: return
+        with db() as c:
+            e = c.execute("SELECT * FROM employees WHERE id=?", (eid,)).fetchone()
+            earned, paid = rep_commission(c, eid)
+        due = earned - paid
+        if earned <= 0 and paid <= 0: return messagebox.showinfo("صرف عمولة", f"«{e['name']}» ماليهوش عمولات مستحقة.")
+        def save(win, v):
+            try: a = float(v["amt"].get()); dt = check_date(v["date"].get())
+            except ValueError: return messagebox.showerror("خطأ", "راجع التاريخ والمبلغ", parent=win)
+            if a <= 0: return messagebox.showerror("خطأ", "المبلغ يجب أن يكون أكبر من صفر", parent=win)
+            if a > due + 0.005: return messagebox.showerror("خطأ", f"الباقي له من العمولة {fmt(due)} فقط", parent=win)
+            with db() as c:
+                # «عمولة» تطلع من الخزنة بس؛ مش بتتحسب مصروف في الأرباح (العمولة اتخصمت من الربح وقت البيع)
+                c.execute("INSERT INTO expenses(exp_date,kind,category,amount,notes,employee_id,created_at) VALUES(?,?,?,?,?,?,?)", (dt, "عمولة", "عمولات", a, v["notes"].get().strip(), eid, now_ts()))
+                log(c, "صرف عمولة", f"{e['name']}: {fmt(a)} (الباقي بعدها {fmt(due - a)})")
+            win.destroy(); self.refresh_employees(); self.status.config(text="تم صرف العمولة")
+        self.small_form(f"صرف عمولة: {e['name']}  —  المستحق {fmt(earned)} • المصروف {fmt(paid)} • الباقي {fmt(due)}",
+                        [("date", "التاريخ", date.today().isoformat()), ("amt", "المبلغ", f"{max(due, 0):.2f}"), ("notes", "ملاحظات", "")], save, 330)
+
+    def employee_statement(self):
+        eid = self.selected_emp()
+        if not eid: return
+        with db() as c:
+            e = c.execute("SELECT * FROM employees WHERE id=?", (eid,)).fetchone()
+            rows = c.execute("SELECT * FROM expenses WHERE employee_id=? ORDER BY exp_date,id", (eid,)).fetchall()
+            is_rep = e["kind"] == "مندوب"
+            rep_rows = []
+            has_rep_moves = c.execute("SELECT (SELECT COUNT(*) FROM invoices WHERE rep_id=?)+(SELECT COUNT(*) FROM payments WHERE rep_id=?)", (eid, eid)).fetchone()[0]
+            if is_rep or has_rep_moves:
+                rep_rows = self.rep_moves(c, eid, "0000-00-00", "9999-12-31")
+                earned, cpaid = rep_commission(c, eid)
+                cust_due, ncust = rep_customers_due(c, eid)
+        win = tk.Toplevel(self); win.title(f"كشف الموظف: {e['name']}"); win.geometry("980x" + ("760" if rep_rows or is_rep else "540")); win.configure(bg=BG); win.transient(self)
+        sub = (e["kind"] or "موظف") + (f" — {e['job']}" if e["job"] else "")
+        tk.Label(win, text=f"كشف الموظف: {e['name']}  ({sub})  —  المرتب الشهري {fmt(e['salary'])}", font=("Tahoma", 17, "bold"), bg=BG, fg=NAVY).pack(anchor="e", padx=15, pady=10)
+        tk.Label(win, text="المرتبات والسلف وصرف العمولات", font=("Tahoma", 13, "bold"), bg=BG, fg=NAVY).pack(anchor="e", padx=15)
+        box = tk.Frame(win, bg=BG); box.pack(fill="both", expand=True, padx=15)
+        t = self.tree(box, ("date", "time", "what", "gross", "ded", "cash", "bal", "notes"), ("التاريخ", "الوقت", "البيان", "المبلغ", "المخصوم من السلف", "المدفوع نقدًا", "رصيد السلف", "ملاحظات"), [95, 75, 70, 100, 130, 110, 110, 200], height=4)
+        bal = 0.0
+        for r in rows:
+            amt = float(r["amount"]); ded = float(r["deducted"] or 0)
+            if r["kind"] == "عمولة": t.insert("", "end", values=(r["exp_date"], fmt_time(r["created_at"]), "صرف عمولة", fmt(amt), "", fmt(amt), fmt(bal), r["notes"]))
+            elif r["kind"] == "سلفة": bal += amt; t.insert("", "end", values=(r["exp_date"], fmt_time(r["created_at"]), "سلفة", fmt(amt), "", fmt(amt), fmt(bal), r["notes"]))
+            else: bal -= ded; t.insert("", "end", values=(r["exp_date"], fmt_time(r["created_at"]), {"يوميات": "يومية", "تشوين": "تشوين"}.get(r["category"], "مرتب"), fmt(amt + ded), fmt(ded), fmt(amt), fmt(bal), r["notes"]))
+        self.total_bar(win, [("رصيد السلف الحالي", fmt(bal) + " ج.م")], title="").pack_configure(padx=15)
+        if rep_rows or is_rep:
+            tk.Label(win, text="مبيعات وتحصيلات المندوب (ضغطتين على فاتورة = فتحها)", font=("Tahoma", 13, "bold"), bg=BG, fg=NAVY).pack(anchor="e", padx=15, pady=(8, 0))
+            box2 = tk.Frame(win, bg=BG); box2.pack(fill="both", expand=True, padx=15)
+            t2 = self.tree(box2, ("date", "time", "what", "ref", "party", "sales", "col", "tons", "qty", "comm"), ("التاريخ", "الوقت", "البيان", "المرجع", "العميل", "مبيعات", "تحصيل", "طن", "شيكارة", "العمولة"), [90, 70, 105, 85, 190, 100, 100, 65, 70, 85], height=4)
+            for r in rep_rows:
+                t2.insert("", "end", iid=r[2], values=(r[0], fmt_time(r[1]), r[3], r[4], r[5], fmt(r[6]) if r[6] else "", fmt(r[7]) if r[7] else "", fmt(r[10]) if r[10] else "", fmt(r[8]) if r[8] else "", fmt(r[9]) if r[9] else ""))
+            t2.bind("<Double-1>", lambda ev: t2.selection() and t2.selection()[0].startswith("0-") and self.view_invoice(int(t2.selection()[0][2:])))
+            self.total_bar(win, [("المبيعات", fmt(sum(r[6] for r in rep_rows))), ("التحصيلات", fmt(sum(r[7] for r in rep_rows))), ("المستحق على عملائه", fmt(cust_due))]).pack_configure(padx=15)
+            self.total_bar(win, [("العمولة المستحقة", fmt(earned)), ("المصروف منها", fmt(cpaid)), ("الباقي له", fmt(earned - cpaid) + " ج.م")], title="العمولة").pack_configure(padx=15)
+        ttk.Button(win, text="إغلاق", command=win.destroy).pack(anchor="e", padx=15, pady=6)
+
+    # ================= الخزنة =================
+    def show_cash(self):
+        self.clear(); self.title_label("الخزنة / الصندوق")
+        top = tk.Frame(self.body, bg=BG); top.pack(fill="x")
+        self.cash_card = tk.Label(top, text="", font=("Tahoma", 24, "bold"), bg="white", fg=NAVY, padx=24, pady=10, highlightbackground="#cbd8e7", highlightthickness=1); self.cash_card.pack(side="right", padx=6)
+        self.cash_sub = tk.Label(top, text="", bg=BG, fg="#50647b", font=("Tahoma", 12), justify="right"); self.cash_sub.pack(side="right", padx=10)
+        ttk.Button(top, text="جرد الخزنة", command=self.cash_inventory).pack(side="left", padx=4)
+        ttk.Button(top, text="🗑 حذف الإيداع/السحب المحدد", command=self.delete_cash_move).pack(side="left", padx=4)
+        f1 = tk.LabelFrame(self.body, text="إيداع / سحب يدوي", padx=10, pady=6); f1.pack(fill="x", pady=(8, 4))
+        self.cm_kind = tk.StringVar(value="إيداع"); self.cm_date = tk.StringVar(value=date.today().isoformat()); self.cm_amount = tk.StringVar(); self.cm_notes = tk.StringVar()
+        self.field(f1, "النوع", self.cm_kind, ["إيداع", "سحب"]); self.field(f1, "التاريخ", self.cm_date); self.field(f1, "المبلغ", self.cm_amount); self.field(f1, "ملاحظات", self.cm_notes)
+        ttk.Button(f1, text="حفظ", command=self.save_cash_move).pack(side="right", padx=8, pady=12)
+        f2 = tk.Frame(self.body, bg=BG); f2.pack(fill="x", pady=4)
+        with db() as c: op = cash_opening(c)
+        self.cash_open_var = tk.StringVar(value=str(op))
+        tk.Label(f2, text="رصيد أول المدة:", bg=BG).pack(side="right", padx=4)
+        ttk.Entry(f2, textvariable=self.cash_open_var, width=14, justify="right").pack(side="right")
+        ttk.Button(f2, text="حفظ رصيد أول المدة", command=self.save_cash_opening).pack(side="right", padx=6)
+        self.cf_from = tk.StringVar(value=date.today().isoformat()); self.cf_to = tk.StringVar(value=date.today().isoformat())
+        ttk.Button(f2, text="عرض", command=self.refresh_cash).pack(side="left", padx=4)
+        for var, lab in ((self.cf_to, "إلى"), (self.cf_from, "من")):
+            e = ttk.Entry(f2, textvariable=var, width=12, justify="right")
+            tk.Button(f2, image=make_icon("cal", "#1f6fd1"), relief="flat", bg="#e3eefa", cursor="hand2", command=lambda e=e, v=var: DatePicker(e, v)).pack(side="left")
+            e.pack(side="left"); e.bind("<Double-1>", lambda ev, e=e, v=var: DatePicker(e, v))
+            tk.Label(f2, text=lab, bg=BG).pack(side="left", padx=4)
+        self.cash_tree = self.tree(self.body, ("date", "time", "what", "inn", "out", "bal"), ("التاريخ", "الوقت", "البيان", "وارد", "صادر", "الرصيد"), [105, 80, 420, 130, 130, 140])
+        self.cash_totals = tk.Frame(self.body, bg=BG); self.cash_totals.pack(fill="x")
+        self.refresh_cash()
+
+    def refresh_cash(self):
+        for x in self.cash_tree.get_children(): self.cash_tree.delete(x)
+        try: s = check_date(self.cf_from.get()); e = check_date(self.cf_to.get())
+        except ValueError: return messagebox.showerror("خطأ", "صيغة التاريخ غير صحيحة (YYYY-MM-DD)")
+        with db() as c: op = cash_opening(c); mv = treasury_moves(c)
+        bal = op + sum(m[5] - m[6] for m in mv if m[0] < s)
+        self.cash_tree.insert("", "end", values=("", "", "رصيد سابق (مرحّل)", "", "", fmt(bal)))
+        tin = tout = 0.0
+        for m in mv:
+            if s <= m[0] <= e:
+                bal += m[5] - m[6]; tin += m[5]; tout += m[6]
+                self.cash_tree.insert("", "end", iid=m[3], values=(m[0], fmt_time(m[7]), m[4], fmt(m[5]) if m[5] else "", fmt(m[6]) if m[6] else "", fmt(bal)))
+        total = op + sum(m[5] - m[6] for m in mv)
+        self.cash_card.config(text=f"الرصيد الحالي: {fmt(total)} ج.م")
+        self.cash_sub.config(text=f"خلال الفترة المعروضة:\nوارد {fmt(tin)}   صادر {fmt(tout)}")
+        for w in self.cash_totals.winfo_children(): w.destroy()
+        self.total_bar(self.cash_totals, [("وارد الفترة", fmt(tin)), ("صادر الفترة", fmt(tout)), ("الرصيد في آخر الفترة", fmt(bal))])
+
+    def delete_cash_move(self):
+        sel = self.cash_tree.selection()
+        if not sel or not sel[0].startswith("c-"):
+            return messagebox.showwarning("تنبيه", "حدد سطر «إيداع» أو «سحب» يدوي من الجدول.\n(الفواتير والسندات والمصروفات بتتحذف من شاشاتها)")
+        mid = int(sel[0][2:])
+        with db() as c: m = c.execute("SELECT * FROM cash_moves WHERE id=?", (mid,)).fetchone()
+        if not m: return
+        msg = check_locked(m["move_date"])
+        if msg: return messagebox.showerror("الشهر مقفول", msg)
+        if not messagebox.askyesno("حذف", f"تحذف {m['kind']} {fmt(m['amount'])} ج.م بتاريخ {m['move_date']}؟"): return
+        with db() as c:
+            c.execute("DELETE FROM cash_moves WHERE id=?", (mid,))
+            log(c, "حذف حركة خزنة", f"{m['kind']} {fmt(m['amount'])} — {m['move_date']}" + (f" — {m['notes']}" if m["notes"] else ""))
+        self.refresh_cash()
+
+    def save_cash_move(self):
+        try: a = float(self.cm_amount.get()); d = check_date(self.cm_date.get())
+        except ValueError: return messagebox.showerror("خطأ", "راجع المبلغ والتاريخ")
+        if a <= 0: return messagebox.showerror("خطأ", "المبلغ يجب أن يكون أكبر من صفر")
+        with db() as c:
+            c.execute("INSERT INTO cash_moves(move_date,kind,amount,notes,created_at) VALUES(?,?,?,?,?)", (d, self.cm_kind.get(), a, self.cm_notes.get().strip(), now_ts()))
+            log(c, "حركة خزنة", f"{self.cm_kind.get()} {fmt(a)}")
+        self.cm_amount.set(""); self.cm_notes.set(""); self.refresh_cash()
+
+    def save_cash_opening(self):
+        try: v = float(self.cash_open_var.get() or 0)
+        except ValueError: return messagebox.showerror("خطأ", "الرقم غير صحيح")
+        with db() as c:
+            c.execute("UPDATE settings SET cash_opening=? WHERE id=1", (v,)); log(c, "رصيد أول مدة الخزنة", fmt(v))
+        self.refresh_cash(); self.status.config(text="تم حفظ رصيد أول المدة")
+
+    def cash_inventory(self):
+        with db() as c: bal = cash_balance(c)
+        counted = simpledialog.askfloat("جرد الخزنة", f"رصيد البرنامج الآن: {fmt(bal)}\nاكتب المبلغ الموجود فعليًا في الخزنة:", parent=self)
+        if counted is None: return
+        diff = counted - bal
+        if abs(diff) < 0.005: return messagebox.showinfo("الجرد", "الخزنة مطابقة تمامًا ✔")
+        msg = (f"زيادة في الخزنة بمقدار {fmt(diff)}" if diff > 0 else f"عجز في الخزنة بمقدار {fmt(-diff)}")
+        if messagebox.askyesno("نتيجة الجرد", msg + "\n\nهل تسجّل تسوية لتطابق الرصيد؟"):
+            with db() as c:
+                c.execute("INSERT INTO cash_moves(move_date,kind,amount,notes,created_at) VALUES(?,?,?,?,?)", (date.today().isoformat(), "إيداع" if diff > 0 else "سحب", abs(diff), "تسوية جرد", now_ts()))
+                log(c, "جرد خزنة", f"{msg} (رصيد البرنامج {fmt(bal)} / الفعلي {fmt(counted)})")
+            self.refresh_cash()
+
+    # ================= أرصدة الحسابات =================
+    def show_balances(self):
+        self.clear(); self.title_label("أرصدة الحسابات")
+        with db() as c:
+            data = []
+            ld = last_dates(c)
+            for p in c.execute("SELECT * FROM parties ORDER BY name").fetchall():
+                b = party_balance(c, p["id"])
+                lc = ld[0].get(p["id"]) or ""; lp = ld[1].get(p["id"]) or ""; li = ld[2].get(p["id"]) or ""
+                data.append((p["id"], p["name"], p["kind"], b, lc, lp, li))
+            cash = cash_balance(c)
+            inv_val = sale_val = 0.0
+            for r in c.execute("SELECT id,buy_price,sell_price FROM items").fetchall():
+                q = max(stock_of(c, r["id"]), 0)
+                sale_val += q * float(r["sell_price"] or 0)
+            inv_val = fifo_stock_value(c)
+        recv = sum(d[3] for d in data if d[3] > 0); pay = -sum(d[3] for d in data if d[3] < 0)
+        cards = tk.Frame(self.body, bg=BG); cards.pack(fill="x", pady=(0, 8))
+        for title, val, color in [("على العملاء (لنا)", recv, "#1c7c4d"), ("علينا للموردين", pay, "#b91c1c"), ("الخزنة", cash, NAVY),
+                                  ("صافي الأملاك (خزنة + مخزون بسعر الشراء + عملاء − موردين)", cash + inv_val + recv - pay, "#6d28d9"), ("قيمة المخزون (بسعر الشراء)", inv_val, "#b45309")] + \
+                                 [("قيمة المخزون (بسعر البيع)", sale_val, "#0f766e")]:
+            light = "#%02x%02x%02x" % tuple(int(int(color[i:i + 2], 16) * 0.10 + 255 * 0.90) for i in (1, 3, 5))
+            card = tk.Frame(cards, bg=light, highlightbackground=color, highlightthickness=2); card.pack(side="right", expand=True, fill="x", padx=4)
+            tk.Label(card, text=title, bg=color, fg="white", font=("Tahoma", 11, "bold"), pady=3).pack(fill="x")
+            tk.Label(card, text=fmt(val), bg=light, fg=color, font=("Tahoma", 19, "bold")).pack(pady=5)
+        tk.Label(self.body, text="ضغطتين على الاسم تفتح كشف حسابه  (موجب = على العميل ، سالب = للمورد)", bg=BG, fg="#50647b", font=("Tahoma", 11)).pack(anchor="e")
+        bq = tk.StringVar(); bar = tk.Frame(self.body, bg=BG); bar.pack(fill="x", pady=(2, 4))
+        ttk.Button(bar, text="🗑 حذف المحدد", command=lambda: self.delete_balance_rows(tree)).pack(side="left", padx=4)
+        ttk.Button(bar, text="كشف الحساب", command=lambda: tree.selection() and self.show_account(int(tree.selection()[0]))).pack(side="left", padx=4)
+        ttk.Button(bar, text="📄 PDF", command=lambda: self.balances_pdf(
+            [d for d in shown if str(d[0]) in set(tree.selection())] if len(tree.selection()) > 1 else list(shown), bq.get().strip(),
+            dict(recv=recv, pay=pay, cash=cash, inv=inv_val, sale=sale_val), len(tree.selection()) > 1)).pack(side="left", padx=4)
+        tk.Label(bar, text="بحث سريع (الاسم أو النوع):", bg=BG).pack(side="right", padx=6)
+        se = ttk.Entry(bar, textvariable=bq, justify="right"); se.pack(side="right", fill="x", expand=True)
+        tree = self.tree(self.body, ("id", "name", "kind", "deb", "cred", "lc", "lp", "li"), ("ID", "الاسم", "النوع", "مدين (عليه)", "دائن (له)", "آخر تحصيل", "آخر دفع", "آخر فاتورة"), [45, 250, 90, 130, 130, 110, 110, 110])
+        tot = tk.Frame(self.body, bg=BG); tot.pack(fill="x")
+        def fill(*a):
+            q = _norm(bq.get().strip())
+            for x in tree.get_children(): tree.delete(x)
+            rows = [d for d in sorted(data, key=lambda x: -abs(x[3])) if not q or q in _norm(f"{d[1]} {d[2]}")]
+            for d in rows:
+                tree.insert("", "end", iid=str(d[0]), values=(d[0], d[1], d[2], fmt(d[3]) if d[3] > 0.005 else fmt(0), fmt(-d[3]) if d[3] < -0.005 else fmt(0), d[4], d[5], d[6]))
+            shown[:] = rows; show_total()
+        shown = []
+        def show_total(*a):
+            """الشريط الأزرق: لو محدد أكتر من حساب = إجمالي المحدد، وإلا إجمالي اللي ظاهر في الجدول."""
+            sel = set(tree.selection())
+            rows, title = ([d for d in shown if str(d[0]) in sel], "إجمالي المحدد") if len(sel) > 1 else (shown, "الإجمالي")
+            r_ = sum(d[3] for d in rows if d[3] > 0); p_ = -sum(d[3] for d in rows if d[3] < 0)
+            for w in tot.winfo_children(): w.destroy()
+            self.total_bar(tot, [("العدد", str(len(rows))), ("إجمالي المدين", fmt(r_)), ("إجمالي الدائن", fmt(p_)), ("الصافي", fmt(r_ - p_))], title=title)
+        tree.bind("<<TreeviewSelect>>", show_total, add="+")
+        bq.trace_add("write", fill); fill(); se.focus_set()
+        tree.bind("<Double-1>", lambda e: tree.selection() and self.show_account(int(tree.selection()[0])))
+
+    def balances_pdf(self, rows, q, tot, only_sel):
+        """أرصدة الحسابات (اللي ظاهرة في الجدول، أو المحدد بس) → ملف PDF."""
+        if not rows: return messagebox.showwarning("PDF", "مفيش حسابات في الجدول")
+        with db() as c: st = c.execute("SELECT * FROM settings WHERE id=1").fetchone()
+        r_ = sum(d[3] for d in rows if d[3] > 0); p_ = -sum(d[3] for d in rows if d[3] < 0)
+        body = "".join(f"<tr><td>{n}</td><td class='nm'>{esc(d[1])}</td><td>{esc(d[2] or '')}</td><td>{fmt(d[3]) if d[3] > 0.005 else ''}</td>"
+                       f"<td>{fmt(-d[3]) if d[3] < -0.005 else ''}</td><td>{d[4] or ''}</td><td>{d[5] or ''}</td><td>{d[6] or ''}</td></tr>" for n, d in enumerate(rows, 1))
+        cards = "" if (q or only_sel) else (
+            "<div class='cards'>" + "".join(f"<div><b>{t}</b><span>{fmt(v)}</span></div>" for t, v in (
+                ("على العملاء (لنا)", tot["recv"]), ("علينا للموردين", tot["pay"]), ("الخزنة", tot["cash"]), ("قيمة المخزون (بسعر الشراء)", tot["inv"]),
+                ("صافي الأملاك", tot["cash"] + tot["inv"] + tot["recv"] - tot["pay"]))) + "</div>")
+        sub = f"بتاريخ {date.today().isoformat()}" + (f"  •  بحث: {esc(q)}" if q else "") + ("  •  الحسابات المحددة بس" if only_sel else "")
+        html = f"""<!doctype html><html lang="ar" dir="rtl"><meta charset="utf-8"><title>أرصدة الحسابات</title><style>
+        @page{{size:A4;margin:10mm}}*{{box-sizing:border-box}}body{{font-family:Tahoma,Arial,sans-serif;font-size:12.5px;color:#111;margin:0}}
+        .hd{{display:flex;align-items:center;justify-content:space-between;border-bottom:2px solid #123b67;padding-bottom:6px}}.hd img{{height:58px}}
+        h1{{margin:0;font-size:21px;color:#123b67}}h2{{text-align:center;margin:10px 0 2px}}.sub{{text-align:center;color:#444;margin-bottom:8px}}
+        .cards{{display:flex;gap:6px;margin:6px 0 10px}}.cards div{{flex:1;border:1px solid #9fb4cc;border-radius:6px;padding:5px;text-align:center}}
+        .cards b{{display:block;font-size:11px;color:#123b67}}.cards span{{font-size:15px;font-weight:bold}}
+        table{{width:100%;border-collapse:collapse}}th,td{{border:1px solid #666;padding:4px 5px;text-align:center}}td.nm{{text-align:right}}
+        table.bal{{table-layout:fixed}}table.bal td{{white-space:nowrap;overflow:hidden;padding:4px 3px}}table.bal td.nm{{white-space:normal}}table.bal th{{font-size:11.5px}}
+        th{{background:#e8eef5}}tr:nth-child(even) td{{background:#f6fafd}}tfoot td{{font-weight:bold;background:#e8eef5}}thead{{display:table-header-group}}tr{{break-inside:avoid}}
+        .ft{{margin-top:8px;color:#555;font-size:11px}}</style>
+        <div class="hd"><div><h1>{esc(st['company']) or DEFAULT_COMPANY}</h1><div>{esc(st['tagline'] or DEFAULT_TAGLINE)}</div></div><img src="{logo_data_uri()}"></div>
+        <h2>أرصدة الحسابات</h2><div class="sub">{sub}</div>{cards}
+        <table class="bal"><colgroup><col style="width:4%"><col style="width:32%"><col style="width:6%"><col style="width:12.6%"><col style="width:12.6%"><col style="width:10.9%"><col style="width:10.9%"><col style="width:11%"></colgroup>
+        <thead><tr><th>م</th><th>الاسم</th><th>النوع</th><th>مدين (عليه)</th><th>دائن (له)</th><th>آخر تحصيل</th><th>آخر دفع</th><th>آخر فاتورة</th></tr></thead>
+        <tbody>{body}</tbody><tfoot><tr><td colspan="3">الإجمالي ({len(rows)} حساب)</td><td>{fmt(r_)}</td><td>{fmt(p_)}</td><td colspan="3">الصافي: {fmt(r_ - p_)}</td></tr></tfoot></table>
+        <div class="ft">طُبع في {date.today().isoformat()} — {fmt_time(now_ts())}</div></html>"""
+        os.makedirs(PRINT_DIR, exist_ok=True)
+        hp = os.path.join(PRINT_DIR, "balances.html")
+        with open(hp, "w", encoding="utf-8") as f: f.write(html)
+        dest = filedialog.asksaveasfilename(title="حفظ أرصدة الحسابات PDF", defaultextension=".pdf", filetypes=[("PDF", "*.pdf")],
+                                            initialfile=f"أرصدة_الحسابات_{date.today().isoformat()}.pdf")
+        if not dest: return
+        self.status.config(text="⏳ بيعمل ملف PDF ..."); self.update_idletasks()
+        if html_to_pdf(hp, dest):
+            self.status.config(text="✔ اتحفظ: " + dest); open_file(dest)
+        else:
+            open_file(hp)
+            messagebox.showinfo("PDF", "ملقيتش Edge أو Chrome علشان أعمل الـ PDF لوحدي.\nفتحتلك الصفحة — دوس Ctrl+P واختار «Save as PDF».")
+
+    def delete_balance_rows(self, tree):
+        sel = [int(x) for x in tree.selection()]
+        if not sel: return messagebox.showwarning("تنبيه", "حدد حساب أو أكتر من الجدول (Ctrl أو Shift + كليك لأكتر من واحد)")
+        with db() as c:
+            info = [(i, c.execute("SELECT name FROM parties WHERE id=?", (i,)).fetchone()[0],
+                     c.execute("SELECT (SELECT COUNT(*) FROM invoices WHERE party_id=?)+(SELECT COUNT(*) FROM payments WHERE party_id=?)+(SELECT COUNT(*) FROM samples WHERE party_id=?)", (i, i, i)).fetchone()[0]) for i in sel]
+        used = [n for _, n, u in info if u]; free = [(i, n) for i, n, u in info if not u]
+        if not free: return messagebox.showwarning("لا يمكن الحذف", "الحسابات دي ليها فواتير أو سندات — مينفعش تتحذف:\n" + "، ".join(used[:10]))
+        q = f"تحذف {len(free)} حساب؟\n" + "، ".join(n for _, n in free[:8]) + ("..." if len(free) > 8 else "")
+        if used: q += f"\n\n({len(used)} مش هيتحذفوا علشان ليهم فواتير أو سندات: " + "، ".join(used[:5]) + ")"
+        if not messagebox.askyesno("حذف", q): return
+        with db() as c:
+            for i, n in free:
+                c.execute("DELETE FROM parties WHERE id=?", (i,)); log(c, "حذف عميل/مورد", n)
+        self.show_balances()
+
+    # ================= المبيعات / المشتريات لكل صنف في الفترة =================
+    def show_items_out(self, kind="مبيعات"):
+        """شاشة المبيعات (أو المشتريات) لكل صنف في الفترة: الصنف • الوحدة • الكمية • القيمة — بعد خصم المرتجع."""
+        sale = kind == "مبيعات"; ret = "مرتجع مبيعات" if sale else "مرتجع مشتريات"
+        title = "المبيعات" if sale else "المشتريات"
+        self.clear(); self.title_label(title)
+        f = tk.Frame(self.body, bg=BG); f.pack(fill="x")
+        fv, tv = tk.StringVar(value=date.today().isoformat()), tk.StringVar(value=date.today().isoformat()); qv = tk.StringVar()
+        self.field(f, "من تاريخ", fv); self.field(f, "إلى تاريخ", tv)
+        ttk.Button(f, text="عرض", command=lambda: fill()).pack(side="right", padx=6, pady=(22, 0))
+        tk.Label(self.body, text=f"الكمية والقيمة بعد خصم {ret}  •  ضغطتين على صنف = فواتيره",
+                 bg=BG, fg="#50647b", font=("Tahoma", 11)).pack(anchor="e", pady=(4, 0))
+        self.search_bar("بحث سريع (الصنف):", qv)
+        tree = self.tree(self.body, ("code", "name", "unit", "qty", "amt"),
+                         ("الكود", "اسم الصنف", "الوحدة", "الكمية", "القيمة"), [90, 340, 100, 130, 160])
+        tot = tk.Frame(self.body, bg=BG); tot.pack(fill="x")
+        data = {}
+        def fill(*a):
+            try: s_ = check_date(fv.get()); e_ = check_date(tv.get())
+            except ValueError: return
+            with db() as c:
+                rows = c.execute(f"""SELECT l.item_id, MIN(l.item_name) nm, MIN(COALESCE(l.unit,'')) un,
+                        SUM(CASE i.kind WHEN ? THEN l.qty WHEN ? THEN -l.qty ELSE 0 END) q,
+                        SUM(CASE i.kind WHEN ? THEN l.qty*l.price WHEN ? THEN -l.qty*l.price ELSE 0 END) a
+                        FROM invoice_lines l JOIN invoices i ON i.id=l.invoice_id
+                        WHERE i.kind IN (?,?) AND {EFFECTIVE_DATE_SQL} BETWEEN ? AND ? GROUP BY l.item_id""",
+                        (kind, ret, kind, ret, kind, ret, s_, e_)).fetchall()
+                codes = {r[0]: r[1] or "" for r in c.execute("SELECT id, code FROM items").fetchall()}
+            data.clear()
+            for r in rows:
+                if r[0] is None or (abs(float(r[3] or 0)) < 1e-9 and abs(float(r[4] or 0)) < 1e-9): continue
+                data[str(r[0])] = (codes.get(r[0], ""), r[1], r[2], float(r[3] or 0), float(r[4] or 0))
+            show()
+        def show(*a):
+            q = _norm(qv.get().strip())
+            for x in tree.get_children(): tree.delete(x)
+            items = sorted(((k, v) for k, v in data.items() if not q or q in _norm(v[1] + " " + v[0])), key=lambda kv: -kv[1][4])
+            for k, v in items:
+                tree.insert("", "end", iid=k, values=(v[0], v[1], v[2], fmt(v[3]), fmt(v[4])))
+            totals()
+        def qty(items):
+            bags = tons = 0.0
+            for _, v in items:
+                u = v[2] or ""
+                if "طن" in u: tons += v[3]; bags += v[3] * BAGS_PER_TON
+                elif "شك" in u or "شيك" in u: bags += v[3]; tons += v[3] / BAGS_PER_TON
+            return qty_text(bags, tons)
+        def totals(*a):
+            sel = set(tree.selection())
+            items = [(k, data[k]) for k in tree.get_children() if (len(sel) < 2 or k in sel) and k in data]
+            for w in tot.winfo_children(): w.destroy()
+            self.total_bar(tot, [("عدد الأصناف", str(len(items))), ("الكمية", qty(items)), ("إجمالي القيمة", fmt(sum(v[4] for _, v in items)))],
+                           title="إجمالي المحدد" if len(sel) > 1 else "الإجمالي")
+        tree.bind("<<TreeviewSelect>>", totals, add="+")
+        def open_inv(e=None):
+            if not tree.selection(): return
+            try: a_, b_ = check_date(fv.get()), check_date(tv.get())
+            except ValueError: a_ = b_ = None
+            self.show_item_invoices(int(tree.selection()[0]), a_, b_, (kind, ret))
+        tree.bind("<Double-1>", open_inv)
+        qv.trace_add("write", show)
+        for v in (fv, tv): v.trace_add("write", lambda *a: fill())
+        fill()
+
+    # ================= أرصدة الأصناف =================
+    def show_stock(self):
+        self.clear(); self.title_label("أرصدة الأصناف")
+        tk.Label(self.body, text="الرصيد لحد اليوم (شامل رصيد أول المدة)  •  «محجوز» = كميات في فواتير تاريخ استحقاقها لسه ماجاش  •  ضغطتين على صنف = فواتيره  •  الأحمر = وصل للحد الأدنى", bg=BG, fg="#50647b", font=("Tahoma", 11)).pack(anchor="e")
+        q_var = tk.StringVar(); self.search_bar("بحث سريع (الكود أو اسم الصنف):", q_var)
+        # تعديل الأسعار بسرعة: اختار صنف ← اكتب السعر ← Enter (بيحفظ وينزل على اللي بعده)
+        pe = tk.LabelFrame(self.body, text="تعديل سعر الصنف المحدد (اكتب واضغط Enter — بيحفظ وينزل على الصنف اللي بعده)", padx=8, pady=4); pe.pack(fill="x", pady=(0, 6))
+        self.sp_buy, self.sp_sell = tk.StringVar(), tk.StringVar()
+        prow = tk.Frame(pe); prow.pack(fill="x")
+        self.sp_name = tk.Label(prow, text="اختار صنف من الجدول", font=("Tahoma", 12, "bold"), fg=NAVY, anchor="e", width=34)
+        self.sp_name.pack(side="right", padx=6)
+        tk.Label(prow, text="سعر الشراء:").pack(side="right", padx=(12, 2))
+        eb = ttk.Entry(prow, textvariable=self.sp_buy, width=12, justify="center"); eb.pack(side="right")
+        tk.Label(prow, text="سعر البيع:").pack(side="right", padx=(12, 2))
+        es = ttk.Entry(prow, textvariable=self.sp_sell, width=12, justify="center"); es.pack(side="right")
+        ttk.Button(prow, text="حفظ السعر", command=lambda: self.save_stock_price(tree, rows_by_id, fill)).pack(side="right", padx=10)
+        eb.bind("<Return>", lambda e: (focus_input(es), "break")[-1])
+        es.bind("<Return>", lambda e: self.save_stock_price(tree, rows_by_id, fill, next_focus=eb))
+        tree = self.tree(self.body, ("code", "name", "unit", "buy", "sell", "open", "inn", "out", "dmg", "stock", "res", "after"),
+                         ("الكود", "اسم الصنف", "الوحدة", "سعر الشراء", "سعر البيع", "أول المدة", "الوارد", "الصادر", "هالك", "الرصيد الحالي", "محجوز لفواتير قادمة", "بعد الفواتير القادمة"),
+                         [80, 230, 70, 95, 95, 90, 90, 90, 70, 110, 130, 140])
+        tree.tag_configure("low", foreground="#b91c1c"); tree.tag_configure("noprice", foreground="#b45309")
+        today = date.today().isoformat(); all_rows = []; rows_by_id = {}
+        with db() as c:
+            direct = {r[0]: float(r[1]) for r in c.execute("SELECT item_id,SUM(qty) FROM damaged WHERE d_date<=? GROUP BY item_id", (today,))}
+            after_map = stock_map(c, "9999-12-31")   # الرصيد بعد كل الفواتير (3 استعلامات بدل 4 لكل صنف)
+            for r in c.execute("SELECT it.*,"
+                               "COALESCE(SUM(CASE WHEN i.kind='مشتريات' OR (i.kind='مرتجع مبيعات' AND COALESCE(l.damaged,0)=0) THEN l.qty END),0) inn,"
+                               "COALESCE(SUM(CASE WHEN i.kind IN ('مبيعات','مرتجع مشتريات') THEN l.qty END),0) outq,"
+                               "COALESCE(SUM(CASE WHEN i.kind='مرتجع مبيعات' AND COALESCE(l.damaged,0)=1 THEN l.qty END),0) dret "
+                               f"FROM items it LEFT JOIN (invoice_lines l JOIN invoices i ON i.id=l.invoice_id AND {EFFECTIVE_DATE_SQL}<=?) ON l.item_id=it.id "
+                               "GROUP BY it.id ORDER BY it.name", (today,)).fetchall():
+                d = direct.get(r["id"], 0.0); op = float(r["opening_qty"] or 0)
+                st = op + r["inn"] - r["outq"] - d; mn = float(r["min_stock"] or 0)
+                after = after_map.get(r["id"], 0.0); res = st - after       # محجوز = هيخرج لما الفواتير القادمة تستحق
+                buy, sell = float(r["buy_price"] or 0), float(r["sell_price"] or 0)
+                tags = ("low",) if mn > 0 and st <= mn else ("noprice",) if not buy or not sell else ()
+                row = [str(r["id"]), [r["code"] or "", r["name"], r["unit"], fmt(buy), fmt(sell), fmt(op), fmt(r["inn"]), fmt(r["outq"]), fmt(d + r["dret"]), fmt(st),
+                                      fmt(res) if abs(res) > 1e-9 else "", fmt(after) if abs(res) > 1e-9 else ""], tags]
+                all_rows.append(row); rows_by_id[row[0]] = row
+        def fill(*a):
+            sel = tree.selection()
+            for x in tree.get_children(): tree.delete(x)
+            q = q_var.get().strip().lower()
+            for iid, vals, tags in all_rows:
+                if q and q not in (str(vals[0]) + " " + str(vals[1])).lower(): continue
+                tree.insert("", "end", iid=iid, values=vals, tags=tags)
+            if sel and tree.exists(sel[0]): tree.selection_set(sel[0]); tree.see(sel[0])
+        def on_select(e=None):
+            sel = tree.selection()
+            if not sel: return
+            vals = rows_by_id[sel[0]][1]
+            self.sp_name.config(text=f"{vals[1]}")
+            self.sp_buy.set(vals[3].replace(",", "")); self.sp_sell.set(vals[4].replace(",", ""))
+        tree.bind("<<TreeviewSelect>>", on_select)
+        q_var.trace_add("write", fill); fill()
+        tree.bind("<Double-1>", lambda e: self.item_invoices_selected(tree))
+        self.stock_tree = tree
+        n_np = sum(1 for r in all_rows if "noprice" in r[2])
+        bar = tk.Frame(self.body, bg=BG); bar.pack(fill="x", pady=6)
+        ttk.Button(bar, text="🖨 طباعة للجرد (الاسم والكمية)", command=self.print_stock_count).pack(side="right", padx=4)
+        if n_np: tk.Label(bar, text=f"البرتقاني = صنف ناقصه سعر شراء أو بيع ({n_np} صنف)", bg=BG, fg="#b45309", font=("Tahoma", 11, "bold")).pack(side="left", padx=6)
+
+    def save_stock_price(self, tree, rows_by_id, fill, next_focus=None):
+        sel = tree.selection()
+        if not sel: return messagebox.showwarning("تنبيه", "اختار صنف من الجدول الأول")
+        try: buy = float(self.sp_buy.get().replace(",", "") or 0); sell = float(self.sp_sell.get().replace(",", "") or 0)
+        except ValueError: return messagebox.showerror("خطأ", "السعر لازم يكون رقم")
+        if buy < 0 or sell < 0: return messagebox.showerror("خطأ", "السعر مينفعش يكون بالسالب")
+        iid = sel[0]
+        with db() as c:
+            old = c.execute("SELECT name,buy_price,sell_price FROM items WHERE id=?", (int(iid),)).fetchone()
+            if abs(float(old["buy_price"] or 0) - buy) < 1e-9 and abs(float(old["sell_price"] or 0) - sell) < 1e-9: changed = False
+            else:
+                changed = True
+                c.execute("UPDATE items SET buy_price=?, sell_price=? WHERE id=?", (buy, sell, int(iid)))
+                log(c, "تعديل سعر صنف", f"{old['name']}: شراء {fmt(old['buy_price'] or 0)}←{fmt(buy)} / بيع {fmt(old['sell_price'] or 0)}←{fmt(sell)}")
+        row = rows_by_id[iid]; row[1][3], row[1][4] = fmt(buy), fmt(sell)
+        if "low" not in row[2]: row[2] = ("noprice",) if not buy or not sell else ()
+        tree.item(iid, values=row[1], tags=row[2])
+        if sell and buy and sell < buy: self.status.config(text=f"⚠ «{old['name']}»: سعر البيع أقل من سعر الشراء")
+        else: self.status.config(text=f"تم حفظ سعر «{old['name']}»" if changed else "مفيش تغيير في السعر")
+        nxt = tree.next(iid)
+        if nxt:
+            tree.selection_set(nxt); tree.see(nxt)
+        if next_focus is not None:
+            focus_input(next_focus)
+
+    # ================= كشف الحساب =================
+    def show_account(self, pid=None):
+        self.clear(); self.title_label("كشف حساب عميل / مورد")
+        with db() as c: parties = c.execute("SELECT * FROM parties ORDER BY name").fetchall()
+        self.account_lookup = {party_label(p): p["id"] for p in parties}
+        form = tk.Frame(self.body, bg=BG); form.pack(fill="x", pady=5)
+        self.acc_party = tk.StringVar(); self.acc_from = tk.StringVar(value=date.today().replace(day=1).isoformat()); self.acc_to = tk.StringVar(value=date.today().isoformat())
+        self.field(form, "الاسم", self.acc_party, list(self.account_lookup), search=True)
+        self.field(form, "من تاريخ", self.acc_from); self.field(form, "إلى تاريخ", self.acc_to)
+        ttk.Button(form, text="عرض الكشف", command=self.render_account).pack(side="right", padx=8, pady=20)
+        ttk.Button(form, text="طباعة / PDF", command=self.print_statement).pack(side="right", padx=4, pady=20)
+        self.acc_note = tk.Label(self.body, text="", bg=BG, fg="#6b7280", font=("Tahoma", 11), anchor="e"); self.acc_note.pack(fill="x")
+        self.acc_result = tk.Frame(self.body, bg=BG); self.acc_result.pack(fill="both", expand=True)
+        if pid:
+            for k, v in self.account_lookup.items():
+                if v == pid: self.acc_party.set(k)
+            self.acc_from.set("2000-01-01")
+            self.render_account()
+
+    def render_account(self):
+        for w in self.acc_result.winfo_children(): w.destroy()
+        pid = self.account_lookup.get(self.acc_party.get())
+        if not pid: return messagebox.showwarning("تنبيه", "اختر الاسم")
+        try: start = check_date(self.acc_from.get()); end = check_date(self.acc_to.get())
+        except ValueError: return messagebox.showerror("خطأ", "صيغة التاريخ غير صحيحة (YYYY-MM-DD)")
+        if start > end: return messagebox.showerror("خطأ", "تاريخ البداية بعد تاريخ النهاية")
+        party, opening, rows, closing = build_statement(pid, start, end)
+        with db() as c: self.acc_note.config(text=party_last_text(c, pid))
+        self.last_statement = (party, start, end, opening, rows, closing)
+        tk.Label(self.acc_result, text="ضغطتين على فاتورة = فتحها  •  ضغطتين على سند = تفاصيله", bg=BG, fg="#50647b", font=("Tahoma", 11)).pack(anchor="e")
+        tree = self.tree(self.acc_result, ("date", "time", "number", "kind", "debit", "credit", "balance"), ("التاريخ", "الوقت", "المرجع", "البيان", "مدين", "دائن", "الرصيد"), [110, 80, 130, 250, 130, 130, 140])
+        tree.insert("", "end", iid="open", values=("", "", "", "رصيد سابق (مرحّل)", "", "", fmt(opening)))
+        for r in rows: tree.insert("", "end", iid=f"{r[6]}-{r[7]}", values=(r[0], fmt_time(r[8]), r[1], r[2], fmt(r[3]), fmt(r[4]), fmt(r[5])))
+        tree.bind("<Double-1>", lambda e: self.open_statement_row(tree))
+        self.total_bar(self.acc_result, [("إجمالي المدين", fmt(sum(r[3] for r in rows))), ("إجمالي الدائن", fmt(sum(r[4] for r in rows))), ("الرصيد الختامي", fmt(closing) + " ج.م")])
+        tk.Label(self.acc_result, text="الرصيد: موجب = على العميل ، سالب = للمورد", bg=BG, fg="#50647b", font=("Tahoma", 11)).pack(anchor="e")
+
+    def open_statement_row(self, tree):
+        sel = tree.selection()
+        if not sel or "-" not in sel[0]: return
+        typ, rid = sel[0].split("-"); rid = int(rid)
+        if typ == "0": return self.view_invoice(rid)
+        with db() as c:
+            p = c.execute("SELECT * FROM payments WHERE id=?", (rid,)).fetchone()
+            rep =rep_name_of(c, p["rep_id"]) if p and p["kind"] == "تحصيل" else ""
+        if p: messagebox.showinfo(f"سند رقم {rid}", f"التاريخ: {p['pay_date']}  {fmt_time(p['created_at'])}\nالنوع: {p['kind'] if p['kind'] == DISC_KIND else 'تحصيل' if p['kind'] == 'تحصيل' else 'دفع'}\nالمبلغ: {fmt(p['amount'])} ج.م" + (f"\nالمندوب: {rep}" if rep else "") + f"\nملاحظات: {p['notes'] or '-'}")
+
+    def print_statement(self):
+        if not self.last_statement: return messagebox.showwarning("تنبيه", "اعرض الكشف أولًا ثم اطبعه")
+        party, start, end, opening, rows, closing = self.last_statement
+        with db() as c: s = c.execute("SELECT * FROM settings WHERE id=1").fetchone()
+        body = f"<tr><td></td><td></td><td></td><td>رصيد سابق (مرحّل)</td><td></td><td></td><td>{fmt(opening)}</td></tr>"
+        body += "".join(f"<tr><td>{esc(r[0])}</td><td>{esc(fmt_time(r[8]))}</td><td>{esc(r[1])}</td><td>{esc(r[2])}</td><td>{fmt(r[3])}</td><td>{fmt(r[4])}</td><td>{fmt(r[5])}</td></tr>" for r in rows)
+        body += f"<tr class='t'><td colspan='4'>الإجمالي</td><td>{fmt(sum(r[3] for r in rows))}</td><td>{fmt(sum(r[4] for r in rows))}</td><td>{fmt(closing)}</td></tr>"
+        html = f"""<!doctype html><html lang="ar" dir="rtl"><meta charset="utf-8"><title>كشف حساب</title><style>
+        @page{{size:A4;margin:0}}*{{box-sizing:border-box}}body{{font-family:Tahoma,Arial,sans-serif;font-size:14px;color:#111;margin:0 auto;padding:12mm;width:210mm}}@media screen{{body{{width:auto;max-width:210mm}}}}
+        h1,h2,h3{{text-align:center;margin:4px}}table{{width:100%;border-collapse:collapse;margin-top:10px}}
+        th,td{{border:1px solid #555;padding:5px;text-align:center}}th{{background:#eee}}
+        tr:nth-child(even) td{{background:#f6fafd}}tr.t td{{font-weight:bold;background:#e3eef9}}
+        .tot{{margin-top:10px;font-weight:bold;font-size:16px}}</style>
+        <div style="overflow:hidden">{logo_img_tag("height:24mm;float:left")}<h1>{esc(s['company']) or DEFAULT_COMPANY}</h1><h2>كشف حساب: {esc(party['name'])}</h2>
+        <h3>من {esc(start)} إلى {esc(end)}</h3></div>
+        <table><thead><tr><th>التاريخ</th><th>الوقت</th><th>المرجع</th><th>البيان</th><th>مدين</th><th>دائن</th><th>الرصيد</th></tr></thead><tbody>{body}</tbody></table>
+        <div class="tot">الرصيد الختامي: {fmt(closing)} ج.م</div>
+        <div>موجب = على العميل ، سالب = للمورد</div></html>"""
+        path = os.path.join(PRINT_DIR, f"statement_{party['id']}.html")
+        with open(path, "w", encoding="utf-8") as f: f.write(html)
+        print_page(path)
+
+    # ================= الأرباح =================
+    def show_profit(self):
+        if not is_owner(): return self.show_home()
+        self.clear(); self.title_label("تقرير الأرباح")
+        bar = tk.Frame(self.body, bg=BG); bar.pack(fill="x", pady=2)
+        self.pf_from = tk.StringVar(value=date.today().replace(day=1).isoformat()); self.pf_to = tk.StringVar(value=date.today().isoformat())
+        self.field(bar, "من تاريخ", self.pf_from); self.field(bar, "إلى تاريخ", self.pf_to)
+        ttk.Button(bar, text="عرض التقرير", command=self.render_profit).pack(side="right", padx=6, pady=18)
+        ttk.Button(bar, text="مقارنة", command=self.compare_dialog).pack(side="right", padx=4, pady=18)
+        self.pf_result = tk.Frame(self.body, bg=BG); self.pf_result.pack(fill="both", expand=True)
+        self.render_profit()
+
+    def render_profit(self):
+        for w in self.pf_result.winfo_children(): w.destroy()
+        try: start = check_date(self.pf_from.get()); end = check_date(self.pf_to.get())
+        except ValueError: return messagebox.showerror("خطأ", "صيغة التاريخ غير صحيحة (YYYY-MM-DD)")
+        if start > end: return messagebox.showerror("خطأ", "تاريخ البداية بعد تاريخ النهاية")
+        ps = profit_summary(start, end)
+        wrap = tk.Frame(self.pf_result, bg=BG); wrap.pack(fill="both", expand=True, pady=(4, 0))
+        sumf = tk.Frame(wrap, bg=BG); sumf.pack(side="right", fill="y", padx=(8, 0))
+        tk.Label(sumf, text="ملخص الفترة", bg=BG, fg=NAVY, font=("Tahoma", 13, "bold")).pack(anchor="e")
+        st = self.tree(sumf, ("l", "v"), ("البند", "القيمة (ج.م)"), [300, 120], height=13)
+        st.tag_configure("key", font=("Tahoma", 13, "bold"), foreground="#123b67")
+        for label, v in metric_rows(ps): st.insert("", "end", values=(label, fmt(v)), tags=("key",) if ("Total" in label or label == "صافي الربح") else ())
+        itf = tk.Frame(wrap, bg=BG); itf.pack(side="left", fill="both", expand=True)
+        tk.Label(itf, text="تفصيل الأصناف", bg=BG, fg=NAVY, font=("Tahoma", 13, "bold")).pack(anchor="e")
+        tree = self.tree(itf, ("name", "qty", "rev", "avg", "cost", "profit"), ("الصنف", "الكمية الصافية", "المبيعات الصافية", "متوسط التكلفة", "إجمالي التكلفة", "الربح"), [150, 105, 125, 110, 120, 90])
+        for r in ps["rows"]: tree.insert("", "end", values=(r[0], fmt(r[1]), fmt(r[2]), fmt(r[3]), fmt(r[4]), fmt(r[5])))
+        if ps["by_cat"]:
+            tk.Label(self.pf_result, text="المصروفات العامة: " + " • ".join(f"{n}: {fmt(a)}" for n, a in ps["by_cat"]), bg=BG, fg="#50647b", font=("Tahoma", 11), wraplength=1200, justify="right").pack(anchor="e")
+        tk.Label(self.pf_result, text="التكلفة = الوارد أولًا يُصرف أولًا (أقدم بضاعة بسعرها الأول، وبعدها اللي بعدها بسعرها) — بدون خصومات المشتريات. إجمالي الربح = المبيعات − المرتجعات − التكلفة − الخصومات. صافي الربح = إجمالي الربح − المصروفات − المرتبات − السلف − الهالك − عمولات المناديب.", bg=BG, fg="#50647b", font=("Tahoma", 11), wraplength=1200, justify="right").pack(anchor="e")
+
+    def compare_dialog(self):
+        try: start = check_date(self.pf_from.get()); end = check_date(self.pf_to.get())
+        except ValueError: return messagebox.showerror("خطأ", "صيغة التاريخ غير صحيحة (YYYY-MM-DD)")
+        win = tk.Toplevel(self); win.title("مقارنة الأرباح"); win.geometry("860x560"); win.configure(bg=BG); win.transient(self)
+        mode = tk.StringVar(value="الشهر السابق"); cf = tk.StringVar(); ct = tk.StringVar()
+        top = tk.Frame(win, bg=BG); top.pack(fill="x", padx=15, pady=10)
+        self.field(top, "طريقة المقارنة", mode, ["الفترة السابقة بنفس الطول", "الشهر السابق", "فترة أخرى"])
+        self.field(top, "من تاريخ (فترة أخرى)", cf); self.field(top, "إلى تاريخ (فترة أخرى)", ct)
+        info = tk.Label(win, text="", bg=BG, fg=NAVY, font=("Tahoma", 12, "bold")); info.pack(anchor="e", padx=15)
+        box = tk.Frame(win, bg=BG); box.pack(fill="both", expand=True, padx=15, pady=8)
+        def run():
+            for w in box.winfo_children(): w.destroy()
+            s = date.fromisoformat(start); e = date.fromisoformat(end); m = mode.get()
+            if m == "الفترة السابقة بنفس الطول":
+                n = (e - s).days + 1; pe = s - timedelta(days=1); pb = pe - timedelta(days=n - 1)
+            elif m == "الشهر السابق":
+                pe = s.replace(day=1) - timedelta(days=1); pb = pe.replace(day=1)
+            else:
+                try: pb = date.fromisoformat(check_date(cf.get())); pe = date.fromisoformat(check_date(ct.get()))
+                except ValueError: return messagebox.showerror("خطأ", "اكتب تواريخ فترة المقارنة بصيغة YYYY-MM-DD", parent=win)
+            if pb > pe: return messagebox.showerror("خطأ", "تاريخ بداية المقارنة بعد نهايتها", parent=win)
+            a = profit_summary(start, end); b = profit_summary(pb.isoformat(), pe.isoformat())
+            info.config(text=f"الحالية: {start} ← {end}        المقارنة: {pb} ← {pe}")
+            t = self.tree(box, ("m", "cur", "prev", "diff", "pct"), ("البند", "الفترة الحالية", "فترة المقارنة", "الفرق", "النسبة %"), [250, 130, 130, 130, 100])
+            t.tag_configure("key", font=("Tahoma", 12, "bold"), foreground="#123b67")
+            for (label, x), (_, y) in zip(metric_rows(a), metric_rows(b)):
+                d = x - y; pct = f"{(d / abs(y) * 100):+.1f}%" if abs(y) > 1e-9 else "—"
+                t.insert("", "end", values=(label, fmt(x), fmt(y), f"{d:+,.2f}", pct), tags=("key",) if ("Total" in label or label == "صافي الربح") else ())
+        ttk.Button(top, text="قارن", command=run).pack(side="right", padx=8, pady=14)
+        run()
+
+    # ================= التقرير اليومي =================
+    def show_daily(self):
+        self.clear(); self.title_label("التقرير اليومي")
+        bar = tk.Frame(self.body, bg=BG); bar.pack(fill="x", pady=2)
+        self.dr_date = tk.StringVar(value=date.today().isoformat())
+        self.field(bar, "التاريخ YYYY-MM-DD", self.dr_date)
+        ttk.Button(bar, text="عرض", command=self.render_daily).pack(side="right", padx=6, pady=18)
+        ttk.Button(bar, text="طباعة", command=self.print_daily).pack(side="right", padx=4, pady=18)
+        self.dr_box = tk.Frame(self.body, bg=BG); self.dr_box.pack(fill="both", expand=True)
+        self.render_daily()
+
+    def render_daily(self):
+        for w in self.dr_box.winfo_children(): w.destroy()
+        try: day = check_date(self.dr_date.get())
+        except ValueError: return messagebox.showerror("خطأ", "صيغة التاريخ غير صحيحة (YYYY-MM-DD)")
+        self.dr_rows = daily_rows(day); self.dr_day = day
+        t = self.tree(self.dr_box, ("l", "v"), ("البند", "القيمة"), [520, 200])
+        t.tag_configure("h", background="#dbe7f4", font=("Tahoma", 12, "bold")); t.tag_configure("b", font=("Tahoma", 12, "bold"), foreground="#123b67")
+        for kind, label, val in self.dr_rows: t.insert("", "end", values=(label, val), tags=(kind,) if kind in ("h", "b") else ())
+
+    def print_daily(self):
+        if not hasattr(self, "dr_rows"): return
+        with db() as c: s = c.execute("SELECT * FROM settings WHERE id=1").fetchone()
+        body = ""
+        for kind, label, val in self.dr_rows:
+            if kind == "h": body += f"<tr><th colspan='2'>{esc(label)}</th></tr>"
+            else: body += f"<tr{' class=b' if kind == 'b' else ''}><td>{esc(label)}</td><td>{esc(val)}</td></tr>"
+        html = f"""<!doctype html><html lang="ar" dir="rtl"><meta charset="utf-8"><title>تقرير يومي</title><style>
+        @page{{size:A4;margin:0}}*{{box-sizing:border-box}}body{{font-family:Tahoma,Arial,sans-serif;font-size:14px;color:#111;margin:0 auto;padding:12mm;width:210mm}}@media screen{{body{{width:auto;max-width:210mm}}}}
+        h1,h2{{text-align:center;margin:4px}}table{{width:100%;border-collapse:collapse;margin-top:10px}}
+        th,td{{border:1px solid #555;padding:5px 8px;text-align:right}}th{{background:#ddd}}tr.b td{{font-weight:bold;background:#f3f3f3}}</style>
+        <h1>{esc(s['company']) or 'اسم الشركة'}</h1><h2>التقرير اليومي — {esc(self.dr_day)}</h2><table>{body}</table></html>"""
+        path = os.path.join(PRINT_DIR, f"daily_{self.dr_day}.html")
+        with open(path, "w", encoding="utf-8") as f: f.write(html)
+        print_page(path)
+
+    # ================= سجل النشاط =================
+    def show_log(self):
+        self.clear(); self.title_label("سجل النشاط (للقراءة فقط)")
+        with db() as c: acts = ["الكل"] + [r[0] for r in c.execute("SELECT DISTINCT action FROM audit_log ORDER BY action")]
+        bar = tk.Frame(self.body, bg=BG); bar.pack(fill="x")
+        self.lg_from = tk.StringVar(value=(date.today() - timedelta(days=7)).isoformat()); self.lg_to = tk.StringVar(value=date.today().isoformat())
+        self.lg_act = tk.StringVar(value="الكل"); self.lg_q = tk.StringVar()
+        self.field(bar, "من", self.lg_from); self.field(bar, "إلى", self.lg_to); self.field(bar, "العملية", self.lg_act, acts); self.field(bar, "بحث في التفاصيل", self.lg_q)
+        ttk.Button(bar, text="عرض", command=self.refresh_log).pack(side="right", padx=6, pady=18)
+        self.lg_tree = self.tree(self.body, ("at", "user", "act", "det"), ("الوقت", "المستخدم", "العملية", "التفاصيل"), [150, 110, 160, 650])
+        self.lg_tree.bind("<Double-1>", lambda e: self.lg_tree.selection() and messagebox.showinfo("تفاصيل العملية", "\n".join(str(x) for x in self.lg_tree.item(self.lg_tree.selection()[0], "values"))))
+        self.refresh_log()
+
+    def refresh_log(self):
+        for x in self.lg_tree.get_children(): self.lg_tree.delete(x)
+        try: s = check_date(self.lg_from.get()); e = check_date(self.lg_to.get())
+        except ValueError: return messagebox.showerror("خطأ", "صيغة التاريخ غير صحيحة (YYYY-MM-DD)")
+        q = self.lg_q.get().strip().lower(); act = self.lg_act.get()
+        with db() as c: rows = c.execute("SELECT * FROM audit_log WHERE substr(at,1,10) BETWEEN ? AND ? ORDER BY id DESC", (s, e)).fetchall()
+        for r in rows:
+            if act != "الكل" and r["action"] != act: continue
+            if q and q not in (r["details"] or "").lower(): continue
+            self.lg_tree.insert("", "end", values=(r["at"], r["user"], r["action"], r["details"]))
+
+    # ================= إيصال أمانة (نموذج فاضي للطباعة والكتابة باليد) =================
+    def print_trust_form(self):
+        with db() as c: st = c.execute("SELECT trust_from,trust_to,trust_to_addr FROM settings WHERE id=1").fetchone()
+        t_from, t_to, t_addr = (st["trust_from"] or ""), (st["trust_to"] or ""), (st["trust_to_addr"] or "")
+        dots = lambda w: f'<span class="dots" style="width:{w}"></span>'
+        html = f"""<!doctype html><html lang="ar" dir="rtl"><meta charset="utf-8"><title>إيصال أمانة</title><style>
+        @page{{size:A4;margin:0}}*{{box-sizing:border-box}}
+        body{{margin:0;font-family:Arial,Tahoma,sans-serif;color:#111;background:white}}
+        .page{{width:210mm;height:296mm;padding:12mm 12mm;margin:0 auto;overflow:hidden}}
+        .frame{{border:1.5px solid #333;border-radius:10px;height:272mm;padding:9mm 10mm;position:relative}}
+        h1{{text-align:center;font-size:30px;margin:0;letter-spacing:3px}}
+        .sub{{text-align:center;font-size:12px;color:#555;margin:2mm 0 4mm}}
+        .rule{{border-top:2.5px solid #111;margin-bottom:8mm}}
+        .ln{{font-size:15px;font-weight:bold;margin:0 0 6mm;display:flex;align-items:flex-end;gap:3mm}}
+        .dots{{display:inline-block;border-bottom:1.5px dotted #777;height:5mm}}
+        .gap{{height:5mm}}
+        .warn{{border:1px solid #bbb;border-right:5px solid #111;border-radius:6px;padding:5mm 5mm;font-size:15px;font-weight:bold;margin:6mm 0 8mm;line-height:1.7}}
+        .boxes{{display:flex;gap:9mm}}
+        .box{{flex:1;border:1px solid #ccc;border-radius:8px;padding:4mm 6mm 5mm;min-height:62mm}}
+        .box h3{{text-align:center;font-size:15px;margin:0 0 5mm;padding-bottom:3mm;border-bottom:1px solid #ddd}}
+        .row{{font-size:13px;font-weight:bold;margin:0 0 5mm;display:flex;align-items:flex-end;gap:2mm}}
+        .row .dots{{flex:1}}
+        .thumb{{width:28mm;height:32mm;border:2px dashed #888;border-radius:6px;margin:6mm auto 0;display:flex;align-items:center;justify-content:center;font-size:11px;color:#777}}
+        @media screen{{body{{background:#e9eef4}}.page{{background:white;margin:12px auto;box-shadow:0 2px 9px #0002}}}}
+        </style><div class="page"><div class="frame">
+        <h1>إيصـال أمـانـة</h1>
+        <div class="sub">محرر وفقاً لأحكام القانون</div>
+        <div class="rule"></div>
+        <div class="ln">استلمت أنا / {dots('105mm')}</div>
+        <div class="ln">المقيم في / {dots('105mm')}</div>
+        <div class="ln">والحامل لبطاقة رقم قومي / {dots('75mm')}</div>
+        <div class="ln">مبلغاً وقدره / {dots('45mm')} ج.م</div>
+        <div class="ln">(فقط وقدره: {dots('120mm')} لا غير)</div>
+        <div class="gap"></div>
+        <div class="ln">وذلك من السيد / {esc(t_from)}</div>
+        <div class="gap"></div>
+        <div class="ln">وذلك على سبيل الأمانة لتسليمها إلى السيد / {esc(t_to)}</div>
+        <div class="ln">المقيم في / {esc(t_addr)}</div>
+        <div class="warn">وفي حالة عدم تسليم المبلغ المذكور أكون خائناً للأمانة وأتحمل كافة العواقب القانونية المترتبة على ذلك.</div>
+        <div class="boxes">
+          <div class="box"><h3>بيانات وتوقيع المستلم (المقر)</h3>
+            <div class="row">الاسم: {dots('auto')}</div>
+            <div class="row">التوقيع: {dots('auto')}</div>
+            <div class="row">التاريخ: {dots('auto')}</div>
+            <div class="thumb">بصمة الإبهام</div></div>
+          <div class="box"><h3>بيانات الشاهد</h3>
+            <div class="row">الاسم: {dots('auto')}</div>
+            <div class="row">رقم القومي: {dots('auto')}</div>
+            <div class="row">التوقيع: {dots('auto')}</div></div>
+        </div>
+        </div></div></html>"""
+        path = os.path.join(PRINT_DIR, "trust_form.html")
+        with open(path, "w", encoding="utf-8") as fh: fh.write(html)
+        print_page(path)
+        with db() as c: log(c, "طباعة إيصال أمانة", "نموذج فاضي")
+        self.status.config(text="تم فتح إيصال الأمانة للطباعة (Ctrl+P)")
+
+    # ================= الصندوق الفرعي (منفصل تمامًا عن الخزنة وأي حسابات) =================
+    def show_subcash(self):
+        self.clear(); self.title_label("الصندوق الفرعي")
+        tk.Label(self.body, text="صندوق منفصل: الإيداع والسحب هنا مش بيظهروا في الخزنة ولا الأرباح ولا التقارير ولا أي حساب تاني.",
+                 bg=BG, fg="#50647b", font=("Tahoma", 11)).pack(anchor="e")
+        self.sc_tiles = self.color_tiles(self.body, [("bal", "رصيد الصندوق الفرعي", "#0d9488"), ("inn", "الوارد في الفترة", "#16a34a"),
+                                                     ("out", "الصادر في الفترة", "#ef4444")], size=20)
+        form = tk.LabelFrame(self.body, text="حركة جديدة", padx=12, pady=8); form.pack(fill="x", pady=6)
+        self.sc_kind = tk.StringVar(value="إيداع"); self.sc_date = tk.StringVar(value=date.today().isoformat())
+        self.sc_amount = tk.StringVar(); self.sc_notes = tk.StringVar()
+        row = tk.Frame(form); row.pack(fill="x")
+        self.field(row, "النوع", self.sc_kind, ["إيداع", "سحب"])
+        self.field(row, "التاريخ", self.sc_date)
+        self.field(row, "المبلغ", self.sc_amount)
+        self.field(row, "البيان / ملاحظات", self.sc_notes)
+        ttk.Button(row, text="حفظ", command=self.save_subcash).pack(side="right", padx=8, pady=(22, 0))
+        flt = tk.Frame(self.body, bg=BG); flt.pack(fill="x", pady=(0, 4))
+        self.sc_from = tk.StringVar(value=date.today().replace(day=1).isoformat()); self.sc_to = tk.StringVar(value=date.today().isoformat())
+        self.field(flt, "من تاريخ", self.sc_from); self.field(flt, "إلى تاريخ", self.sc_to)
+        ttk.Button(flt, text="عرض", command=self.refresh_subcash).pack(side="right", padx=6, pady=(22, 0))
+        self.sc_tree = self.tree(self.body, ("date", "time", "what", "inn", "out", "bal"), ("التاريخ", "الوقت", "البيان", "وارد", "صادر", "الرصيد"), [110, 90, 480, 140, 140, 150])
+        bar = tk.Frame(self.body, bg=BG); bar.pack(fill="x", pady=4)
+        ttk.Button(bar, text="حذف الحركة المحددة", command=self.delete_subcash).pack(side="right", padx=4)
+        self.refresh_subcash()
+
+    def save_subcash(self):
+        try: amt = float(self.sc_amount.get()); d = check_date(self.sc_date.get())
+        except ValueError: return messagebox.showerror("خطأ", "راجع المبلغ والتاريخ")
+        if amt <= 0: return messagebox.showerror("خطأ", "المبلغ لازم يكون أكبر من صفر")
+        kind = self.sc_kind.get()
+        with db() as c:
+            bal = float(c.execute("SELECT COALESCE(SUM(CASE WHEN kind='إيداع' THEN amount ELSE -amount END),0) FROM sub_cash").fetchone()[0])
+            if kind == "سحب" and amt > bal + 0.005 and not messagebox.askyesno("رصيد غير كافٍ", f"رصيد الصندوق الفرعي {fmt(bal)} بس.\nتكمّل السحب ويبقى الرصيد بالسالب؟"): return
+            c.execute("INSERT INTO sub_cash(m_date,created_at,kind,amount,notes) VALUES(?,?,?,?,?)", (d, now_ts(), kind, amt, self.sc_notes.get().strip()))
+            log(c, "الصندوق الفرعي", f"{kind} {fmt(amt)} بتاريخ {d}" + (f" — {self.sc_notes.get().strip()}" if self.sc_notes.get().strip() else ""))
+        self.sc_amount.set(""); self.sc_notes.set(""); self.refresh_subcash()
+        self.status.config(text=f"✔ تم تسجيل {kind} {fmt(amt)} في الصندوق الفرعي")
+
+    def refresh_subcash(self):
+        for x in self.sc_tree.get_children(): self.sc_tree.delete(x)
+        try: s = check_date(self.sc_from.get()); e = check_date(self.sc_to.get())
+        except ValueError: return messagebox.showerror("خطأ", "صيغة التاريخ غير صحيحة")
+        with db() as c: rows = c.execute("SELECT * FROM sub_cash ORDER BY m_date, id").fetchall()
+        bal = sum(float(r["amount"]) * (1 if r["kind"] == "إيداع" else -1) for r in rows if r["m_date"] < s)
+        self.sc_tree.insert("", "end", iid="open", values=("", "", "رصيد سابق (مرحّل)", "", "", fmt(bal)))
+        tin = tout = 0.0
+        for r in rows:
+            if not (s <= r["m_date"] <= e): continue
+            a = float(r["amount"]); inn = r["kind"] == "إيداع"
+            bal += a if inn else -a; tin += a if inn else 0; tout += 0 if inn else a
+            self.sc_tree.insert("", "end", iid=str(r["id"]), values=(r["m_date"], fmt_time(r["created_at"]), r["kind"] + (f" — {r['notes']}" if r["notes"] else ""),
+                                                                    fmt(a) if inn else "", "" if inn else fmt(a), fmt(bal)))
+        total = sum(float(r["amount"]) * (1 if r["kind"] == "إيداع" else -1) for r in rows)
+        self.sc_tiles["bal"].config(text=fmt(total)); self.sc_tiles["inn"].config(text=fmt(tin)); self.sc_tiles["out"].config(text=fmt(tout))
+
+    def delete_subcash(self):
+        sel = self.sc_tree.selection()
+        if not sel or sel[0] == "open": return messagebox.showwarning("تنبيه", "حدد حركة أولًا")
+        rid = int(sel[0])
+        if not messagebox.askyesno("تأكيد", "حذف الحركة المحددة من الصندوق الفرعي؟"): return
+        with db() as c:
+            r = c.execute("SELECT * FROM sub_cash WHERE id=?", (rid,)).fetchone()
+            c.execute("DELETE FROM sub_cash WHERE id=?", (rid,))
+            if r: log(c, "حذف حركة صندوق فرعي", f"{r['kind']} {fmt(r['amount'])} بتاريخ {r['m_date']}")
+        self.refresh_subcash()
+
+    # ================= تقرير المناديب =================
+    def rep_moves(self, c, rep_key, s, e):
+        """حركات مندوب في فترة: فواتير مبيعات + سندات تحصيل. rep_key = 0 للمكتب."""
+        rows = []
+        for r in c.execute(f"SELECT i.id,i.inv_date d,i.created_at,i.number,p.name pname,{NET_SQL} amt,{INV_BAGS_SQL} q,{INV_TONS_SQL} t,{COMM_AMT_SQL} cq,1 rate FROM invoices i LEFT JOIN parties p ON p.id=i.party_id "
+                           "WHERE i.kind='مبيعات' AND COALESCE(i.rep_id,0)=? AND COALESCE(NULLIF(i.due_date,''), i.inv_date) BETWEEN ? AND ?", (rep_key, s, e)):
+            rows.append((r["d"], r["created_at"] or "", f"0-{r['id']}", "فاتورة مبيعات", r["number"], r["pname"] or "", float(r["amt"]), 0.0, float(r["q"]), float(r["cq"]) * float(r["rate"]), float(r["t"])))
+        for r in c.execute("SELECT p.id,p.pay_date d,p.created_at,p.amount,pt.name pname FROM payments p JOIN parties pt ON pt.id=p.party_id "
+                           "WHERE p.kind='تحصيل' AND COALESCE(p.rep_id,0)=? AND p.pay_date BETWEEN ? AND ?", (rep_key, s, e)):
+            rows.append((r["d"], r["created_at"] or "", f"1-{r['id']}", "سند تحصيل", f"سند {r['id']}", r["pname"], 0.0, float(r["amount"]), 0.0, 0.0, 0.0))
+        rows.sort(key=lambda x: (x[0], x[1], x[2]))
+        return rows
+
+    def show_reps(self):
+        self.clear(); self.title_label("تقرير المناديب")
+        bar = tk.Frame(self.body, bg=BG); bar.pack(fill="x", pady=2)
+        self.rp_from = tk.StringVar(value=date.today().replace(day=1).isoformat()); self.rp_to = tk.StringVar(value=date.today().isoformat())
+        self.field(bar, "من تاريخ", self.rp_from); self.field(bar, "إلى تاريخ", self.rp_to)
+        ttk.Button(bar, text="عرض التقرير", command=self.render_reps).pack(side="right", padx=6, pady=18)
+        tk.Label(self.body, text="المبيعات = صافي فواتير المبيعات باسم المندوب (المرتجعات لا تُخصم)  •  العمولة = الكمية × عمولة المندوب وقت الفاتورة  •  المستحق على عملائه = أرصدة العملاء المربوطين بيه  •  ضغطتين = التفاصيل",
+                 bg=BG, fg="#50647b", font=("Tahoma", 11)).pack(anchor="e")
+        self.rp_box = tk.Frame(self.body, bg=BG); self.rp_box.pack(fill="both", expand=True)
+        self.render_reps()
+
+    def render_reps(self):
+        for w in self.rp_box.winfo_children(): w.destroy()
+        try: s = check_date(self.rp_from.get()); e = check_date(self.rp_to.get())
+        except ValueError: return messagebox.showerror("خطأ", "صيغة التاريخ غير صحيحة (YYYY-MM-DD)")
+        if s > e: return messagebox.showerror("خطأ", "تاريخ البداية بعد تاريخ النهاية")
+        with db() as c:
+            reps = c.execute("SELECT id,name,phone FROM employees WHERE kind='مندوب' OR id IN (SELECT rep_id FROM invoices WHERE rep_id IS NOT NULL) "
+                             "OR id IN (SELECT rep_id FROM payments WHERE rep_id IS NOT NULL) ORDER BY name").fetchall()
+            data = []
+            for key, name in [(r["id"], r["name"]) for r in reps] + [(0, OFFICE)]:
+                mv = self.rep_moves(c, key, s, e)
+                n = sum(1 for m in mv if m[2].startswith("0-"))
+                qty = sum(m[8] for m in mv); tons = sum(m[10] for m in mv); comm = sum(m[9] for m in mv)
+                due_all = (lambda ep: ep[0] - ep[1])(rep_commission(c, key)) if key else 0.0
+                cust_due, _ = rep_customers_due(c, key)
+                data.append(dict(key=key, name=name, n=n, qty=qty, tons=tons, sales=sum(m[6] for m in mv), col=sum(m[7] for m in mv), cust=cust_due, comm=comm, due=due_all))
+        tree = self.tree(self.rp_box, ("id", "name", "n", "tons", "qty", "sales", "col", "cust", "comm", "due"),
+                         ("ID", "المندوب", "عدد الفواتير", "الكمية (طن)", "الكمية (شيكارة)", "المبيعات", "التحصيلات", "المستحق على عملائه (الآن)", "عمولة الفترة", "عمولة باقية له (الآن)"),
+                         [40, 160, 80, 90, 105, 120, 120, 160, 105, 140])
+        for d in data:
+            tree.insert("", "end", iid=str(d["key"]), values=(d["key"] or "", d["name"], d["n"], fmt(d["tons"]), fmt(d["qty"]), fmt(d["sales"]), fmt(d["col"]), fmt(d["cust"]),
+                                                              fmt(d["comm"]) if d["key"] else "—", fmt(d["due"]) if d["key"] else "—"))
+        tree.bind("<Double-1>", lambda ev: tree.selection() and self.rep_detail(int(tree.selection()[0]), s, e))
+        self.total_bar(self.rp_box, [("عدد الفواتير", str(sum(d["n"] for d in data))), ("الكمية", qty_text(sum(d["qty"] for d in data), sum(d["tons"] for d in data))),
+                                     ("المبيعات", fmt(sum(d["sales"] for d in data))), ("التحصيلات", fmt(sum(d["col"] for d in data))),
+                                     ("المستحق على العملاء", fmt(sum(d["cust"] for d in data))), ("عمولات الفترة", fmt(sum(d["comm"] for d in data)))])
+
+    def show_targets(self):
+        self.clear(); self.title_label("🎯 تارجت المناديب الشهري")
+        tk.Label(self.body, text="المحقق = الكمية المباعة في فواتير المبيعات باسم المندوب في الشهر ده (الطن = 20 شيكارة، والمرتجعات مش بتتخصم)  •  التارجت بالطن أو بالشيكارة، وبيفضل ساري للشهور اللي بعده لحد ما تغيّره  •  ضغطتين = تحديد التارجت",
+                 bg=BG, fg="#50647b", font=("Tahoma", 11), wraplength=1150, justify="right").pack(anchor="e")
+        bar = tk.Frame(self.body, bg=BG); bar.pack(fill="x", pady=6)
+        today = date.today(); months = []
+        y, m = today.year, today.month + 1
+        if m == 13: y, m = y + 1, 1
+        for _ in range(14):
+            months.append(f"{y:04d}-{m:02d}"); m -= 1
+            if m == 0: y, m = y - 1, 12
+        self.tg_month = tk.StringVar(value=today.strftime("%Y-%m"))
+        tk.Label(bar, text="الشهر:", bg=BG).pack(side="right", padx=4)
+        ttk.Combobox(bar, textvariable=self.tg_month, values=months, state="readonly", width=10, justify="center").pack(side="right")
+        if is_owner():
+            ttk.Button(bar, text="تحديد التارجت للمندوب المحدد", command=lambda: self.set_target()).pack(side="right", padx=12)
+            ttk.Button(bar, text="🗑 إلغاء التارجت", command=self.clear_target).pack(side="right", padx=4)
+        self.tg_box = tk.Frame(self.body, bg=BG); self.tg_box.pack(fill="both", expand=True)
+        self.tg_month.trace_add("write", lambda *a: self.render_targets())
+        self.render_targets()
+
+    def clear_target(self):
+        t = getattr(self, "tg_tree", None); sel = t.selection() if t else ()
+        if not sel: return messagebox.showwarning("تنبيه", "حدد المندوب من الجدول الأول")
+        rid = int(sel[0]); month = self.tg_month.get(); name = t.item(sel[0])["values"][1]
+        if not messagebox.askyesno("إلغاء التارجت", f"تلغي تارجت «{name}» من شهر {month}؟\n(الشهور اللي قبله زي ما هي)"): return
+        with db() as c:
+            c.execute("DELETE FROM rep_targets WHERE rep_id=? AND month>=?", (rid, month))
+            c.execute("INSERT INTO rep_targets(rep_id,month,qty,unit) VALUES(?,?,?,?)", (rid, month, 0, "شيكارة"))
+            log(c, "إلغاء تارجت", f"{name} من {month}")
+        self.render_targets()
+
+    def render_targets(self):
+        for w in self.tg_box.winfo_children(): w.destroy()
+        month = self.tg_month.get(); s, e = month_bounds(month)
+        with db() as c: rows = target_rows(c, month)
+        today = date.today().isoformat()
+        days_left = (date.fromisoformat(e) - max(date.fromisoformat(s), date.today())).days + 1 if today <= e else 0
+        tree = self.tree(self.tg_box, ("id", "name", "target", "done", "both", "pct", "left", "per_day"),
+                         ("ID", "المندوب", "التارجت", "المحقق", "المحقق بالطن والشيكارة", "النسبة", "الباقي", "المطلوب في اليوم"), [40, 180, 130, 120, 210, 80, 120, 150])
+        tree.tag_configure("ok", foreground="#1c7c4d"); tree.tag_configure("mid", foreground="#9a6700"); tree.tag_configure("low", foreground="#b91c1c")
+        for rid, name, tgt, unit, done, bags, tons in rows:
+            pct = (done / tgt * 100) if tgt > 0 else 0; left = max(tgt - done, 0)
+            tag = () if tgt <= 0 else (("ok",) if pct >= 100 else ("mid",) if pct >= 60 else ("low",))
+            tree.insert("", "end", iid=str(rid), values=(rid, name, f"{fmt(tgt)} {unit}" if tgt else "— (مش متحدد)", f"{fmt(done)} {unit}" if tgt else "", qty_text(bags, tons),
+                                                         f"{pct:.0f}%" if tgt else "", f"{fmt(left)} {unit}" if tgt else "",
+                                                         (f"{fmt(left / days_left)} {unit}" if days_left and left else ("✔ حقق التارجت" if tgt and not left else "")) if tgt else ""), tags=tag)
+        if is_owner(): tree.bind("<Double-1>", lambda ev: tree.selection() and self.set_target(int(tree.selection()[0])))
+        self.tg_tree = tree
+        # الإجماليات بالطن (التارجت اللي بالشيكارة بيتحوّل)
+        tot_t = sum((r[2] if r[3] == "طن" else r[2] / BAGS_PER_TON) for r in rows if r[2] > 0)
+        tot_d = sum(r[6] for r in rows if r[2] > 0)
+        self.total_bar(self.tg_box, [("إجمالي التارجت", f"{fmt(tot_t)} طن"), ("إجمالي المحقق", qty_text(sum(r[5] for r in rows), sum(r[6] for r in rows))),
+                                     ("النسبة", f"{(tot_d / tot_t * 100) if tot_t else 0:.0f}%"), ("أيام باقية في الشهر", str(days_left))])
+
+    def set_target(self, rep_id=None):
+        if not is_owner(): return
+        if rep_id is None:
+            sel = self.tg_tree.selection()
+            if not sel: return messagebox.showwarning("تنبيه", "حدد مندوب من الجدول الأول")
+            rep_id = int(sel[0])
+        month = self.tg_month.get()
+        with db() as c: name = rep_name_of(c, rep_id); cur, cunit = rep_target(c, rep_id, month)
+        w = tk.Toplevel(self); w.title("التارجت"); w.configure(bg=BG); w.resizable(False, False); _center(w, 440, 260); w.transient(self); w.grab_set()
+        tk.Label(w, text=f"تارجت «{name}» من شهر {month}", font=("Tahoma", 14, "bold"), bg=BG, fg=NAVY).pack(pady=(12, 2))
+        tk.Label(w, text="هيفضل ساري للشهور اللي بعده لحد ما تغيّره — اكتب 0 لإلغائه", bg=BG, fg="#50647b", font=("Tahoma", 10)).pack()
+        row = tk.Frame(w, bg=BG); row.pack(pady=12)
+        qv = tk.StringVar(value=fmt(cur).replace(",", "") if cur else ""); uv = tk.StringVar(value=cunit)
+        ttk.Combobox(row, textvariable=uv, values=list(COMM_UNITS), state="readonly", width=8, justify="center").pack(side="left", padx=6)
+        e = ttk.Entry(row, textvariable=qv, width=14, justify="center"); e.pack(side="left"); e.focus_set()
+        hint = tk.Label(w, text="", bg=BG, fg="#1c7c4d", font=("Tahoma", 11)); hint.pack()
+        def upd(*a):
+            try: q = float(qv.get().replace(",", "") or 0)
+            except ValueError: return hint.config(text="")
+            hint.config(text=(f"= {fmt(q * BAGS_PER_TON)} شيكارة" if uv.get() == "طن" else f"= {fmt(q / BAGS_PER_TON)} طن") if q else "")
+        qv.trace_add("write", upd); uv.trace_add("write", upd); upd()
+        def ok(*a):
+            try: q = float(qv.get().replace(",", "").strip() or 0)
+            except ValueError: return messagebox.showerror("خطأ", "اكتب رقم", parent=w)
+            if q < 0: return messagebox.showerror("خطأ", "التارجت مينفعش يكون بالسالب", parent=w)
+            unit = uv.get() if uv.get() in COMM_UNITS else "طن"
+            with db() as c:
+                c.execute("DELETE FROM rep_targets WHERE rep_id=? AND month=?", (rep_id, month))
+                c.execute("INSERT INTO rep_targets(rep_id,month,qty,unit) VALUES(?,?,?,?)", (rep_id, month, q, unit))
+                log(c, "تحديد تارجت مندوب", f"{name}: {fmt(q)} {unit} من شهر {month}")
+            w.destroy(); self.render_targets(); self.status.config(text=f"✔ تارجت {name} = {fmt(q)} {unit} من شهر {month}")
+        e.bind("<Return>", ok)
+        ttk.Button(w, text="حفظ", command=ok).pack(pady=6)
+
+    # ================= العربيات =================
+    def show_vehicles(self):
+        self.clear(); self.title_label("🚚 العربيات")
+        real_body = self.body; self.body = self.scroll_area()   # الشاشة بتتسكرول في الشاشات الصغيرة
+        try: self._vehicles_content()
+        finally: self.body = real_body
+
+    def _vehicles_content(self):
+        tk.Label(self.body, text="سجّل قراءة العداد كل يوم، ومع كل تموين أو صيانة.  المصروف بيتسجل لوحده في المصروفات ويتخصم من الخزنة.  ضغطتين على عربية = تعديلها",
+                 bg=BG, fg="#50647b", font=("Tahoma", 11), wraplength=1150, justify="right").pack(anchor="e")
+        with db() as c: vs = c.execute("SELECT * FROM vehicles ORDER BY COALESCE(active,1) DESC, name").fetchall()
+        self.veh_lookup = {(r["name"] + (f" ({r['plate']})" if r["plate"] else "")): r["id"] for r in vs if (r["active"] if r["active"] is not None else 1)}
+        top = tk.Frame(self.body, bg=BG); top.pack(fill="x")
+        vf = tk.LabelFrame(top, text="العربيات", padx=8, pady=4); vf.pack(fill="x")
+        # ----- تسجيل حركة -----
+        form = tk.LabelFrame(top, text="تسجيل (قراءة عداد / تموين / صيانة …)", padx=10, pady=6); form.pack(fill="x", pady=(6, 0))
+        self.vl = {k: tk.StringVar() for k in ("veh", "date", "kind", "odo", "liters", "amount", "notes")}
+        self.vl["date"].set(date.today().isoformat()); self.vl["kind"].set("قراءة عداد")
+        r1 = tk.Frame(form); r1.pack(fill="x")
+        self.field(r1, "العربية", self.vl["veh"], list(self.veh_lookup))
+        self.field(r1, "التاريخ", self.vl["date"])
+        self.field(r1, "النوع", self.vl["kind"], list(VEHICLE_KINDS))
+        r2 = tk.Frame(form); r2.pack(fill="x")
+        self.field(r2, "قراءة العداد (كم)", self.vl["odo"])
+        self.field(r2, "اللترات (للبنزين/الجاز)", self.vl["liters"])
+        self.field(r2, "المبلغ", self.vl["amount"])
+        self.field(r2, "ملاحظات", self.vl["notes"])
+        b = tk.Frame(form); b.pack(fill="x", pady=(4, 0))
+        ttk.Button(b, text="حفظ", command=self.save_vehicle_log).pack(side="right")
+        self.vl_last = tk.Label(b, text="", anchor="e", fg="#50647b", font=("Tahoma", 11)); self.vl_last.pack(side="right", padx=12)
+        self.vl["veh"].trace_add("write", lambda *a: self.vehicle_selected())
+        # ----- العربيات -----
+        vrow = tk.Frame(vf); vrow.pack(fill="x")
+        self.veh_tree = self.tree(vrow, ("id", "name", "plate", "driver", "st"), ("ID", "العربية", "النمرة", "السواق", "الحالة"), [45, 220, 140, 180, 90], height=2)
+        for r in vs: self.veh_tree.insert("", "end", iid=str(r["id"]), values=(r["id"], r["name"], r["plate"] or "", r["driver"] or "", "شغالة" if (r["active"] if r["active"] is not None else 1) else "متوقفة"))
+        vb = tk.Frame(vf); vb.pack(fill="x", pady=(2, 0))
+        ttk.Button(vb, text="عربية جديدة", command=lambda: self.vehicle_dialog(None)).pack(side="right")
+        ttk.Button(vb, text="تعديل", command=lambda: self.veh_tree.selection() and self.vehicle_dialog(int(self.veh_tree.selection()[0]))).pack(side="right", padx=4)
+        ttk.Button(vb, text="🗑 حذف العربية", command=self.delete_vehicle).pack(side="left", padx=4)
+        self.veh_tree.bind("<Double-1>", lambda e: self.veh_tree.selection() and self.vehicle_dialog(int(self.veh_tree.selection()[0])))
+        self.veh_tree.bind("<<TreeviewSelect>>", lambda e: self.veh_tree.selection() and self.vl["veh"].set(next((k for k, v in self.veh_lookup.items() if v == int(self.veh_tree.selection()[0])), self.vl["veh"].get())))
+        # ----- السجل والملخص -----
+        flt = tk.Frame(self.body, bg=BG); flt.pack(fill="x", pady=(8, 2))
+        self.vf_from = tk.StringVar(value=date.today().replace(day=1).isoformat()); self.vf_to = tk.StringVar(value=date.today().isoformat())
+        self.field(flt, "من تاريخ", self.vf_from); self.field(flt, "إلى تاريخ", self.vf_to)
+        ttk.Button(flt, text="عرض", command=self.refresh_vehicle_logs).pack(side="right", padx=6, pady=(22, 0))
+        ttk.Button(flt, text="حذف السطر المحدد", command=self.delete_vehicle_log).pack(side="left", pady=(22, 0))
+        self.vsum = tk.Frame(self.body, bg=BG); self.vsum.pack(fill="x")
+        self.vlog_tree = self.tree(self.body, ("id", "date", "veh", "kind", "odo", "km", "liters", "amount", "notes"),
+                                   ("رقم", "التاريخ", "العربية", "النوع", "العداد", "كم من القراءة اللي قبلها", "لترات", "المبلغ", "ملاحظات"), [50, 95, 130, 100, 100, 150, 70, 100, 200], height=14)
+        if self.veh_lookup and not self.vl["veh"].get(): self.vl["veh"].set(next(iter(self.veh_lookup)))
+        self.refresh_vehicle_logs()
+
+    def vehicle_selected(self):
+        if not getattr(self, "vl_last", None) or not self.vl_last.winfo_exists(): return
+        vid = self.veh_lookup.get(self.vl["veh"].get())
+        if not vid: return self.vl_last.config(text="")
+        with db() as c:
+            r = c.execute("SELECT v_date, odometer FROM vehicle_logs WHERE vehicle_id=? AND odometer IS NOT NULL ORDER BY v_date DESC, id DESC LIMIT 1", (vid,)).fetchone()
+        self.vl_last.config(text=f"آخر قراءة عداد: {fmt(r['odometer'])} كم (يوم {r['v_date']})" if r else "لسه مفيش قراءات للعربية دي")
+        try: self.refresh_vehicle_logs()
+        except Exception: pass
+
+    def vehicle_dialog(self, vid):
+        with db() as c: r = c.execute("SELECT * FROM vehicles WHERE id=?", (vid,)).fetchone() if vid else None
+        w = tk.Toplevel(self); w.title("عربية"); w.configure(bg=BG); w.resizable(False, False); _center(w, 460, 360)
+        v = {k: tk.StringVar(value=(r[k] or "") if r else "") for k in ("name", "plate", "driver", "notes")}
+        act = tk.IntVar(value=(r["active"] if r and r["active"] is not None else 1))
+        for k, lab in (("name", "اسم العربية (مثلًا: النص نقل الأبيض)"), ("plate", "النمرة"), ("driver", "السواق"), ("notes", "ملاحظات")):
+            tk.Label(w, text=lab, bg=BG, anchor="e").pack(fill="x", padx=16); ttk.Entry(w, textvariable=v[k], justify="right").pack(fill="x", padx=16, pady=(0, 6))
+        tk.Checkbutton(w, text="شغالة", variable=act, bg=BG, anchor="e").pack(fill="x", padx=16)
+        def ok():
+            name = v["name"].get().strip()
+            if not name: return messagebox.showwarning("تنبيه", "اكتب اسم العربية", parent=w)
+            with db() as c:
+                if vid:
+                    c.execute("UPDATE vehicles SET name=?,plate=?,driver=?,notes=?,active=? WHERE id=?", (name, v["plate"].get().strip(), v["driver"].get().strip(), v["notes"].get().strip(), act.get(), vid))
+                    log(c, "تعديل عربية", name)
+                else:
+                    c.execute("INSERT INTO vehicles(name,plate,driver,notes,active,created_at) VALUES(?,?,?,?,?,?)", (name, v["plate"].get().strip(), v["driver"].get().strip(), v["notes"].get().strip(), act.get(), now_ts()))
+                    log(c, "إضافة عربية", name)
+            w.destroy(); self.show_vehicles()
+        ttk.Button(w, text="حفظ", command=ok).pack(pady=10)
+        w.transient(self); w.grab_set()
+
+    def save_vehicle_log(self):
+        vid = self.veh_lookup.get(self.vl["veh"].get())
+        if not vid: return messagebox.showwarning("تنبيه", "اختار العربية (أو ضيف عربية جديدة)")
+        try: d = check_date(self.vl["date"].get())
+        except ValueError: return messagebox.showerror("خطأ", "صيغة التاريخ غلط (YYYY-MM-DD)")
+        if d > date.today().isoformat(): return messagebox.showerror("خطأ", "مينفعش تسجّل ليوم لسه مجاش")
+        kind = self.vl["kind"].get()
+        if kind not in VEHICLE_KINDS: return messagebox.showwarning("تنبيه", "اختار النوع")
+        def num(k):
+            t = self.vl[k].get().replace(",", "").strip()
+            return float(t) if t else None
+        try: odo, liters, amount = num("odo"), num("liters") or 0.0, num("amount") or 0.0
+        except ValueError: return messagebox.showerror("خطأ", "العداد واللترات والمبلغ لازم يكونوا أرقام")
+        if kind == "قراءة عداد" and odo is None: return messagebox.showwarning("تنبيه", "اكتب قراءة العداد")
+        if kind != "قراءة عداد" and amount <= 0: return messagebox.showwarning("تنبيه", "اكتب المبلغ")
+        if odo is not None and odo < 0 or liters < 0 or amount < 0: return messagebox.showerror("خطأ", "مفيش أرقام بالسالب")
+        if amount > 0:
+            msg = check_locked(d)
+            if msg: return messagebox.showerror("الشهر مقفول", msg)
+        with db() as c:
+            if odo is not None:
+                before = c.execute("SELECT MAX(odometer) FROM vehicle_logs WHERE vehicle_id=? AND v_date<=? AND odometer IS NOT NULL", (vid, d)).fetchone()[0]
+                after = c.execute("SELECT MIN(odometer) FROM vehicle_logs WHERE vehicle_id=? AND v_date>? AND odometer IS NOT NULL", (vid, d)).fetchone()[0]
+                if (before is not None and odo < float(before)) or (after is not None and odo > float(after)):
+                    if not messagebox.askyesno("قراءة العداد", f"القراءة دي ({fmt(odo)}) مش ماشية مع القراءات التانية"
+                                               + (f" (أعلى قراءة لحد اليوم ده: {fmt(before)})" if before is not None else "") + (f" (أقل قراءة بعده: {fmt(after)})" if after is not None else "") + ".\nتحفظها برضه؟"):
+                        return
+            vname = c.execute("SELECT name FROM vehicles WHERE id=?", (vid,)).fetchone()[0]
+            exp_id = None
+            notes = self.vl["notes"].get().strip()
+            if amount > 0:
+                exp_id = c.execute("INSERT INTO expenses(exp_date,kind,category,amount,notes,created_at) VALUES(?,?,?,?,?,?)",
+                                   (d, "مصروف", f"عربيات — {kind}", amount, f"{vname}" + (f" — عداد {fmt(odo)}" if odo is not None else "") + (f" — {fmt(liters)} لتر" if liters else "") + (f" — {notes}" if notes else ""), now_ts())).lastrowid
+                c.execute("INSERT OR IGNORE INTO expense_cats(name) VALUES(?)", (f"عربيات — {kind}",))
+            c.execute("INSERT INTO vehicle_logs(vehicle_id,v_date,kind,odometer,liters,amount,notes,expense_id,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                      (vid, d, kind, odo, liters, amount, notes, exp_id, now_ts()))
+            log(c, "العربيات", f"{vname}: {kind}" + (f" — عداد {fmt(odo)}" if odo is not None else "") + (f" — {fmt(amount)}" if amount else "") + f" ({d})")
+        for k in ("odo", "liters", "amount", "notes"): self.vl[k].set("")
+        self.vehicle_selected(); self.status.config(text=f"✔ اتسجل: {vname} — {kind}")
+
+    def delete_vehicle(self):
+        sel = self.veh_tree.selection()
+        if not sel: return messagebox.showwarning("تنبيه", "حدد العربية من الجدول الأول")
+        vid = int(sel[0])
+        with db() as c:
+            v = c.execute("SELECT * FROM vehicles WHERE id=?", (vid,)).fetchone()
+            logs = c.execute("SELECT v_date, amount, expense_id FROM vehicle_logs WHERE vehicle_id=?", (vid,)).fetchall()
+        if not v: return
+        exps = [l for l in logs if l["expense_id"]]; tot = sum(float(l["amount"] or 0) for l in exps)
+        if logs:
+            if exps and not is_owner(): return messagebox.showwarning("غير مسموح", "العربية دي ليها مصروفات متسجلة — المالك بس اللي يقدر يحذفها.\nلو مش هتستخدمها تاني: «تعديل» ← خليها متوقفة.")
+            msg = check_locked(*[l["v_date"] for l in exps])
+            if msg: return messagebox.showerror("الشهر مقفول", msg)
+            q = (f"«{v['name']}» ليها {len(logs)} سطر في السجل" + (f"، منهم {len(exps)} مصروف بإجمالي {fmt(tot)} ج.م" if exps else "") + ".\n\n"
+                 "تحذف العربية وكل سجلها؟" + ("\nالمصروفات دي هتتحذف وفلوسها ترجع للخزنة." if exps else "") +
+                 "\n\n(لو عايز تحتفظ بالسجل: دوس «لأ» واعمل «تعديل» ← متوقفة)")
+        else: q = f"تحذف «{v['name']}»؟"
+        if not messagebox.askyesno("حذف العربية", q): return
+        with db() as c:
+            for l in exps: c.execute("DELETE FROM expenses WHERE id=?", (l["expense_id"],))
+            c.execute("DELETE FROM vehicle_logs WHERE vehicle_id=?", (vid,))
+            c.execute("DELETE FROM vehicles WHERE id=?", (vid,))
+            log(c, "حذف عربية", f"{v['name']}" + (f" ({v['plate']})" if v["plate"] else "") + f" — {len(logs)} سطر" + (f" ومصروفات {fmt(tot)}" if exps else ""))
+        self.show_vehicles()
+
+    def delete_vehicle_log(self):
+        sel = self.vlog_tree.selection()
+        if not sel: return messagebox.showwarning("تنبيه", "حدد سطر من السجل الأول")
+        lid = int(sel[0])
+        with db() as c: l = c.execute("SELECT * FROM vehicle_logs WHERE id=?", (lid,)).fetchone()
+        if not l: return
+        if float(l["amount"] or 0) > 0:
+            msg = check_locked(l["v_date"])
+            if msg: return messagebox.showerror("الشهر مقفول", msg)
+        if not messagebox.askyesno("حذف", "تحذف السطر ده؟" + ("\nوالمصروف المربوط بيه هيتحذف كمان ويرجع للخزنة." if l["expense_id"] else "")): return
+        with db() as c:
+            if l["expense_id"]: c.execute("DELETE FROM expenses WHERE id=?", (l["expense_id"],))
+            c.execute("DELETE FROM vehicle_logs WHERE id=?", (lid,))
+            log(c, "حذف حركة عربية", f"{l['kind']} — {l['v_date']}" + (f" — {fmt(l['amount'])}" if l["amount"] else ""))
+        self.refresh_vehicle_logs()
+
+    def refresh_vehicle_logs(self):
+        try: s = check_date(self.vf_from.get()); e = check_date(self.vf_to.get())
+        except ValueError: return messagebox.showerror("خطأ", "صيغة التاريخ غلط")
+        vid = self.veh_lookup.get(self.vl["veh"].get())
+        for x in self.vlog_tree.get_children(): self.vlog_tree.delete(x)
+        for w in self.vsum.winfo_children(): w.destroy()
+        if not vid: return
+        with db() as c:
+            sm = vehicle_summary(c, vid, s, e)
+            prev = c.execute("SELECT MAX(odometer) FROM vehicle_logs WHERE vehicle_id=? AND v_date<? AND odometer IS NOT NULL", (vid, s)).fetchone()[0]
+            vname = c.execute("SELECT name FROM vehicles WHERE id=?", (vid,)).fetchone()[0]
+        last = float(prev) if prev is not None else None
+        rows = []
+        for l in sm["logs"]:
+            km = ""
+            if l["odometer"] is not None:
+                if last is not None: km = fmt(float(l["odometer"]) - last)
+                last = max(last or 0, float(l["odometer"]))
+            rows.append((l["id"], l["v_date"], vname, l["kind"], fmt(l["odometer"]) if l["odometer"] is not None else "", km, fmt(l["liters"]) if l["liters"] else "", fmt(l["amount"]) if l["amount"] else "", l["notes"] or ""))
+        for r in reversed(rows): self.vlog_tree.insert("", "end", iid=str(r[0]), values=r)
+        self.total_bar(self.vsum, [("الكيلومترات", fmt(sm["km"])), ("لترات الوقود", fmt(sm["liters"])), ("فلوس الوقود", fmt(sm["fuel"])), ("كل المصروفات", fmt(sm["total"]))], title=vname)
+        self.total_bar(self.vsum, [("كم / لتر", fmt(sm["km_per_l"]) if sm["km_per_l"] else "—"), ("تكلفة الكيلو (كل المصروفات)", fmt(sm["cost_km"]) if sm["cost_km"] else "—"),
+                                   ("تكلفة الكيلو (وقود بس)", fmt(sm["fuel_km"]) if sm["fuel_km"] else "—")], title="الاستهلاك")
+
+    # ================= إقفال الشهور =================
+    def _lock_settings(self):
+        lf = tk.LabelFrame(self.body, text="🔒 إقفال الشهور (للمالك بس)", padx=12, pady=10); lf.pack(fill="x", pady=(10, 0))
+        with db() as c: r = c.execute("SELECT COALESCE(lock_until,''), COALESCE(lock_auto,0) FROM settings WHERE id=1").fetchone(); eff = lock_date(c)
+        tk.Label(lf, text=("مقفول لحد: " + eff) if eff else "مفيش إقفال حاليًا", anchor="e", font=("Tahoma", 12, "bold"), fg="#b91c1c" if eff else NAVY).pack(fill="x")
+        tk.Label(lf, text="الفواتير والسندات والمصروفات بتاريخ في الفترة المقفولة: المحاسب مش هيقدر يضيفها أو يعدّلها أو يحذفها. المالك بس يقدر.",
+                 anchor="e", fg="#50647b", font=("Tahoma", 11)).pack(fill="x")
+        auto = tk.IntVar(value=int(r[1]))
+        def set_auto():
+            with db() as c: c.execute("UPDATE settings SET lock_auto=? WHERE id=1", (auto.get(),)); log(c, "إقفال الشهور", "أوتوماتيك أول كل شهر: " + ("شغال" if auto.get() else "مقفول"))
+            self.show_settings()
+        tk.Checkbutton(lf, text="اقفل الشهر اللي فات أوتوماتيك أول ما الشهر الجديد يبدأ", variable=auto, command=set_auto, anchor="e").pack(fill="x", pady=(4, 0))
+        b = tk.Frame(lf); b.pack(fill="x", pady=6)
+        def set_lock(d):
+            with db() as c: c.execute("UPDATE settings SET lock_until=? WHERE id=1", (d,)); log(c, "إقفال الشهور", ("مقفول لحد " + d) if d else "اتفتح الإقفال اليدوي")
+            self.show_settings()
+        last_month_end = (date.today().replace(day=1) - timedelta(days=1)).isoformat()
+        ttk.Button(b, text=f"اقفل لحد آخر الشهر اللي فات ({last_month_end})", command=lambda: messagebox.askyesno("إقفال", f"تقفل كل الفواتير والسندات لحد {last_month_end}؟") and set_lock(last_month_end)).pack(side="right")
+        def pick():
+            v = simpledialog.askstring("إقفال", "اقفل لحد تاريخ (YYYY-MM-DD):", initialvalue=r[0] or last_month_end, parent=self)
+            if v is None: return
+            try: set_lock(check_date(v.strip()))
+            except ValueError: messagebox.showerror("خطأ", "صيغة التاريخ غلط")
+        ttk.Button(b, text="اختيار تاريخ", command=pick).pack(side="right", padx=6)
+        ttk.Button(b, text="فتح الإقفال اليدوي", command=lambda: set_lock("")).pack(side="right")
+
+    def rep_detail(self, rep_key, s, e):
+        with db() as c:
+            name = OFFICE if not rep_key else rep_name_of(c, rep_key)
+            rows = self.rep_moves(c, rep_key, s, e)
+            custs = [(p["id"], p["name"], p["phone"] or "", party_balance(c, p["id"])) for p in
+                     c.execute("SELECT id,name,phone FROM parties WHERE COALESCE(rep_id,0)=? AND kind<>'مورد' ORDER BY name", (rep_key,)).fetchall()]
+            earned, cpaid = rep_commission(c, rep_key) if rep_key else (0.0, 0.0)
+        win = tk.Toplevel(self); win.title(f"المندوب: {name}"); win.geometry("1000x760"); win.configure(bg=BG); win.transient(self)
+        tk.Label(win, text=f"المندوب: {name}   —   من {s} إلى {e}", font=("Tahoma", 17, "bold"), bg=BG, fg=NAVY).pack(anchor="e", padx=15, pady=(12, 2))
+        tk.Label(win, text="ضغطتين على فاتورة = فتحها  •  ضغطتين على عميل = كشف حسابه", bg=BG, fg="#50647b", font=("Tahoma", 11)).pack(anchor="e", padx=15)
+        box = tk.Frame(win, bg=BG); box.pack(fill="both", expand=True, padx=15, pady=6)
+        t = self.tree(box, ("date", "time", "what", "ref", "party", "sales", "col", "tons", "qty", "comm"), ("التاريخ", "الوقت", "البيان", "المرجع", "العميل", "مبيعات", "تحصيل", "طن", "شيكارة", "العمولة"), [90, 70, 105, 85, 200, 105, 105, 70, 75, 90], height=4)
+        for r in rows: t.insert("", "end", iid=r[2], values=(r[0], fmt_time(r[1]), r[3], r[4], r[5], fmt(r[6]) if r[6] else "", fmt(r[7]) if r[7] else "", fmt(r[10]) if r[10] else "", fmt(r[8]) if r[8] else "", fmt(r[9]) if r[9] else ""))
+        t.bind("<Double-1>", lambda ev: t.selection() and t.selection()[0].startswith("0-") and self.view_invoice(int(t.selection()[0][2:])))
+        pairs = [("المبيعات", fmt(sum(r[6] for r in rows))), ("التحصيلات", fmt(sum(r[7] for r in rows))), ("الكمية", qty_text(sum(r[8] for r in rows), sum(r[10] for r in rows)))]
+        if rep_key: pairs += [("عمولة الفترة", fmt(sum(r[9] for r in rows))), ("الباقي له من العمولة (الآن)", fmt(earned - cpaid))]
+        self.total_bar(win, pairs).pack_configure(padx=15)
+        tk.Label(win, text=f"عملاء {'المكتب' if not rep_key else 'المندوب'} وأرصدتهم الحالية", font=("Tahoma", 13, "bold"), bg=BG, fg=NAVY).pack(anchor="e", padx=15, pady=(6, 0))
+        box2 = tk.Frame(win, bg=BG); box2.pack(fill="both", expand=True, padx=15)
+        t2 = self.tree(box2, ("id", "name", "phone", "bal"), ("ID", "العميل", "الهاتف", "الرصيد الحالي"), [45, 300, 160, 160], height=4)
+        for cid, cname, ph, b in custs: t2.insert("", "end", iid=str(cid), values=(cid, cname, ph, fmt(b)))
+        t2.bind("<Double-1>", lambda ev: t2.selection() and (win.destroy(), self.show_account(int(t2.selection()[0]))))
+        self.total_bar(win, [("عدد العملاء", str(len(custs))), ("المستحق عليهم", fmt(sum(b for *_, b in custs if b > 0)))]).pack_configure(padx=15)
+        ttk.Button(win, text="إغلاق", command=win.destroy).pack(anchor="e", padx=15, pady=8)
+
+    # ================= قايمة الهالك =================
+    def show_damaged(self):
+        self.clear(); self.title_label("قايمة الهالك والتالف")
+        tk.Label(self.body, text="الهالك = مرتجعات مبيعات اتعلّمت «هالك» (مش بترجع للمخزن) + بضاعة باظت عندك وبتسجّلها هنا. التكلفة بمتوسط سعر الشراء وبتتخصم من الربح.",
+                 bg=BG, fg="#50647b", font=("Tahoma", 11)).pack(anchor="e")
+        with db() as c: items = c.execute("SELECT id,code,name,unit FROM items ORDER BY name").fetchall()
+        self.dmg_item_lookup = {item_label(r): r["id"] for r in items}
+        form = tk.LabelFrame(self.body, text="تسجيل هالك من المخزن", padx=10, pady=6); form.pack(fill="x", pady=(4, 6))
+        self.dmg_date = tk.StringVar(value=date.today().isoformat()); self.dmg_item = tk.StringVar(); self.dmg_qty = tk.StringVar(value="1"); self.dmg_notes = tk.StringVar()
+        row = tk.Frame(form); row.pack(fill="x")
+        self.field(row, "التاريخ YYYY-MM-DD", self.dmg_date)
+        self.field(row, "الصنف", self.dmg_item, list(self.dmg_item_lookup), search=True)
+        self.field(row, "الكمية", self.dmg_qty)
+        self.field(row, "السبب / ملاحظات", self.dmg_notes)
+        ttk.Button(row, text="حفظ", command=self.save_damaged).pack(side="right", padx=8, pady=14)
+        flt = tk.LabelFrame(self.body, text="السجل", padx=8, pady=4); flt.pack(fill="x", pady=(0, 4))
+        self.dmg_from = tk.StringVar(value=date.today().replace(day=1).isoformat()); self.dmg_to = tk.StringVar(value=date.today().isoformat())
+        self.dmg_src = tk.StringVar(value="الكل"); self.dmg_q = tk.StringVar()
+        self.field(flt, "من", self.dmg_from); self.field(flt, "إلى", self.dmg_to)
+        self.field(flt, "المصدر", self.dmg_src, ["الكل", "مرتجع هالك", "هالك من المخزن"])
+        self.field(flt, "بحث (الصنف / الاسم / ملاحظات)", self.dmg_q)
+        ttk.Button(flt, text="عرض", command=self.refresh_damaged).pack(side="right", padx=6, pady=8)
+        self.dmg_tree = self.tree(self.body, ("date", "time", "item", "qty", "cost", "value", "src", "notes"),
+                                  ("التاريخ", "الوقت", "الصنف", "الكمية", "التكلفة للوحدة", "القيمة", "المصدر", "ملاحظات"), [95, 75, 210, 85, 110, 110, 260, 200])
+        self.dmg_tree.bind("<Double-1>", lambda e: self.dmg_tree.selection() and self.dmg_tree.selection()[0].startswith("r-") and self.view_invoice(int(self.dmg_tree.selection()[0].split("-")[1])))
+        self.dmg_totals = tk.Frame(self.body, bg=BG); self.dmg_totals.pack(fill="x")
+        bar = tk.Frame(self.body, bg=BG); bar.pack(fill="x", pady=4)
+        ttk.Button(bar, text="حذف المحدد (الهالك من المخزن بس)", command=self.delete_damaged).pack(side="right", padx=4)
+        tk.Label(bar, text="المرتجع الهالك بيتعدّل من فاتورة المرتجع نفسها (ضغطتين تفتحها)", bg=BG, fg="#50647b", font=("Tahoma", 11)).pack(side="left")
+        self.refresh_damaged()
+
+    def save_damaged(self):
+        iid = self.dmg_item_lookup.get(self.dmg_item.get())
+        if not iid: return messagebox.showwarning("تنبيه", "اختر الصنف")
+        try: qty = float(self.dmg_qty.get()); d = check_date(self.dmg_date.get())
+        except ValueError: return messagebox.showerror("خطأ", "راجع التاريخ والكمية")
+        if qty <= 0: return messagebox.showerror("خطأ", "الكمية يجب أن تكون أكبر من صفر")
+        try:
+            with db() as c:
+                cost = fifo_preview(c, [(iid, qty)])[0]
+                c.execute("INSERT INTO damaged(d_date,created_at,item_id,qty,unit_cost,notes) VALUES(?,?,?,?,?,?)", (d, now_ts(), iid, qty, cost, self.dmg_notes.get().strip()))
+                check_stock(c, [iid])
+                log(c, "تسجيل هالك", f"{self.dmg_item.get()}: كمية {fmt(qty)} بتكلفة {fmt(cost)}/وحدة = {fmt(qty * cost)}")
+        except NegativeStock as e:
+            if getattr(_TLS, "allow_neg", None): return messagebox.showerror("رصيد غير كافٍ", str(e))
+            who = self.allow_negative(str(e))
+            if who: return self._with_neg(who, self.save_damaged)
+            return
+        except ValueError as e: return messagebox.showerror("رصيد غير كافٍ", str(e))
+        self.dmg_qty.set("1"); self.dmg_notes.set(""); self.status.config(text="تم تسجيل الهالك"); self.refresh_damaged()
+
+    def refresh_damaged(self):
+        for x in self.dmg_tree.get_children(): self.dmg_tree.delete(x)
+        try: s = check_date(self.dmg_from.get()); e = check_date(self.dmg_to.get())
+        except ValueError: return messagebox.showerror("خطأ", "صيغة التاريخ غير صحيحة (YYYY-MM-DD)")
+        rows = []
+        with db() as c:
+            for r in c.execute("SELECT d.*,it.name iname,it.unit FROM damaged d JOIN items it ON it.id=d.item_id WHERE d.d_date BETWEEN ? AND ?", (s, e)):
+                rows.append((r["d_date"], r["created_at"] or "", f"d-{r['id']}", r["iname"], float(r["qty"]), fifo_engine(c)["dmg"].get(r["id"], float(r["unit_cost"] or 0)), "هالك من المخزن", r["notes"] or ""))
+            for r in c.execute("SELECT l.id lid,l.item_id,l.item_name,l.qty,i.id,i.number,i.inv_date,i.created_at,i.notes,p.name pname FROM invoice_lines l JOIN invoices i ON i.id=l.invoice_id "
+                               "LEFT JOIN parties p ON p.id=i.party_id WHERE i.kind='مرتجع مبيعات' AND COALESCE(l.damaged,0)=1 AND COALESCE(NULLIF(i.due_date,''), i.inv_date) BETWEEN ? AND ?", (s, e)).fetchall():
+                cost = fifo_engine(c)["line"].get(r["lid"], 0.0) if r["item_id"] else 0.0
+                rows.append((r["inv_date"], r["created_at"] or "", f"r-{r['id']}-{r['lid']}", r["item_name"], float(r["qty"]), cost, f"مرتجع هالك — {r['pname'] or ''} (فاتورة {r['number']})", r["notes"] or ""))
+        src = self.dmg_src.get(); q = self.dmg_q.get().strip().lower()
+        if src == "مرتجع هالك": rows = [r for r in rows if r[2].startswith("r-")]
+        elif src == "هالك من المخزن": rows = [r for r in rows if r[2].startswith("d-")]
+        if q: rows = [r for r in rows if q in (r[3] + " " + r[6] + " " + r[7]).lower()]
+        rows.sort(key=lambda r: (r[0], r[1]), reverse=True)
+        for r in rows: self.dmg_tree.insert("", "end", iid=r[2], values=(r[0], fmt_time(r[1]), r[3], fmt(r[4]), fmt(r[5]), fmt(r[4] * r[5]), r[6], r[7]))
+        for w in self.dmg_totals.winfo_children(): w.destroy()
+        self.total_bar(self.dmg_totals, [("عدد الحركات", str(len(rows))), ("إجمالي الكمية", fmt(sum(r[4] for r in rows))), ("إجمالي القيمة (بالتكلفة)", fmt(sum(r[4] * r[5] for r in rows)))])
+
+    def delete_damaged(self):
+        sel = self.dmg_tree.selection()
+        if not sel: return messagebox.showwarning("تنبيه", "حدد حركة أولًا")
+        if not sel[0].startswith("d-"): return messagebox.showwarning("تنبيه", "ده مرتجع هالك — عدّله أو احذفه من فاتورة المرتجع نفسها.")
+        if not messagebox.askyesno("تأكيد", "حذف حركة الهالك المحددة؟ الكمية هترجع للمخزن."): return
+        rid = int(sel[0][2:])
+        with db() as c:
+            r = c.execute("SELECT d.*,it.name iname FROM damaged d JOIN items it ON it.id=d.item_id WHERE d.id=?", (rid,)).fetchone()
+            c.execute("DELETE FROM damaged WHERE id=?", (rid,))
+            if r: log(c, "حذف هالك", f"{r['iname']}: كمية {fmt(r['qty'])} بتاريخ {r['d_date']}")
+        self.refresh_damaged()
+
+    # ================= طباعة أرصدة الأصناف للجرد =================
+    def print_stock_count(self):
+        with db() as c:
+            s = c.execute("SELECT * FROM settings WHERE id=1").fetchone()
+            rows = [(r["name"], stock_of(c, r["id"]), r["unit"] or "") for r in c.execute("SELECT id,name,unit FROM items ORDER BY name").fetchall()]
+        body = "".join(f"<tr><td>{n}</td><td class='nm'>{esc(name)}</td><td>{fmt(q)} {esc(u)}</td></tr>" for n, (name, q, u) in enumerate(rows, 1))
+        html = f"""<!doctype html><html lang="ar" dir="rtl"><meta charset="utf-8"><title>أرصدة الأصناف للجرد</title><style>
+        @page{{size:A4;margin:0}}*{{box-sizing:border-box}}body{{font-family:Tahoma,Arial,sans-serif;font-size:15px;color:#111;margin:0 auto;padding:12mm;width:210mm}}@media screen{{body{{width:auto;max-width:210mm}}}}
+        h1,h2,h3{{text-align:center;margin:4px}}table{{width:100%;border-collapse:collapse;margin-top:10px}}
+        th,td{{border:1px solid #555;padding:6px 8px;text-align:center}}td.nm{{text-align:right}}th{{background:#e8eef5}}
+        tr:nth-child(even) td{{background:#f6fafd}}thead{{display:table-header-group}}tr{{break-inside:avoid}}</style>
+        <h1>{esc(s['company']) or DEFAULT_COMPANY}</h1><h2>أرصدة الأصناف (للجرد)</h2><h3>{date.today().isoformat()} — {fmt_time(now_ts())}</h3>
+        <table><thead><tr><th style="width:8%">م</th><th>اسم الصنف</th><th style="width:28%">الكمية</th></tr></thead><tbody>{body}</tbody></table></html>"""
+        path = os.path.join(PRINT_DIR, "stock_count.html")
+        with open(path, "w", encoding="utf-8") as f: f.write(html)
+        print_page(path)
+
+    # ================= العينات (منفصلة تمامًا عن الأصناف والحسابات) =================
+    SAMPLE_IN = "عينات مشتريات"; SAMPLE_OUT = "عينات مبيعات"
+
+    def sample_balance(self, c, sid):
+        r = c.execute("SELECT COALESCE(SUM(CASE WHEN kind=? THEN qty ELSE 0 END),0) inn, COALESCE(SUM(CASE WHEN kind=? THEN qty ELSE 0 END),0) outq FROM samples WHERE sample_item_id=?",
+                      (self.SAMPLE_IN, self.SAMPLE_OUT, sid)).fetchone()
+        return float(r["inn"]), float(r["outq"])
+
+    def show_sample_items(self):
+        self.clear(); self.title_label("أصناف العينات")
+        tk.Label(self.body, text="أصناف العينات منفصلة تمامًا عن الأصناف العادية: لا تؤثر على المخزون ولا الأرباح ولا الخزنة ولا أرصدة العملاء.", bg=BG, fg="#50647b", font=("Tahoma", 11)).pack(anchor="e")
+        self.si_edit_id = None
+        form = tk.LabelFrame(self.body, text="بيانات صنف عينة", padx=10, pady=8); form.pack(fill="x", pady=(4, 8))
+        self.si_vars = {k: tk.StringVar() for k in ("code", "name", "unit")}; self.si_vars["unit"].set("قطعة")
+        for k, label in [("code", "كود العينة"), ("name", "اسم العينة"), ("unit", "الوحدة")]: self.field(form, label, self.si_vars[k])
+        ttk.Button(form, text="حفظ", command=self.save_sample_item).pack(side="right", padx=8, pady=14)
+        ttk.Button(form, text="تفريغ", command=self.reset_sample_item).pack(side="right", padx=4, pady=14)
+        self.si_q = tk.StringVar(); self.search_bar("بحث سريع (الكود أو الاسم):", self.si_q)
+        self.si_q.trace_add("write", lambda *a: self.refresh_sample_items())
+        self.si_tree = self.tree(self.body, ("id", "code", "name", "unit", "inn", "out", "bal"), ("ID", "الكود", "اسم العينة", "الوحدة", "الوارد", "المنصرف", "الرصيد"), [45, 100, 280, 90, 120, 120, 120])
+        self.si_tree.bind("<Double-1>", lambda e: self.sample_item_moves())
+        bar = tk.Frame(self.body, bg=BG); bar.pack(fill="x", pady=6)
+        ttk.Button(bar, text="حركات العينة المحددة", command=self.sample_item_moves).pack(side="right", padx=4)
+        ttk.Button(bar, text="تعديل المحدد", command=self.edit_sample_item).pack(side="right", padx=4)
+        ttk.Button(bar, text="حذف المحدد", command=self.delete_sample_item).pack(side="right", padx=4)
+        tk.Label(bar, text="ضغطتين على عينة = حركاتها", bg=BG, fg="#50647b", font=("Tahoma", 11)).pack(side="left")
+        self.refresh_sample_items()
+
+    def reset_sample_item(self):
+        self.si_edit_id = None; self.si_vars["code"].set(""); self.si_vars["name"].set(""); self.si_vars["unit"].set("قطعة")
+
+    def save_sample_item(self):
+        v = {k: x.get().strip() for k, x in self.si_vars.items()}
+        if not v["name"]: return messagebox.showwarning("تنبيه", "اسم العينة مطلوب")
+        try:
+            with db() as c:
+                if self.si_edit_id:
+                    c.execute("UPDATE sample_items SET code=?,name=?,unit=? WHERE id=?", (v["code"] or None, v["name"], v["unit"] or "قطعة", self.si_edit_id)); log(c, "تعديل صنف عينة", v["name"])
+                else:
+                    c.execute("INSERT INTO sample_items(code,name,unit) VALUES(?,?,?)", (v["code"] or None, v["name"], v["unit"] or "قطعة")); log(c, "إضافة صنف عينة", v["name"])
+        except DBIntegrityError: return messagebox.showerror("خطأ", "كود العينة مستخدم بالفعل")
+        self.reset_sample_item(); self.refresh_sample_items(); self.status.config(text="تم حفظ صنف العينة")
+
+    def refresh_sample_items(self):
+        if not hasattr(self, "si_tree") or not self.si_tree.winfo_exists(): return
+        for x in self.si_tree.get_children(): self.si_tree.delete(x)
+        q = self.si_q.get().strip().lower()
+        with db() as c:
+            for r in c.execute("SELECT * FROM sample_items ORDER BY name").fetchall():
+                if q and q not in (r["name"] or "").lower() and q not in (r["code"] or "").lower(): continue
+                inn, out = self.sample_balance(c, r["id"])
+                self.si_tree.insert("", "end", iid=str(r["id"]), values=(r["id"], r["code"] or "", r["name"], r["unit"], fmt(inn), fmt(out), fmt(inn - out)))
+
+    def selected_sample_item(self):
+        sel = self.si_tree.selection()
+        if not sel: messagebox.showwarning("تنبيه", "حدد عينة أولًا"); return None
+        return int(sel[0])
+
+    def edit_sample_item(self):
+        sid = self.selected_sample_item()
+        if not sid: return
+        with db() as c: r = c.execute("SELECT * FROM sample_items WHERE id=?", (sid,)).fetchone()
+        self.si_edit_id = sid
+        self.si_vars["code"].set(r["code"] or ""); self.si_vars["name"].set(r["name"]); self.si_vars["unit"].set(r["unit"] or "قطعة")
+        self.status.config(text=f"جاري تعديل العينة «{r['name']}» — عدّل الحقول واضغط «حفظ»")
+
+    def delete_sample_item(self):
+        sid = self.selected_sample_item()
+        if not sid: return
+        with db() as c:
+            used = c.execute("SELECT COUNT(*) FROM samples WHERE sample_item_id=?", (sid,)).fetchone()[0]
+            name = c.execute("SELECT name FROM sample_items WHERE id=?", (sid,)).fetchone()["name"]
+        if used: return messagebox.showwarning("لا يمكن الحذف", "العينة لها حركات مسجّلة. يمكنك تعديلها فقط.")
+        if messagebox.askyesno("تأكيد", f"حذف العينة «{name}»؟"):
+            with db() as c: c.execute("DELETE FROM sample_items WHERE id=?", (sid,)); log(c, "حذف صنف عينة", name)
+            self.refresh_sample_items()
+
+    def sample_item_moves(self):
+        sid = self.selected_sample_item()
+        if not sid: return
+        with db() as c:
+            it = c.execute("SELECT * FROM sample_items WHERE id=?", (sid,)).fetchone()
+            rows = c.execute("SELECT s.*,p.name pname FROM samples s LEFT JOIN parties p ON p.id=s.party_id WHERE s.sample_item_id=? ORDER BY s.s_date,s.id", (sid,)).fetchall()
+        win = tk.Toplevel(self); win.title(f"حركات العينة: {it['name']}"); win.geometry("900x520"); win.configure(bg=BG); win.transient(self)
+        tk.Label(win, text=f"حركات العينة: {it['name']}", font=("Tahoma", 17, "bold"), bg=BG, fg=NAVY).pack(anchor="e", padx=15, pady=10)
+        box = tk.Frame(win, bg=BG); box.pack(fill="both", expand=True, padx=15)
+        t = self.tree(box, ("date", "time", "kind", "party", "inn", "out", "bal", "cost", "notes"), ("التاريخ", "الوقت", "النوع", "العميل / المورد", "وارد", "منصرف", "الرصيد", "التكلفة (للعلم)", "ملاحظات"), [95, 75, 115, 190, 80, 80, 80, 110, 160])
+        bal = 0.0
+        for r in rows:
+            inn = r["kind"] == self.SAMPLE_IN; q = float(r["qty"]); bal += q if inn else -q
+            t.insert("", "end", values=(r["s_date"], fmt_time(r["created_at"]), r["kind"], r["pname"] or "", fmt(q) if inn else "", "" if inn else fmt(q), fmt(bal), fmt(r["cost"]), r["notes"] or ""))
+        self.total_bar(win, [("الرصيد الحالي", fmt(bal) + " " + (it["unit"] or ""))]).pack_configure(padx=15)
+        ttk.Button(win, text="إغلاق", command=win.destroy).pack(anchor="e", padx=15, pady=6)
+
+    def show_samples(self, kind):
+        self.clear(); self.title_label(kind)
+        inn = kind == self.SAMPLE_IN
+        tk.Label(self.body, text=("عينات واردة لنا (تزيد رصيد العينات)" if inn else "عينات خارجة منا (تقلل رصيد العينات)") +
+                 " — التكلفة للعلم فقط، ولا يوجد أي أثر على المخزون أو الأرباح أو الخزنة أو رصيد العميل/المورد.", bg=BG, fg="#50647b", font=("Tahoma", 11)).pack(anchor="e")
+        with db() as c:
+            sitems = c.execute("SELECT * FROM sample_items ORDER BY name").fetchall()
+            parties = c.execute("SELECT id,name,address,phone FROM parties ORDER BY name").fetchall()
+        self.smp_kind = kind
+        self.smp_item_lookup = {item_label(r): r["id"] for r in sitems}
+        self.smp_party_lookup = {party_label(p): p["id"] for p in parties}
+        form = tk.LabelFrame(self.body, text="حركة عينة جديدة", padx=10, pady=6); form.pack(fill="x", pady=(4, 6))
+        self.smp_date = tk.StringVar(value=date.today().isoformat()); self.smp_item = tk.StringVar(); self.smp_qty = tk.StringVar(value="1")
+        self.smp_cost = tk.StringVar(value="0"); self.smp_party = tk.StringVar(); self.smp_notes = tk.StringVar()
+        row = tk.Frame(form); row.pack(fill="x")
+        self.field(row, "التاريخ YYYY-MM-DD", self.smp_date)
+        self.field(row, "العينة", self.smp_item, list(self.smp_item_lookup), search=True)
+        self.field(row, "الكمية", self.smp_qty)
+        self.field(row, "التكلفة (للعلم فقط)", self.smp_cost)
+        self.field(row, ("المورد" if inn else "العميل") + " (اختياري)", self.smp_party, list(self.smp_party_lookup), search=True)
+        self.field(row, "ملاحظات", self.smp_notes)
+        b = tk.Frame(form); b.pack(fill="x", pady=(6, 0))
+        ttk.Button(b, text="حفظ", command=self.save_sample).pack(side="right", padx=4)
+        ttk.Button(b, text="+ صنف عينة جديد", command=self.show_sample_items).pack(side="right", padx=4)
+        if not sitems: tk.Label(b, text="لا توجد أصناف عينات بعد — أضفها من «أصناف العينات» أولًا", fg="#b45309").pack(side="left")
+        flt = tk.LabelFrame(self.body, text="السجل", padx=8, pady=4); flt.pack(fill="x", pady=(0, 4))
+        self.smp_from = tk.StringVar(value=date.today().replace(day=1).isoformat()); self.smp_to = tk.StringVar(value=date.today().isoformat()); self.smp_q = tk.StringVar()
+        self.field(flt, "من", self.smp_from); self.field(flt, "إلى", self.smp_to); self.field(flt, "بحث (العينة / الاسم / ملاحظات)", self.smp_q)
+        ttk.Button(flt, text="عرض", command=self.refresh_samples).pack(side="right", padx=6, pady=8)
+        self.smp_tree = self.tree(self.body, ("date", "time", "item", "qty", "cost", "party", "notes"),
+                                  ("التاريخ", "الوقت", "العينة", "الكمية", "التكلفة (للعلم)", "المورد" if inn else "العميل", "ملاحظات"), [100, 75, 240, 90, 120, 220, 260])
+        self.smp_totals = tk.Frame(self.body, bg=BG); self.smp_totals.pack(fill="x")
+        bar = tk.Frame(self.body, bg=BG); bar.pack(fill="x", pady=4)
+        ttk.Button(bar, text="حذف الحركة المحددة", command=self.delete_sample).pack(side="right", padx=4)
+        self.refresh_samples()
+
+    def save_sample(self):
+        sid = self.smp_item_lookup.get(self.smp_item.get())
+        if not sid: return messagebox.showwarning("تنبيه", "اختر العينة")
+        try: qty = float(self.smp_qty.get()); cost = float(self.smp_cost.get() or 0); d = check_date(self.smp_date.get())
+        except ValueError: return messagebox.showerror("خطأ", "راجع التاريخ والكمية والتكلفة")
+        if qty <= 0 or cost < 0: return messagebox.showerror("خطأ", "الكمية يجب أن تكون أكبر من صفر والتكلفة غير سالبة")
+        party_txt = self.smp_party.get().strip()
+        pid = self.smp_party_lookup.get(party_txt) if party_txt else None
+        if party_txt and not pid: return messagebox.showwarning("تنبيه", "اختر الاسم من القائمة أو اترك الخانة فاضية")
+        with db() as c:
+            if self.smp_kind == self.SAMPLE_OUT:
+                inn, out = self.sample_balance(c, sid)
+                if qty > inn - out + 1e-9 and not messagebox.askyesno("رصيد العينات", f"رصيد العينة المسجّل {fmt(inn - out)} فقط.\nتكمل التسجيل؟"): return
+            c.execute("INSERT INTO samples(s_date,created_at,kind,sample_item_id,qty,cost,party_id,notes) VALUES(?,?,?,?,?,?,?,?)",
+                      (d, now_ts(), self.smp_kind, sid, qty, cost, pid, self.smp_notes.get().strip()))
+            log(c, self.smp_kind, f"{self.smp_item.get()}: كمية {fmt(qty)}، تكلفة {fmt(cost)}" + (f" — {party_txt}" if party_txt else ""))
+        self.smp_qty.set("1"); self.smp_cost.set("0"); self.smp_notes.set("")
+        self.status.config(text="تم حفظ حركة العينة"); self.refresh_samples()
+
+    def refresh_samples(self):
+        for x in self.smp_tree.get_children(): self.smp_tree.delete(x)
+        try: s = check_date(self.smp_from.get()); e = check_date(self.smp_to.get())
+        except ValueError: return messagebox.showerror("خطأ", "صيغة التاريخ غير صحيحة (YYYY-MM-DD)")
+        q = self.smp_q.get().strip().lower()
+        with db() as c:
+            rows = c.execute("SELECT s.*,si.name iname,si.unit,p.name pname FROM samples s JOIN sample_items si ON si.id=s.sample_item_id LEFT JOIN parties p ON p.id=s.party_id "
+                             "WHERE s.kind=? AND s.s_date BETWEEN ? AND ? ORDER BY s.s_date DESC,s.id DESC", (self.smp_kind, s, e)).fetchall()
+        tq = tc = 0.0; n = 0
+        for r in rows:
+            if q and q not in " ".join([r["iname"] or "", r["pname"] or "", r["notes"] or ""]).lower(): continue
+            self.smp_tree.insert("", "end", iid=str(r["id"]), values=(r["s_date"], fmt_time(r["created_at"]), r["iname"], fmt(r["qty"]) + " " + (r["unit"] or ""), fmt(r["cost"]), r["pname"] or "", r["notes"] or ""))
+            tq += float(r["qty"]); tc += float(r["cost"] or 0); n += 1
+        for w in self.smp_totals.winfo_children(): w.destroy()
+        self.total_bar(self.smp_totals, [("عدد الحركات", str(n)), ("إجمالي الكمية", fmt(tq)), ("إجمالي التكلفة (للعلم)", fmt(tc))])
+
+    def delete_sample(self):
+        sel = self.smp_tree.selection()
+        if not sel: return messagebox.showwarning("تنبيه", "حدد حركة أولًا")
+        if not messagebox.askyesno("تأكيد", "حذف حركة العينة المحددة نهائيًا؟"): return
+        rid = int(sel[0])
+        with db() as c:
+            r = c.execute("SELECT s.*,si.name iname FROM samples s JOIN sample_items si ON si.id=s.sample_item_id WHERE s.id=?", (rid,)).fetchone()
+            c.execute("DELETE FROM samples WHERE id=?", (rid,))
+            if r: log(c, "حذف حركة عينة", f"{r['kind']}: {r['iname']} كمية {fmt(r['qty'])} بتاريخ {r['s_date']}")
+        self.refresh_samples()
+
+    # ================= المستخدمين (المالك بس) =================
+    def show_users(self):
+        if not is_owner(): return self.show_home()
+        self.clear(); self.title_label("المستخدمين وكلمات السر")
+        tk.Label(self.body, text="المالك: كل الصلاحيات  •  المحاسب: كل حاجة ماعدا الأرباح وإدارة المستخدمين  •  ⚠️ مفيش استرجاع لكلمة السر حاليًا — احتفظ بيها في مكان آمن",
+                 bg=BG, fg="#50647b", font=("Tahoma", 11)).pack(anchor="e")
+        form = tk.LabelFrame(self.body, text="مستخدم جديد", padx=10, pady=6); form.pack(fill="x", pady=(4, 6))
+        self.us_vars = {k: tk.StringVar() for k in ("name", "p1", "p2", "role")}; self.us_vars["role"].set(ROLE_ACC)
+        row = tk.Frame(form); row.pack(fill="x")
+        self.field(row, "اسم المستخدم", self.us_vars["name"])
+        for k, label in (("p1", "كلمة السر"), ("p2", "تأكيد كلمة السر")):
+            col = tk.Frame(row); col.pack(side="right", expand=True, fill="x", padx=5)
+            tk.Label(col, text=label, anchor="e").pack(fill="x"); ttk.Entry(col, textvariable=self.us_vars[k], show="•", justify="right").pack(fill="x")
+        self.field(row, "الصلاحية", self.us_vars["role"], [ROLE_ACC, ROLE_OWNER])
+        ttk.Button(row, text="إضافة", command=self.add_user).pack(side="right", padx=8, pady=14)
+        self.us_tree = self.tree(self.body, ("id", "name", "role", "active", "created"), ("ID", "اسم المستخدم", "الصلاحية", "الحالة", "تاريخ الإنشاء"), [45, 260, 160, 120, 200])
+        bar = tk.Frame(self.body, bg=BG); bar.pack(fill="x", pady=6)
+        for text, fn in (("تغيير كلمة السر للمحدد", self.change_user_pw), ("إيقاف / تفعيل المحدد", self.toggle_user), ("حذف المحدد", self.delete_user)):
+            ttk.Button(bar, text=text, command=fn).pack(side="right", padx=4)
+        self.refresh_users()
+
+    def refresh_users(self):
+        for x in self.us_tree.get_children(): self.us_tree.delete(x)
+        with db() as c:
+            for r in c.execute("SELECT * FROM users ORDER BY role DESC,username").fetchall():
+                me = "  (انت)" if r["id"] == CURRENT_USER.get("id") else ""
+                self.us_tree.insert("", "end", iid=str(r["id"]), values=(r["id"], r["username"] + me, r["role"], "مفعّل" if r["active"] else "موقوف", (r["created_at"] or "")[:16]))
+
+    def add_user(self):
+        v = {k: x.get() for k, x in self.us_vars.items()}; name = v["name"].strip()
+        if not name: return messagebox.showwarning("تنبيه", "اكتب اسم المستخدم")
+        if len(v["p1"]) < 4: return messagebox.showwarning("تنبيه", "كلمة السر لازم تكون 4 حروف/أرقام على الأقل")
+        if v["p1"] != v["p2"]: return messagebox.showerror("خطأ", "كلمتين السر مش متطابقتين")
+        if v["role"] not in (ROLE_OWNER, ROLE_ACC): return messagebox.showwarning("تنبيه", "اختر الصلاحية")
+        h, salt = hash_pw(v["p1"])
+        try:
+            with db() as c:
+                c.execute("INSERT INTO users(username,pw_hash,salt,role,active,created_at) VALUES(?,?,?,?,1,?)", (name, h, salt, v["role"], now_ts()))
+                log(c, "إضافة مستخدم", f"{name} ({v['role']})")
+        except DBIntegrityError: return messagebox.showerror("خطأ", "اسم المستخدم موجود بالفعل")
+        for k in ("name", "p1", "p2"): self.us_vars[k].set("")
+        self.refresh_users(); self.status.config(text=f"تم إضافة المستخدم {name}")
+
+    def _sel_user(self):
+        sel = self.us_tree.selection()
+        if not sel: messagebox.showwarning("تنبيه", "حدد مستخدمًا أولًا"); return None
+        with db() as c: return c.execute("SELECT * FROM users WHERE id=?", (int(sel[0]),)).fetchone()
+
+    def _active_owners(self, c, exclude=None):
+        return c.execute("SELECT COUNT(*) FROM users WHERE role=? AND active=1 AND id<>?", (ROLE_OWNER, exclude or -1)).fetchone()[0]
+
+    def change_user_pw(self):
+        u = self._sel_user()
+        if not u: return
+        p1 = simpledialog.askstring("كلمة سر جديدة", f"كلمة السر الجديدة لـ«{u['username']}»:", show="•", parent=self)
+        if p1 is None: return
+        if len(p1) < 4: return messagebox.showwarning("تنبيه", "كلمة السر لازم تكون 4 حروف/أرقام على الأقل")
+        p2 = simpledialog.askstring("تأكيد", "اكتب كلمة السر الجديدة تاني:", show="•", parent=self)
+        if p1 != p2: return messagebox.showerror("خطأ", "كلمتين السر مش متطابقتين")
+        h, salt = hash_pw(p1)
+        with db() as c:
+            c.execute("UPDATE users SET pw_hash=?,salt=? WHERE id=?", (h, salt, u["id"])); log(c, "تغيير كلمة سر", u["username"])
+        messagebox.showinfo("تم", f"تم تغيير كلمة سر «{u['username']}»")
+
+    def toggle_user(self):
+        u = self._sel_user()
+        if not u: return
+        if u["id"] == CURRENT_USER.get("id"): return messagebox.showwarning("تنبيه", "مينفعش توقف حسابك وانت داخل بيه")
+        with db() as c:
+            if u["active"] and u["role"] == ROLE_OWNER and not self._active_owners(c, u["id"]):
+                return messagebox.showwarning("تنبيه", "لازم يفضل حساب مالك واحد مفعّل على الأقل")
+            c.execute("UPDATE users SET active=? WHERE id=?", (0 if u["active"] else 1, u["id"]))
+            log(c, "إيقاف مستخدم" if u["active"] else "تفعيل مستخدم", u["username"])
+        self.refresh_users()
+
+    def delete_user(self):
+        u = self._sel_user()
+        if not u: return
+        if u["id"] == CURRENT_USER.get("id"): return messagebox.showwarning("تنبيه", "مينفعش تحذف حسابك وانت داخل بيه")
+        with db() as c:
+            if u["role"] == ROLE_OWNER and not self._active_owners(c, u["id"]):
+                return messagebox.showwarning("تنبيه", "لازم يفضل حساب مالك واحد مفعّل على الأقل")
+        if not messagebox.askyesno("تأكيد", f"حذف المستخدم «{u['username']}» نهائيًا؟ (سجل النشاط بتاعه هيفضل موجود)"): return
+        with db() as c:
+            c.execute("DELETE FROM users WHERE id=?", (u["id"],)); log(c, "حذف مستخدم", u["username"])
+        self.refresh_users()
+
+    # ================= الإعدادات والنسخ الاحتياطي =================
+    def scroll_area(self):
+        """يحوّل باقي الشاشة لمساحة بتعمل Scroll (للشاشات الطويلة زي الإعدادات)."""
+        outer = tk.Frame(self.body, bg=BG); outer.pack(fill="both", expand=True)
+        cv = tk.Canvas(outer, bg=BG, highlightthickness=0)
+        sb = ttk.Scrollbar(outer, orient="vertical", command=cv.yview); cv.configure(yscrollcommand=sb.set)
+        sb.pack(side="left", fill="y"); cv.pack(side="right", fill="both", expand=True)
+        inner = tk.Frame(cv, bg=BG); win = cv.create_window(0, 0, window=inner, anchor="nw")
+        inner.bind("<Configure>", lambda e: cv.configure(scrollregion=cv.bbox("all")))
+        cv.bind("<Configure>", lambda e: cv.itemconfigure(win, width=e.width))
+        def wheel(e):
+            try: cv.yview_scroll(int(-e.delta / 120) or (-1 if e.num == 4 else 1 if e.num == 5 else 0), "units")
+            except tk.TclError: pass
+        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            cv.bind_all(seq, wheel)
+        outer.bind("<Destroy>", lambda e: [cv.unbind_all(q) for q in ("<MouseWheel>", "<Button-4>", "<Button-5>")])
+        return inner
+
+    def show_settings(self):
+        self.clear(); self.title_label("الإعدادات")
+        real_body = self.body; self.body = self.scroll_area()
+        try: self._settings_content()
+        finally: self.body = real_body
+
+    def _settings_content(self):
+        with db() as c: s = c.execute("SELECT * FROM settings WHERE id=1").fetchone()
+        form = tk.LabelFrame(self.body, text="بيانات الشركة (تظهر في رأس البرنامج والفواتير)", padx=12, pady=10); form.pack(fill="x")
+        self.settings_vars = {}
+        locked = tk.Frame(form, bg="#eef4fa", highlightbackground="#c5d5e6", highlightthickness=1, padx=10, pady=6); locked.pack(fill="x", pady=(0, 6))
+        tk.Label(locked, text=f"🔒 {LICENSED_COMPANY} — {LICENSED_TAGLINE}", bg="#eef4fa", fg=NAVY, font=("Tahoma", 14, "bold")).pack(anchor="e")
+        tk.Label(locked, text=f"النسخة دي مرخّصة باسم الشركة، والاسم والشعار ثابتين ومش بيتغيّروا.   {DEVELOPER_MARK}", bg="#eef4fa", fg="#50647b", font=("Tahoma", 11)).pack(anchor="e")
+        for k, label in [("english", "اسم الشركة بالإنجليزية"), ("address", "العنوان / الفرع"), ("phone", "رقم الهاتف"),
+                         ("taxno", "الرقم الضريبي / السجل التجاري (اختياري)")]:
+            var = tk.StringVar(value=s[k] or ""); self.settings_vars[k] = var
+            col = tk.Frame(form); col.pack(fill="x", pady=3); tk.Label(col, text=label, anchor="e").pack(fill="x"); ttk.Entry(col, textvariable=var, justify="right").pack(fill="x")
+        ttk.Button(form, text="حفظ الإعدادات", command=self.save_settings).pack(anchor="e", pady=8)
+        if is_owner():
+            tf = tk.LabelFrame(self.body, text="🔒 بيانات إيصال الأمانة (للمالك بس)", padx=12, pady=8); tf.pack(fill="x", pady=(10, 0))
+            self.trust_vars = {k: tk.StringVar(value=s[k] or "") for k in ("trust_from", "trust_to", "trust_to_addr")}
+            row = tk.Frame(tf); row.pack(fill="x")
+            self.field(row, "وذلك من السيد", self.trust_vars["trust_from"])
+            self.field(row, "لتسليمها إلى السيد", self.trust_vars["trust_to"])
+            self.field(row, "المقيم في", self.trust_vars["trust_to_addr"])
+            ttk.Button(row, text="حفظ بيانات الإيصال", command=self.save_trust_settings).pack(side="right", padx=8, pady=(22, 0))
+        lf = tk.LabelFrame(self.body, text="شعار الشركة (يظهر فوق على الشمال وفي الفواتير والسندات وكشف الحساب)", padx=12, pady=8); lf.pack(fill="x", pady=(10, 0))
+        self._set_logo_img = self.load_logo_image(90)
+        self.set_logo_lbl = tk.Label(lf, image=self._set_logo_img)
+        self.set_logo_lbl.pack(side="right", padx=6)
+        lb = tk.Frame(lf); lb.pack(side="right", padx=12)
+        tk.Label(lb, text="🔒 الشعار ثابت (مرخّص)", fg="#50647b", font=("Tahoma", 12, "bold")).pack(anchor="e")
+        if is_owner(): self._lock_settings(); self._network_settings(); self._online_settings_section()
+        bf = tk.LabelFrame(self.body, text="النسخ الاحتياطي التلقائي (نسخة يوميًا عند فتح البرنامج وعند إغلاقه، ويُحتفظ بآخر 30 يومًا)", padx=12, pady=10); bf.pack(fill="x", pady=10)
+        self.bk_label = tk.Label(bf, text="المجلد الحالي: " + backup_dir(), anchor="e"); self.bk_label.pack(fill="x")
+        tk.Label(bf, text="لو المجلد المختار (فلاشة مثلًا) مش متاح وقت النسخ، النسخة بتتحفظ على الجهاز وبيظهر تنبيه.", anchor="e", fg="#50647b", font=("Tahoma", 11)).pack(fill="x")
+        b = tk.Frame(bf); b.pack(fill="x", pady=6)
+        ttk.Button(b, text="اختيار مجلد آخر للنسخ التلقائية (مثلًا فلاشة)", command=self.choose_backup_dir).pack(side="right")
+        ttk.Button(b, text="الرجوع لمجلد الجهاز الافتراضي", command=self.reset_backup_dir).pack(side="right", padx=6)
+
+    def _network_settings(self):
+        nf = tk.LabelFrame(self.body, text="🌐 الشبكة وقاعدة البيانات (للمالك بس)", padx=12, pady=10); nf.pack(fill="x", pady=(10, 0))
+        tk.Label(nf, text="الداتا محفوظة: " + server_label() + "   •   " + version_text(), anchor="e", font=("Tahoma", 12, "bold"), fg=NAVY).pack(fill="x")
+        if using_pg():
+            try:
+                with db() as c:
+                    devs = c.execute("SELECT application_name, client_addr FROM pg_stat_activity WHERE datname=current_database() AND application_name LIKE 'WarehouseDesktop%' ORDER BY backend_start").fetchall()
+                names = []
+                for a, ip in devs:
+                    n = (a or "").replace("WarehouseDesktop", "").strip(" -") or str(ip or "الجهاز الأساسي")
+                    if n not in names: names.append(n)
+                tk.Label(nf, text=f"الأجهزة المتصلة دلوقتي ({len(names)}): " + "، ".join(names), anchor="e", fg="#1c7c4d").pack(fill="x")
+            except Exception: pass
+            tk.Label(nf, text="النسخة الاحتياطية التلقائية على الجهاز ده بتتاخد من السيرفر كملف SQLite عادي (يتفتح بالنسخة الأوفلاين كمان).",
+                     anchor="e", fg="#50647b", font=("Tahoma", 11), wraplength=900, justify="right").pack(fill="x")
+        ttk.Button(nf, text="إعدادات الاتصال بالسيرفر", command=self.open_db_settings).pack(anchor="e", pady=(8, 0))
+
+    def _online_settings_section(self):
+        of = tk.LabelFrame(self.body, text="📱 المتابعة من الموبايل — Telegram و Google Sheets (للمالك بس)", padx=12, pady=10); of.pack(fill="x", pady=(10, 0))
+        cfg = ONLINE_CFG
+        st = "شغالة على الجهاز ده" if cfg.get("enabled") else "مقفولة على الجهاز ده"
+        parts = []
+        if cfg.get("tg_chats"): parts.append(f"Telegram: {len(cfg['tg_chats'])} موبايل مربوط")
+        if cfg.get("gs_enabled"): parts.append("Google Sheets: شغال")
+        tk.Label(of, text=f"الحالة: {st}" + ("  •  " + "  •  ".join(parts) if parts else ""), anchor="e", font=("Tahoma", 12, "bold"), fg=NAVY).pack(fill="x")
+        for k in ("status", "status_tg", "status_gs"):
+            if cfg.get(k): tk.Label(of, text=cfg[k], anchor="e", fg="#50647b", font=("Tahoma", 11)).pack(fill="x")
+        ttk.Button(of, text="إعدادات المتابعة من الموبايل", command=self.online_settings_dialog).pack(anchor="e", pady=(8, 0))
+
+    def online_settings_dialog(self):
+        if not is_owner(): return
+        cfg = load_online_config()
+        d = tk.Toplevel(self); d.title("المتابعة من الموبايل"); d.configure(bg=BG)
+        _center(d, 760, min(self.winfo_screenheight() - 60, 900))
+        top = tk.Frame(d, bg=NAVY); top.pack(fill="x")
+        tk.Label(top, text="📱 المتابعة من الموبايل", font=("Tahoma", 16, "bold"), fg="white", bg=NAVY).pack(pady=8)
+        outer = tk.Frame(d, bg=BG); outer.pack(fill="both", expand=True)
+        cv = tk.Canvas(outer, bg=BG, highlightthickness=0); sb = ttk.Scrollbar(outer, orient="vertical", command=cv.yview)
+        body = tk.Frame(cv, bg=BG, padx=16, pady=8); win = cv.create_window(0, 0, window=body, anchor="nw")
+        body.bind("<Configure>", lambda e: cv.configure(scrollregion=cv.bbox("all"))); cv.bind("<Configure>", lambda e: cv.itemconfigure(win, width=e.width))
+        cv.configure(yscrollcommand=sb.set); sb.pack(side="left", fill="y"); cv.pack(side="right", fill="both", expand=True)
+        cv.bind_all("<MouseWheel>", lambda e: cv.yview_scroll(-1 if e.delta > 0 else 1, "units"))
+        B = lambda k: tk.BooleanVar(value=bool(cfg.get(k)))
+        S = lambda k: tk.StringVar(value=str(cfg.get(k) if cfg.get(k) is not None else ""))
+        v = {k: B(k) for k in ("enabled", "show_profit", "tg_daily", "tg_commands", "al_low", "al_returns", "al_sensitive", "al_credit", "al_attendance", "al_expected", "gs_enabled")}
+        v.update({k: S(k) for k in ("tg_token", "tg_time", "al_big", "gs_sheet", "gs_every")})
+        key_path = [cfg.get("gs_key") or ""]
+        def chk(parent, k, text): tk.Checkbutton(parent, text=text, variable=v[k], bg=BG, anchor="e", justify="right", wraplength=640, font=("Tahoma", 11)).pack(fill="x")
+        def ent(parent, k, label, width=None, ltr=True):
+            tk.Label(parent, text=label, bg=BG, anchor="e", font=("Tahoma", 11)).pack(fill="x")
+            e = ttk.Entry(parent, textvariable=v[k], justify="left" if ltr else "right"); e.pack(fill="x", pady=(0, 6)); return e
+        chk(body, "enabled", "الجهاز ده هو اللي بيبعت التقارير والتنبيهات ويحدّث الشيت (فعّلها على جهاز واحد بس — الأساسي)")
+        chk(body, "show_profit", "إظهار الأرباح في التقارير والشيت")
+        msg = tk.Label(body, text="", bg=BG, fg=NAVY, font=("Tahoma", 12, "bold"), justify="center", wraplength=680)
+        gmsg = tk.Label(body, text="", bg=BG, fg=NAVY, font=("Tahoma", 12, "bold"), justify="center", wraplength=680)
+
+        # ----- Telegram -----
+        tf = tk.LabelFrame(body, text="Telegram", bg=BG, padx=12, pady=8); tf.pack(fill="x", pady=8)
+        tk.Label(tf, text="1) من تليجرام كلّم @BotFather واعمل بوت جديد (/newbot)، وانسخ التوكن اللي هيديهولك هنا.\n2) افتح البوت بتاعك من الموبايل وابعتله /start، وبعدين دوس «ربط الموبايل».",
+                 bg=BG, fg="#50647b", font=("Tahoma", 10), justify="right", anchor="e", wraplength=680).pack(fill="x")
+        ent(tf, "tg_token", "توكن البوت")
+        chats_lbl = tk.Label(tf, text="", bg=BG, anchor="e", fg="#1c7c4d", font=("Tahoma", 11, "bold")); chats_lbl.pack(fill="x")
+        def show_chats():
+            ch = ONLINE_CFG.get("tg_chats") or {}; rp = ONLINE_CFG.get("tg_reps") or {}
+            parts = []
+            if ch: parts.append("المديرين: " + "، ".join(ch.values()))
+            if any(not is_acct(x) for x in rp.values()): parts.append("المناديب: " + "، ".join(f"{v['name']} ({v.get('tg', '')})" for v in rp.values() if not is_acct(v)))
+            if any(is_acct(x) for x in rp.values()): parts.append("المحاسبين: " + "، ".join(f"{v['name']} ({v.get('tg', '')})" for v in rp.values() if is_acct(v)))
+            chats_lbl.config(text="  •  ".join(parts) if parts else "لسه مفيش موبايل مربوط")
+            stg = ONLINE_CFG.get("status_tg") or ""
+            if stg.startswith("✖"): chats_lbl.config(text=chats_lbl.cget("text") + "\n" + stg, fg="#b91c1c")
+        show_chats()
+        def say(t, color=NAVY): msg.config(text=t, fg=color); d.update()
+        def link():
+            try: _link()
+            except Exception as e:
+                write_error_log("ربط الموبايل: " + repr(e)); say("✖ " + str(e)[:300], "#b91c1c")
+        def _link():
+            tok = v["tg_token"].get().strip()
+            if not tok: return say("اكتب توكن البوت الأول", "#b91c1c")
+            if tok != ONLINE_CFG.get("tg_token"): save_online_config(tg_token=tok, tg_offset=0)
+            say("بيدوّر على رسالة /start ...")
+            try:
+                me = tg_call(tok, "getMe")
+                found = dict(ONLINE_CFG.get("tg_pending") or {})
+                try:
+                    ups = tg_call(tok, "getUpdates", {"offset": int(ONLINE_CFG.get("tg_offset") or 0), "timeout": 0}, timeout=15)
+                    off = int(ONLINE_CFG.get("tg_offset") or 0)
+                    for u in ups or []:
+                        off = max(off, u["update_id"] + 1); m = u.get("message") or {}; ch = m.get("chat") or {}
+                        if ch.get("id") and str(ch.get("id")) not in (ONLINE_CFG.get("tg_chats") or {}) and str(ch.get("id")) not in (ONLINE_CFG.get("tg_reps") or {}):
+                            found[str(ch["id"])] = " ".join(x for x in (ch.get("first_name"), ch.get("last_name")) if x) or ch.get("title") or ch.get("username") or str(ch["id"])
+                    save_online_config(tg_offset=off)
+                except TelegramError as e:
+                    if "Conflict" not in str(e): raise
+            except TelegramError as e: return say("✖ " + str(e), "#b91c1c")
+            if not found: return say(f"البوت @{me.get('username')} شغال ✔ — بس لسه موصلتلوش رسالة جديدة.\nابعتله أي رسالة من الموبايل (مثلًا: سلام)، استنى 5 ثواني، ودوس «ربط الموبايل» تاني.", "#9a6700")
+            chats = dict(ONLINE_CFG.get("tg_chats") or {}); reps = dict(ONLINE_CFG.get("tg_reps") or {}); pending = dict(ONLINE_CFG.get("tg_pending") or {})
+            for cid, name in found.items():
+                d.lift(); d.focus_force()
+                role = self.tg_role_dialog(d, name)
+                if role == "manager":
+                    chats[cid] = name
+                    try: tg_send_text(tok, cid, f"✅ اتربطت بنجاح بـ {_e(LICENSED_COMPANY)}\n\n" + tg_help_text())
+                    except TelegramError: pass
+                elif isinstance(role, tuple) and role[0] == "acct":
+                    reps[cid] = {"emp_id": role[1], "name": role[2], "tg": name, "role": "acct"}
+                    try: tg_send_text(tok, cid, f"✅ اتربطت كمحاسب: {_e(role[2])}\n\n" + acct_help_text())
+                    except TelegramError: pass
+                elif isinstance(role, tuple):
+                    reps[cid] = {"emp_id": role[0], "name": role[1], "tg": name}
+                    try: tg_send_text(tok, cid, f"✅ اتربطت كمندوب: {_e(role[1])}\n\n" + rep_help_text())
+                    except TelegramError: pass
+                if role is not None: pending.pop(cid, None)
+            save_online_config(tg_chats=chats, tg_reps=reps, tg_pending=pending); show_chats(); say("✔ تم", "#1c7c4d")
+        def test_msg():
+            tok = v["tg_token"].get().strip(); ch = ONLINE_CFG.get("tg_chats") or {}
+            if not tok or not ch: return say("اربط موبايل الأول", "#b91c1c")
+            try:
+                for cid in ch: tg_send_text(tok, cid, "👋 رسالة تجربة من برنامج المخازن\n\n" + cash_text())
+                say("✔ الرسالة اتبعتت", "#1c7c4d")
+            except Exception as e: say("✖ " + str(e), "#b91c1c")
+        def unlink():
+            if messagebox.askyesno("إلغاء الربط", "تلغي ربط كل الموبايلات (المديرين والمناديب)؟", parent=d): save_online_config(tg_chats={}, tg_reps={}, tg_pending={}); show_chats()
+        bf = tk.Frame(tf, bg=BG); bf.pack(fill="x", pady=4)
+        ttk.Button(bf, text="ربط الموبايل", command=link).pack(side="right", padx=4)
+        ttk.Button(bf, text="رسالة تجربة", command=test_msg).pack(side="right", padx=4)
+        ttk.Button(bf, text="إلغاء ربط الكل", command=unlink).pack(side="left", padx=4)
+        ttk.Button(bf, text="👥 مستخدمين البوت", command=lambda: (self.tg_users_dialog(d, v["tg_token"].get().strip()), show_chats())).pack(side="right", padx=4)
+        msg.pack(in_=tf, fill="x", pady=4)
+        rf = tk.Frame(tf, bg=BG); rf.pack(fill="x", pady=(6, 0))
+        chk(rf, "tg_daily", "تقرير آخر اليوم (مبيعات، تحصيلات، مصروفات، خزنة، أرباح)")
+        ent(rf, "tg_time", "ساعة التقرير (24 ساعة، مثال 21:00)")
+        chk(rf, "tg_commands", "البوت يرد على الأسئلة: اليوم، امبارح، خزنة، حضور، طلبات، شيت")
+        af = tk.LabelFrame(tf, text="التنبيهات الفورية", bg=BG, padx=10, pady=6); af.pack(fill="x", pady=6)
+        chk(af, "al_returns", "مرتجع مبيعات أو مشتريات")
+        chk(af, "al_sensitive", "جرد الخزنة، حذف عميل أو صنف أو موظف أو عربية أو حركة خزنة، وتغيير المستخدمين")
+        chk(af, "al_credit", "عميل عدّى الحد الائتماني")
+        chk(af, "al_attendance", "ملخص الحضور أول ما يتسجل")
+        chk(af, "al_expected", "الصبح: العملاء المتوقع يطلبوا النهارده (والمندوب بيوصله عملاءه بس)")
+        ent(af, "al_big", "تنبيه لفاتورة مبيعات أكبر من (ج.م) — اكتب 0 لو مش عايزه")
+
+        # ----- Google Sheets -----
+        gf = tk.LabelFrame(body, text="Google Sheets", bg=BG, padx=12, pady=8); gf.pack(fill="x", pady=8)
+        chk(gf, "gs_enabled", "تحديث شيت Google تلقائي (الأصناف، العملاء والموردين، فواتير وسندات آخر 30 يوم)")
+        key_lbl = tk.Label(gf, text="", bg=BG, anchor="e", font=("Tahoma", 11)); key_lbl.pack(fill="x")
+        email_var = tk.StringVar()
+        def show_key():
+            em = gs_key_email(key_path[0]) if key_path[0] else ""
+            email_var.set(em)
+            key_lbl.config(text=("✔ ملف المفتاح متحط. شارك الشيت (Editor) مع الإيميل ده:" if em else "لسه مفيش ملف مفتاح Google (JSON)"), fg="#1c7c4d" if em else "#9a6700")
+        e_email = ttk.Entry(gf, textvariable=email_var, justify="left", state="readonly"); e_email.pack(fill="x", pady=(0, 4))
+        def pick_key():
+            p = filedialog.askopenfilename(parent=d, title="اختار ملف مفتاح Google (JSON)", filetypes=[("JSON", "*.json")])
+            if not p: return
+            if not gs_key_email(p): return gmsg.config(text="✖ الملف ده مش ملف مفتاح Service Account", fg="#b91c1c")
+            dest = os.path.join(APP_DATA_DIR, "google_key.json")
+            import shutil; shutil.copyfile(p, dest); key_path[0] = dest; _GS_CREDS.pop(dest, None); show_key()
+        def copy_email():
+            self.clipboard_clear(); self.clipboard_append(email_var.get()); gmsg.config(text="✔ الإيميل اتنسخ", fg="#1c7c4d")
+        kb = tk.Frame(gf, bg=BG); kb.pack(fill="x")
+        ttk.Button(kb, text="اختيار ملف المفتاح (JSON)", command=pick_key).pack(side="right", padx=4)
+        ttk.Button(kb, text="نسخ الإيميل", command=copy_email).pack(side="right", padx=4)
+        show_key()
+        ent(gf, "gs_sheet", "لينك الشيت (من المتصفح)")
+        ent(gf, "gs_every", "التحديث كل كام دقيقة (لو فيه حاجة اتغيرت)")
+        def sync_now():
+            c = collect()
+            if c is None: return
+            say = lambda t, color=NAVY: (gmsg.config(text=t, fg=color), d.update())
+            say("بيحدّث الشيت ...")
+            old = getattr(_TLS, "as_owner", False); _TLS.as_owner = bool(c["show_profit"])
+            try:
+                n = sheets_sync(c); say(f"✔ الشيت اتحدث ({n} صف)", "#1c7c4d")
+                save_online_config(status_gs=f"{datetime.now().strftime('%H:%M')} — ✔ الشيت اتحدث ({n} صف)")
+            except Exception as e: say("✖ " + str(e), "#b91c1c")
+            finally: _TLS.as_owner = old
+        ttk.Button(gf, text="تحديث الشيت دلوقتي", command=sync_now).pack(anchor="e", pady=4)
+        gmsg.pack(in_=gf, fill="x", pady=4)
+
+        def collect():
+            c = dict(ONLINE_CFG)
+            for k in ("enabled", "show_profit", "tg_daily", "tg_commands", "al_low", "al_returns", "al_sensitive", "al_credit", "al_attendance", "al_expected", "gs_enabled"): c[k] = bool(v[k].get())
+            c["tg_token"] = v["tg_token"].get().strip(); c["gs_sheet"] = v["gs_sheet"].get().strip(); c["gs_key"] = key_path[0]
+            t = v["tg_time"].get().strip() or "21:00"
+            if not re.fullmatch(r"([01]?\d|2[0-3]):[0-5]\d", t): say("✖ ساعة التقرير لازم تبقى زي 21:00", "#b91c1c"); return None
+            c["tg_time"] = t
+            try: c["al_big"] = float(v["al_big"].get().strip() or 0); c["gs_every"] = max(int(float(v["gs_every"].get().strip() or 10)), 2)
+            except ValueError: say("✖ مبلغ الفاتورة الكبيرة ودقايق التحديث لازم يبقوا أرقام", "#b91c1c"); return None
+            if c["gs_enabled"] and (not c["gs_key"] or not gs_sheet_id(c["gs_sheet"])): say("✖ عشان تشغّل الشيت: اختار ملف المفتاح وحط لينك الشيت", "#b91c1c"); return None
+            return c
+        def save():
+            c = collect()
+            if c is None: return
+            if c["tg_token"] != ONLINE_CFG.get("tg_token"): c["tg_offset"] = 0
+            if c["enabled"] and not ONLINE_CFG.get("enabled"): c["last_audit_id"] = None; c["last_invoice_id"] = None   # التنبيهات تبدأ من دلوقتي
+            save_online_config(**c)
+            with db() as cc: log(cc, "إعدادات المتابعة من الموبايل", ("شغالة" if c["enabled"] else "مقفولة") + f" — Telegram: {len(c.get('tg_chats') or {})} موبايل — Sheets: {'شغال' if c['gs_enabled'] else 'مقفول'}")
+            start_online_service().nudge()
+            cv.unbind_all("<MouseWheel>"); d.destroy()
+            try: self.show_settings()
+            except Exception: pass
+        bb = tk.Frame(d, bg=BG); bb.pack(fill="x", pady=8)
+        ttk.Button(bb, text="حفظ", command=save).pack(side="right", padx=16)
+        ttk.Button(bb, text="إغلاق", command=lambda: (cv.unbind_all("<MouseWheel>"), d.destroy())).pack(side="right")
+        d.protocol("WM_DELETE_WINDOW", lambda: (cv.unbind_all("<MouseWheel>"), d.destroy()))
+        d.transient(self); d.grab_set()
+
+    def tg_users_dialog(self, parent, tok):
+        """ليستة كل اللي متربطين بالبوت (مديرين ومناديب) + اللي مستنيين: تغيير الصفة، إلغاء الربط."""
+        w = tk.Toplevel(parent); w.title("مستخدمين البوت"); w.configure(bg=BG); _center(w, 760, 470)
+        top = tk.Frame(w, bg=NAVY); top.pack(fill="x")
+        tk.Label(top, text="👥 مستخدمين البوت", font=("Tahoma", 15, "bold"), fg="white", bg=NAVY).pack(pady=8)
+        tk.Label(w, text="الاسم = اسمه على تليجرام  •  المدير بيوصله التقارير والتنبيهات ويوافق على الطلبات  •  المحاسب بيشوف التقارير (من غير المكسب) ويوافق على الطلبات ويسجل حضوره  •  المندوب بيبعت طلبات تحصيل وحضور",
+                 bg=BG, fg="#50647b", font=("Tahoma", 10), wraplength=720, justify="right").pack(anchor="e", padx=12, pady=(6, 0))
+        tr = self.tree(w, ("name", "role", "emp", "cid"), ("الاسم على تليجرام", "الصفة", "اسمه في البرنامج", "رقم تليجرام"), [220, 160, 200, 140])
+        tr.tag_configure("pending", foreground="#9a6700")
+        def fill():
+            for x in tr.get_children(): tr.delete(x)
+            cfg = ONLINE_CFG
+            for cid, name in (cfg.get("tg_chats") or {}).items(): tr.insert("", "end", iid="m" + cid, values=(name, "مدير", "", cid))
+            for cid, r in (cfg.get("tg_reps") or {}).items(): tr.insert("", "end", iid="r" + cid, values=(r.get("tg", ""), "محاسب" if is_acct(r) else "مندوب", r.get("name", ""), cid))
+            for cid, name in (cfg.get("tg_pending") or {}).items(): tr.insert("", "end", iid="p" + cid, values=(name, "⏳ مستني ربط", "", cid), tags=("pending",))
+        def sel():
+            s = tr.selection()
+            if not s: messagebox.showwarning("تنبيه", "حدد اسم من الليستة الأول", parent=w); return None
+            return s[0][0], s[0][1:], tr.item(s[0])["values"][0]
+        def change():
+            x = sel()
+            if not x: return
+            kind, cid, name = x
+            role = self.tg_role_dialog(w, name)
+            if role is None: return
+            chats = dict(ONLINE_CFG.get("tg_chats") or {}); reps = dict(ONLINE_CFG.get("tg_reps") or {}); pend = dict(ONLINE_CFG.get("tg_pending") or {})
+            chats.pop(cid, None); reps.pop(cid, None); pend.pop(cid, None)
+            note = None
+            if role == "manager": chats[cid] = name; note = f"✅ اتربطت كمدير في {_e(LICENSED_COMPANY)}\n\n" + tg_help_text()
+            elif isinstance(role, tuple) and role[0] == "acct": reps[cid] = {"emp_id": role[1], "name": role[2], "tg": name, "role": "acct"}; note = f"✅ اتربطت كمحاسب: {_e(role[2])}\n\n" + acct_help_text()
+            elif isinstance(role, tuple): reps[cid] = {"emp_id": role[0], "name": role[1], "tg": name}; note = f"✅ اتربطت كمندوب: {_e(role[1])}\n\n" + rep_help_text()
+            save_online_config(tg_chats=chats, tg_reps=reps, tg_pending=pend)
+            if note and tok:
+                try: tg_send_text(tok, cid, note)
+                except Exception: pass
+            fill()
+        def remove():
+            x = sel()
+            if not x: return
+            kind, cid, name = x
+            if not messagebox.askyesno("إلغاء الربط", f"تلغي ربط «{name}»؟\nمش هيقدر يستخدم البوت تاني غير لما تربطه من جديد.", parent=w): return
+            chats = dict(ONLINE_CFG.get("tg_chats") or {}); reps = dict(ONLINE_CFG.get("tg_reps") or {}); pend = dict(ONLINE_CFG.get("tg_pending") or {})
+            was_linked = cid in chats or cid in reps
+            chats.pop(cid, None); reps.pop(cid, None); pend.pop(cid, None)
+            save_online_config(tg_chats=chats, tg_reps=reps, tg_pending=pend)
+            if was_linked and tok:
+                try: tg_send_text(tok, cid, "ربطك بالبوت اتلغى.")
+                except Exception: pass
+            fill()
+        bf = tk.Frame(w, bg=BG); bf.pack(fill="x", pady=8, padx=12)
+        ttk.Button(bf, text="تغيير الصفة / ربط", command=change).pack(side="right", padx=4)
+        ttk.Button(bf, text="إلغاء الربط", command=remove).pack(side="right", padx=4)
+        ttk.Button(bf, text="إغلاق", command=w.destroy).pack(side="left", padx=4)
+        tr.bind("<Double-1>", lambda e: change())
+        fill(); w.transient(parent); w.grab_set(); parent.wait_window(w)
+
+    def tg_role_dialog(self, parent, name):
+        """«فلان» يتربط بصفته إيه؟ بترجع 'manager' أو (رقم المندوب, اسمه) أو 'ignore' أو None."""
+        with db() as c:
+            reps = c.execute("SELECT id,name FROM employees WHERE kind='مندوب' AND COALESCE(active,1)=1 ORDER BY name").fetchall()
+            emps = c.execute("SELECT id,name FROM employees WHERE COALESCE(active,1)=1 ORDER BY name").fetchall()
+        w = tk.Toplevel(parent); w.title("ربط موبايل"); w.configure(bg=BG); w.resizable(False, False); _center(w, 560, 460)
+        tk.Label(w, text=f"«{name}» بعت رسالة للبوت.\nيتربط بصفته إيه؟", font=("Tahoma", 13, "bold"), fg=NAVY, bg=BG, justify="center").pack(pady=12)
+        role = tk.StringVar(value="manager"); rv = tk.StringVar()
+        tk.Radiobutton(w, text="مدير / مالك — يوصله التقارير والتنبيهات ويوافق على طلبات التحصيل", variable=role, value="manager", bg=BG, anchor="e", wraplength=480, justify="right").pack(fill="x", padx=16)
+        tk.Radiobutton(w, text="مندوب — يقدر يبعت طلبات سندات تحصيل بس", variable=role, value="rep", bg=BG, anchor="e", state="normal" if reps else "disabled").pack(fill="x", padx=16)
+        names = {r["name"]: r["id"] for r in reps}
+        cb = ttk.Combobox(w, textvariable=rv, values=list(names), state="readonly", justify="right"); cb.pack(fill="x", padx=40, pady=4)
+        if not reps: tk.Label(w, text="(لسه مفيش موظفين نوعهم «مندوب» — ضيفهم من شاشة الموظفين)", bg=BG, fg="#9a6700", font=("Tahoma", 10)).pack()
+        tk.Radiobutton(w, text="محاسب — يشوف التقارير (من غير المكسب)، ويوافق على الطلبات، ويسجل حضوره بالموقع", variable=role, value="acct", bg=BG, anchor="e",
+                       wraplength=520, justify="right", state="normal" if emps else "disabled").pack(fill="x", padx=16, pady=(8, 0))
+        av = tk.StringVar(); enames = {r["name"]: r["id"] for r in emps}
+        acb = ttk.Combobox(w, textvariable=av, values=list(enames), state="readonly", justify="right"); acb.pack(fill="x", padx=40, pady=4)
+        acb.bind("<<ComboboxSelected>>", lambda e: role.set("acct"))
+        tk.Radiobutton(w, text="تجاهل الرسالة دي", variable=role, value="ignore", bg=BG, anchor="e").pack(fill="x", padx=16)
+        res = {"v": None}
+        def ok():
+            if role.get() == "acct":
+                if av.get() not in enames: return messagebox.showwarning("تنبيه", "اختار المحاسب من قايمة الموظفين", parent=w)
+                res["v"] = ("acct", enames[av.get()], av.get())
+            elif role.get() == "rep":
+                if rv.get() not in names: return messagebox.showwarning("تنبيه", "اختار المندوب من القايمة", parent=w)
+                res["v"] = (names[rv.get()], rv.get())
+            else: res["v"] = role.get()
+            w.destroy()
+        cb.bind("<<ComboboxSelected>>", lambda e: role.set("rep"))
+        bf = tk.Frame(w, bg=BG); bf.pack(pady=12)
+        ttk.Button(bf, text="تمام", command=ok).pack(side="right", padx=6); ttk.Button(bf, text="بعدين", command=w.destroy).pack(side="right")
+        w.transient(parent); w.grab_set(); w.lift(); w.focus_force(); parent.wait_window(w)
+        return res["v"]
+
+    def show_att_requests(self):
+        self.clear(); self.title_label("حضور المناديب بالموقع (من تليجرام)")
+        tk.Label(self.body, text="المندوب يكتب للبوت «حضور» ويبعت موقعه. لو جوه المخزن حضوره بيتسجل على طول بساعة تليجرام. لو بعيد، بيوصلك طلب توافق عليه أو ترفضه.",
+                 bg=BG, fg="#50647b", font=("Tahoma", 11), wraplength=1100, justify="right").pack(anchor="e")
+        with db() as c: pl = att_place(c)
+        sf = tk.LabelFrame(self.body, text="📍 مكان المخزن", padx=10, pady=6); sf.pack(fill="x", pady=6)
+        posv = tk.StringVar(value=f"{pl['lat']:.6f}, {pl['lon']:.6f}" if pl["lat"] is not None else "")
+        radv = tk.StringVar(value=str(pl["radius"])); autov = tk.IntVar(value=int(pl["auto"])); livev = tk.IntVar(value=int(pl["live"]))
+        r1 = tk.Frame(sf); r1.pack(fill="x")
+        tk.Label(r1, text="الإحداثيات:", font=("Tahoma", 11)).pack(side="right")
+        ttk.Entry(r1, textvariable=posv, width=28, justify="center").pack(side="right", padx=4)
+        tk.Label(r1, text="المسافة المسموحة (متر):", font=("Tahoma", 11)).pack(side="right", padx=(14, 0))
+        ttk.Entry(r1, textvariable=radv, width=7, justify="center").pack(side="right", padx=4)
+        ttk.Button(r1, text="🗺 شوفه على الخريطة", command=lambda: posv.get().strip() and webbrowser.open("https://maps.google.com/?q=" + posv.get().replace(" ", ""))).pack(side="left", padx=4)
+        r2 = tk.Frame(sf); r2.pack(fill="x", pady=(4, 0))
+        tk.Checkbutton(r2, text="اللي جوه المخزن حضوره يتسجل لوحده (من غير موافقة)", variable=autov).pack(side="right")
+        tk.Checkbutton(r2, text="اطلب «موقع مباشر Live» (أصعب في التزوير)", variable=livev).pack(side="right", padx=14)
+        tk.Label(sf, text="أسهل طريقة: وانت في المخزن ابعت للبوت «موقع المخزن» ودوس الزرار. أو من جوجل ماب: كليك يمين على المخزن ← انسخ الأرقام والصقها هنا.",
+                 fg="#50647b", font=("Tahoma", 10)).pack(anchor="e")
+        def save_place():
+            if not is_owner(): return messagebox.showwarning("تنبيه", "المالك بس اللي يغيّر مكان المخزن")
+            txt = posv.get().strip().translate(_AR_DIGITS).replace("،", ",")
+            lat = lon = None
+            if txt:
+                try: lat, lon = [float(x) for x in txt.replace(" ", "").split(",")[:2]]; assert -90 <= lat <= 90 and -180 <= lon <= 180
+                except Exception: return messagebox.showerror("خطأ", "الإحداثيات مش مظبوطة — لازم تبقى زي: 30.123456, 31.234567")
+            try: rad = int(float(radv.get())); assert 20 <= rad <= 5000
+            except Exception: return messagebox.showerror("خطأ", "المسافة لازم تبقى رقم من 20 لـ 5000 متر")
+            with db() as c:
+                c.execute("UPDATE settings SET wh_lat=?, wh_lon=?, wh_radius=?, att_auto=?, att_live=? WHERE id=1", (lat, lon, rad, autov.get(), livev.get()))
+                log(c, "إعدادات حضور المناديب", f"{txt or 'مفيش موقع'} — {rad} م — تلقائي: {'أيوه' if autov.get() else 'لأ'} — مباشر: {'أيوه' if livev.get() else 'لأ'}")
+            self.status.config(text="✔ اتحفظ مكان المخزن")
+        ttk.Button(sf, text="حفظ", command=save_place).pack(anchor="w")
+        bar = tk.Frame(self.body, bg=BG); bar.pack(fill="x", pady=6)
+        flt = tk.StringVar(value="مستنية موافقة")
+        ttk.Combobox(bar, textvariable=flt, values=["مستنية موافقة", "الكل"], state="readonly", width=16, justify="right").pack(side="right")
+        tree = self.tree(self.body, ("id", "day", "time", "rep", "dist", "reason", "status"),
+                         ("رقم", "اليوم", "الساعة", "المندوب", "البعد عن المخزن", "السبب", "الحالة"), [60, 110, 100, 180, 140, 240, 240])
+        tree.tag_configure("pending", foreground="#9a6700"); tree.tag_configure("rejected", foreground="#b91c1c"); tree.tag_configure("approved", foreground="#1c7c4d")
+        locs = {}
+        def fill(*a):
+            for x in tree.get_children(): tree.delete(x)
+            with db() as c:
+                cond = "WHERE r.status='pending'" if flt.get() == "مستنية موافقة" else ""
+                rows = c.execute(f"SELECT r.*, e.name rname FROM att_requests r LEFT JOIN employees e ON e.id=r.rep_id {cond} ORDER BY r.id DESC LIMIT 500").fetchall()
+            for r in rows:
+                locs[str(r["id"])] = (r["lat"], r["lon"])
+                d = "—" if r["dist"] is None else (f"{r['dist'] / 1000:.1f} كم" if r["dist"] >= 1000 else f"{r['dist']:.0f} متر")
+                st = REQ_STATUS.get(r["status"], r["status"]) + (f" — {r['decided_by']}" if r["status"] != "pending" and r["decided_by"] else "")
+                tree.insert("", "end", iid=str(r["id"]), values=(r["id"], r["a_date"], time12(r["check_in"]), r["rname"] or "", d + (" 📡" if r["live"] else ""), r["reason"] or "", st), tags=(r["status"],))
+        def decide(ok):
+            sel = tree.selection()
+            if not sel: return messagebox.showwarning("تنبيه", "حدد طلب الأول")
+            v = tree.item(sel[0])["values"]
+            if not messagebox.askyesno("تأكيد", f"{'توافق على' if ok else 'ترفض'} حضور «{v[3]}» يوم {v[1]} الساعة {v[2]}؟"): return
+            done, text = decide_att_request(int(sel[0]), ok, CURRENT_USER.get("username", ""))
+            (messagebox.showinfo if done else messagebox.showwarning)("حضور المناديب", text)
+            if ONLINE_SERVICE[0]: ONLINE_SERVICE[0].nudge()
+            fill()
+        def show_map():
+            sel = tree.selection()
+            if sel and locs.get(sel[0], (None,))[0] is not None: webbrowser.open(maps_link(*locs[sel[0]]))
+        ttk.Button(bar, text="✅ موافقة", command=lambda: decide(True)).pack(side="right", padx=(16, 4))
+        ttk.Button(bar, text="❌ رفض", command=lambda: decide(False)).pack(side="right", padx=4)
+        ttk.Button(bar, text="🗺 الموقع على الخريطة", command=show_map).pack(side="right", padx=4)
+        ttk.Button(bar, text="تحديث", command=fill).pack(side="right", padx=4)
+        tree.bind("<Double-1>", lambda e: show_map())
+        flt.trace_add("write", fill); fill()
+
+    def show_rep_requests(self):
+        self.clear(); self.title_label("طلبات تحصيل المناديب (من الموبايل)")
+        tk.Label(self.body, text="المندوب بيبعت الطلب من تليجرام، والسند مش بيتعمل غير لما توافق (من هنا أو من موبايل المدير). تاريخ السند = يوم الموافقة.",
+                 bg=BG, fg="#50647b", font=("Tahoma", 11)).pack(anchor="e")
+        bar = tk.Frame(self.body, bg=BG); bar.pack(fill="x", pady=6)
+        flt = tk.StringVar(value="مستنية موافقة")
+        ttk.Combobox(bar, textvariable=flt, values=["مستنية موافقة", "الكل"], state="readonly", width=16, justify="right").pack(side="right")
+        tree = self.tree(self.body, ("id", "at", "rep", "party", "amount", "bal", "status", "notes"),
+                         ("رقم", "الوقت", "المندوب", "العميل", "المبلغ", "رصيد العميل دلوقتي", "الحالة", "ملاحظات"), [60, 150, 140, 220, 110, 150, 230, 220])
+        tree.tag_configure("pending", foreground="#9a6700"); tree.tag_configure("rejected", foreground="#b91c1c"); tree.tag_configure("approved", foreground="#1c7c4d")
+        def fill(*a):
+            for x in tree.get_children(): tree.delete(x)
+            with db() as c:
+                cond = "WHERE r.status='pending'" if flt.get() == "مستنية موافقة" else ""
+                rows = c.execute(f"SELECT r.*, p.name pname, e.name rname FROM rep_requests r LEFT JOIN parties p ON p.id=r.party_id LEFT JOIN employees e ON e.id=r.rep_id {cond} ORDER BY r.id DESC LIMIT 500").fetchall()
+                bals = {pid: party_balance(c, pid, None) for pid in {r["party_id"] for r in rows if r["status"] == "pending"}}
+            for r in rows:
+                st = REQ_STATUS.get(r["status"], r["status"]) + (f" — {r['decided_by']}" if r["status"] != "pending" and r["decided_by"] else "")
+                tree.insert("", "end", iid=str(r["id"]), values=(r["id"], fmt_time(r["created_at"]) + "  " + r["created_at"][:10], r["rname"] or "", r["pname"] or "", fmt(r["amount"]),
+                            fmt(bals[r["party_id"]]) if r["party_id"] in bals else "", st, r["notes"] or ""), tags=(r["status"],))
+        def decide(ok):
+            sel = tree.selection()
+            if not sel: return messagebox.showwarning("تنبيه", "حدد طلب الأول")
+            rid = int(sel[0]); v = tree.item(sel[0])["values"]
+            if not messagebox.askyesno("تأكيد", (f"توافق على تحصيل {v[4]} ج.م من «{v[3]}» (المندوب: {v[2]})؟\nهيتعمل سند تحصيل بتاريخ النهارده." if ok else f"ترفض طلب رقم {rid}؟")): return
+            done, text = decide_rep_request(rid, ok, CURRENT_USER.get("username", ""))
+            (messagebox.showinfo if done else messagebox.showwarning)("طلبات المناديب", text)
+            if ONLINE_SERVICE[0]: ONLINE_SERVICE[0].nudge()
+            fill()
+        ttk.Button(bar, text="✅ موافقة", command=lambda: decide(True)).pack(side="right", padx=(16, 4))
+        ttk.Button(bar, text="❌ رفض", command=lambda: decide(False)).pack(side="right", padx=4)
+        ttk.Button(bar, text="تحديث", command=fill).pack(side="right", padx=4)
+        flt.trace_add("write", fill); fill()
+
+    def open_db_settings(self):
+        if not is_owner(): return
+        if db_connection_dialog(self):
+            messagebox.showinfo("الاتصال", "البرنامج هيتقفل ويفتح تاني بالإعدادات الجديدة.")
+            APP_RESTART[0] = True; self.destroy()
+
+    def save_settings(self):
+        v = {k: x.get().strip() for k, x in self.settings_vars.items()}
+        with db() as c:
+            c.execute("UPDATE settings SET company=?,tagline=?,english=?,address=?,phone=?,taxno=? WHERE id=1",
+                      (LICENSED_COMPANY, LICENSED_TAGLINE, v["english"], v["address"], v["phone"], v["taxno"]))
+            log(c, "تعديل الإعدادات", "بيانات الشركة")
+        self.refresh_header()
+        messagebox.showinfo("تم", "تم حفظ الإعدادات")
+
+    def save_trust_settings(self):
+        if not is_owner(): return
+        v = {k: x.get().strip() for k, x in self.trust_vars.items()}
+        with db() as c:
+            c.execute("UPDATE settings SET trust_from=?,trust_to=?,trust_to_addr=? WHERE id=1", (v["trust_from"], v["trust_to"], v["trust_to_addr"]))
+            log(c, "تعديل بيانات إيصال الأمانة", f"من: {v['trust_from']} — إلى: {v['trust_to']} — {v['trust_to_addr']}")
+        self.status.config(text="✔ تم حفظ بيانات إيصال الأمانة")
+
+    def choose_backup_dir(self):
+        d = filedialog.askdirectory(title="اختر مجلد النسخ الاحتياطي التلقائي")
+        if not d: return
+        if DB_CFG.get("mode") == "postgres":
+            cfg = dict(DB_CFG); cfg["backup_dir"] = d; save_db_config(cfg)
+            with db() as c: log(c, "تغيير مجلد النسخ التلقائي (الجهاز ده)", d)
+            return self.bk_label.config(text="المجلد الحالي: " + d)
+        with db() as c:
+            c.execute("UPDATE settings SET backup_dir=? WHERE id=1", (d,)); log(c, "تغيير مجلد النسخ التلقائي", d)
+        self.bk_label.config(text="المجلد الحالي: " + d)
+
+    def reset_backup_dir(self):
+        if DB_CFG.get("mode") == "postgres":
+            cfg = dict(DB_CFG); cfg["backup_dir"] = ""; save_db_config(cfg)
+            return self.bk_label.config(text="المجلد الحالي: " + LOCAL_BACKUP_DIR)
+        with db() as c:
+            c.execute("UPDATE settings SET backup_dir='' WHERE id=1"); log(c, "تغيير مجلد النسخ التلقائي", LOCAL_BACKUP_DIR)
+        self.bk_label.config(text="المجلد الحالي: " + LOCAL_BACKUP_DIR)
+
+    def backup(self):
+        target = filedialog.asksaveasfilename(title="حفظ نسخة احتياطية", defaultextension=".db", filetypes=[("قاعدة بيانات SQLite", "*.db")], initialfile=f"warehouse_backup_{date.today().isoformat()}.db")
+        if target:
+            try:
+                with db() as c:
+                    dest = sqlite3.connect(target)
+                    try: c.backup(dest)
+                    finally: dest.close()
+                    log(c, "نسخة احتياطية يدوية", target)
+            except Exception as e:
+                return messagebox.showerror("نسخة احتياطية", f"تعذّر حفظ النسخة:\n{e}")
+            messagebox.showinfo("نسخة احتياطية", "تم حفظ النسخة الاحتياطية بنجاح")
+
+def write_error_log(txt):
+    try:
+        os.makedirs(APP_DATA_DIR, exist_ok=True)
+        with open(os.path.join(APP_DATA_DIR, "error_log.txt"), "a", encoding="utf-8") as f: f.write(now_ts() + "\n" + txt + "\n")
+    except Exception: pass
+
+# ======================================================================
+# المتابعة من الموبايل: تقارير وتنبيهات Telegram + مزامنة Google Sheets
+# بتشتغل في الخلفية على جهاز واحد بس (اللي متعلّم عليه «الجهاز ده هو اللي بيبعت»).
+# الإعدادات في online_config.json على الجهاز ده.
+# ======================================================================
+import urllib.request, urllib.parse, urllib.error, html as _html
+ONLINE_CONFIG_PATH = os.path.join(APP_DATA_DIR, "online_config.json")
+ONLINE_DEFAULTS = {
+    "enabled": False, "show_profit": True,
+    "tg_token": "", "tg_chats": {}, "tg_daily": True, "tg_time": "21:00", "tg_commands": True,
+    "al_low": False, "al_big": 0, "al_returns": True, "al_sensitive": True, "al_credit": True, "al_attendance": True, "al_expected": True, "tg_morning": "09:00", "last_morning": "",
+    "gs_enabled": False, "gs_key": "", "gs_sheet": "", "gs_every": 10,
+    # حالة داخلية
+    "last_audit_id": None, "last_invoice_id": None, "last_daily": "", "last_att": "", "low_alerted": [],
+    "tg_offset": 0, "tg_pending": {}, "tg_reps": {}, "outbox": [], "gs_last": 0, "gs_mark": "", "status": "", "status_gs": "", "status_tg": "",
+}
+_ONLINE_LOCK = threading.RLock()
+ONLINE_CFG = {}
+
+def load_online_config():
+    with _ONLINE_LOCK:
+        cfg = json.loads(json.dumps(ONLINE_DEFAULTS))
+        try:
+            with open(ONLINE_CONFIG_PATH, encoding="utf-8") as f: cfg.update({k: v for k, v in json.load(f).items() if k in ONLINE_DEFAULTS})
+        except Exception: pass
+        ONLINE_CFG.clear(); ONLINE_CFG.update(cfg)
+        return ONLINE_CFG
+
+def save_online_config(**changes):
+    with _ONLINE_LOCK:
+        ONLINE_CFG.update(changes)
+        os.makedirs(APP_DATA_DIR, exist_ok=True)
+        tmp = ONLINE_CONFIG_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f: json.dump(ONLINE_CFG, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, ONLINE_CONFIG_PATH)
+
+load_online_config()
+
+def stock_map(c, upto=None):
+    """رصيد كل الأصناف في 3 استعلامات بس (بدل 4 لكل صنف)."""
+    upto = upto or date.today().isoformat()
+    st = {r[0]: float(r[1] or 0) for r in c.execute("SELECT id, COALESCE(opening_qty,0) FROM items").fetchall()}
+    for r in c.execute(f"SELECT l.item_id, COALESCE(SUM({STOCK_CASE}),0) FROM invoice_lines l JOIN invoices i ON i.id=l.invoice_id "
+                       f"WHERE {EFFECTIVE_DATE_SQL}<=? GROUP BY l.item_id", (upto,)).fetchall():
+        if r[0] in st: st[r[0]] += float(r[1])
+    for r in c.execute("SELECT item_id, COALESCE(SUM(qty),0) FROM damaged WHERE d_date<=? GROUP BY item_id", (upto,)).fetchall():
+        if r[0] in st: st[r[0]] -= float(r[1])
+    return st
+
+def low_stock_items(c):
+    st = stock_map(c)
+    return [(r["id"], r["name"], st.get(r["id"], 0.0), float(r["min_stock"])) for r in
+            c.execute("SELECT id,name,min_stock FROM items WHERE COALESCE(min_stock,0)>0 ORDER BY name").fetchall() if st.get(r["id"], 0.0) <= float(r["min_stock"])]
+
+# ---------- Telegram ----------
+class TelegramError(Exception): pass
+
+_SSL = [None]
+def _ssl_ctx():
+    """شهادات ويندوز + certifi (علشان الأجهزة اللي عليها أنتي فيرس بيفحص HTTPS أو ويندوز قديم)."""
+    if _SSL[0] is None:
+        import ssl
+        ctx = ssl.create_default_context()
+        try:
+            import certifi; ctx.load_verify_locations(certifi.where())
+        except Exception: pass
+        _SSL[0] = ctx
+    return _SSL[0]
+
+def tg_call(token, method, params=None, timeout=20):
+    if not token: raise TelegramError("مفيش توكن للبوت")
+    data = urllib.parse.urlencode({k: (json.dumps(v) if isinstance(v, (dict, list)) else v) for k, v in (params or {}).items()}).encode()
+    req = urllib.request.Request(f"https://api.telegram.org/bot{token}/{method}", data=data)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout, context=_ssl_ctx()) as r: res = json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        try: res = json.loads(e.read().decode("utf-8"))
+        except Exception: raise TelegramError(f"HTTP {e.code}")
+    except (urllib.error.URLError, OSError) as e:
+        why = str(getattr(e, "reason", "") or e)
+        if "CERTIFICATE" in why.upper() or "SSL" in why.upper(): raise TelegramError("مشكلة شهادة أمان (غالبًا برنامج الأنتي فيرس بيفحص النت): " + why[:150]) from e
+        if "timed out" in why.lower(): raise TelegramError("تليجرام مش بيرد (النت بطيء أو مقطوع)") from e
+        raise TelegramError("مفيش نت أو تليجرام مش متاح: " + why[:150]) from e
+    if not res.get("ok"):
+        d = res.get("description", "")
+        if "Unauthorized" in d or "Not Found" in d: raise TelegramError("توكن البوت غلط")
+        raise TelegramError(d or "خطأ من تليجرام")
+    return res.get("result")
+
+def tg_send_text(token, chat_id, text):
+    for i in range(0, len(text), 3800):      # حد تليجرام 4096 حرف
+        tg_call(token, "sendMessage", {"chat_id": chat_id, "text": text[i:i + 3800], "parse_mode": "HTML", "disable_web_page_preview": True})
+
+def queue_message(text):
+    """الرسالة بتتحط في طابور، وبتتبعت أول ما النت يبقى متاح."""
+    with _ONLINE_LOCK:
+        box = list(ONLINE_CFG.get("outbox") or []); box.append(text)
+        save_online_config(outbox=box[-200:])
+
+def _e(s): return _html.escape(str(s if s is not None else ""))
+
+def report_text(day, title=None):
+    rows = daily_rows(day)
+    out = [f"📊 <b>{_e(title or 'تقرير يوم')} {_e(day)}</b>", f"<i>{_e(LICENSED_COMPANY)}</i>"]
+    for kind, label, val in rows:
+        if kind == "h": out.append(f"\n<b>— {_e(label)} —</b>")
+        elif kind == "b": out.append(f"<b>{_e(label)}: {_e(val)}</b>")
+        else: out.append(f"{_e(label)}: {_e(val)}")
+    try:
+        vt = vehicles_day_text(day)
+        if vt: out.append(vt)
+        with db() as c:
+            r = c.execute("SELECT COUNT(*), COALESCE(SUM(amount),0) FROM loading_logs WHERE l_date=? AND expense_id IS NULL", (day,)).fetchone()
+        if r[0]: out.append(f"\n⏳ <b>تشوين لسه ماتصرفش:</b> {fmt(r[1])} ج.م ({r[0]} سطر)")
+    except Exception: pass
+    return "\n".join(out)
+
+def cash_text():
+    with db() as c: cb = cash_balance(c)
+    return f"💵 <b>رصيد الخزنة دلوقتي:</b> {fmt(cb)} ج.م\n<i>{now_ts()}</i>"
+
+def low_text():
+    with db() as c: low = low_stock_items(c)
+    if not low: return "✅ مفيش أصناف وصلت للحد الأدنى"
+    return f"⚠️ <b>أصناف وصلت للحد الأدنى ({len(low)}):</b>\n" + "\n".join(f"• {_e(n)}: {fmt(q)} (الحد {fmt(m)})" for _, n, q, m in low[:60])
+
+def attendance_text(day):
+    with db() as c:
+        rows = c.execute("SELECT m.name, a.present, a.check_in, a.late_min FROM attendance a JOIN employees m ON m.id=a.employee_id WHERE a.a_date=? ORDER BY m.name", (day,)).fetchall()
+    if not rows: return None
+    pres = [r for r in rows if r["present"]]; absn = [r for r in rows if not r["present"]]; late = [r for r in pres if r["late_min"]]
+    t = [f"🕘 <b>حضور يوم {day}</b>", f"حاضر: {len(pres)}  •  غايب: {len(absn)}  •  متأخر: {len(late)}"]
+    if absn: t.append("\n<b>الغياب:</b>\n" + "\n".join(f"• {_e(r['name'])}" for r in absn))
+    if late: t.append("\n<b>التأخير:</b>\n" + "\n".join(f"• {_e(r['name'])} — {time12(r['check_in'])} ({fmt_minutes(r['late_min'])})" for r in late))
+    return "\n".join(t)
+
+def targets_text(month=None, rep_id=None):
+    month = month or date.today().strftime("%Y-%m")
+    with db() as c: rows = target_rows(c, month)
+    if rep_id is not None: rows = [r for r in rows if r[0] == rep_id]
+    if not rows: return "مفيش مناديب"
+    out = [f"🎯 <b>تارجت شهر {month}</b>"]
+    for _, name, tgt, unit, done, bags, tons in rows:
+        if tgt > 0: out.append(f"• {_e(name)}: {fmt(done)} من {fmt(tgt)} {unit} ({done / tgt * 100:.0f}%)" + (" ✅" if done >= tgt else f" — باقي {fmt(tgt - done)} {unit}")
+                               + f"\n   ({qty_text(bags, tons)})")
+        else: out.append(f"• {_e(name)}: {qty_text(bags, tons)} (مفيش تارجت متحدد)")
+    return "\n".join(out)
+
+def tg_help_text():
+    return ("أوامر البوت:\n• <b>اليوم</b> — تقرير النهارده لحد دلوقتي\n• <b>امبارح</b> — تقرير امبارح\n• <b>خزنة</b> — رصيد الخزنة\n"
+            "• <b>حضور</b> — حضور النهارده\n• <b>طلبات</b> — طلبات التحصيل والحضور اللي مستنية موافقة\n• <b>موقع المخزن</b> — تحدد مكان الحضور (ابعتها وانت في المخزن)\n• <b>شيت</b> — يحدّث شيت Google دلوقتي\n• <b>تارجت</b> — تارجت المناديب الشهر ده\n• <b>متوقع</b> — العملاء اللي متوقع يطلبوا النهارده")
+
+# تعديل/حذف الفواتير والسندات والمصروفات مش بيبعت تنبيه على تليجرام (بيتسجل في سجل النشاط بس)
+SENSITIVE_ACTIONS = ("حذف عربية", "حذف حركة خزنة", "جرد خزنة",
+                     "رصيد أول مدة الخزنة", "حذف عميل/مورد", "حذف صنف", "حذف موظف", "حذف مستخدم", "إضافة مستخدم", "تغيير كلمة سر", "حذف هالك")
+
+# ---------- Google Sheets ----------
+class SheetsError(Exception): pass
+_GS_CREDS = {}
+
+def gs_sheet_id(text):
+    m = re.search(r"/d/([A-Za-z0-9_-]{20,})", text or "")
+    return m.group(1) if m else (text or "").strip()
+
+def gs_key_email(path):
+    try:
+        with open(path, encoding="utf-8") as f: return json.load(f).get("client_email", "")
+    except Exception: return ""
+
+def _gs_token(keyfile):
+    try:
+        from google.oauth2 import service_account
+        import google.auth.transport.requests
+    except Exception: raise SheetsError("مكتبة Google (google-auth) مش موجودة في النسخة دي")
+    cr = _GS_CREDS.get(keyfile)
+    if cr is None:
+        try: cr = service_account.Credentials.from_service_account_file(keyfile, scopes=["https://www.googleapis.com/auth/spreadsheets"])
+        except Exception as e: raise SheetsError(f"ملف مفتاح Google مش سليم: {e}")
+        _GS_CREDS[keyfile] = cr
+    if not cr.valid:
+        try: cr.refresh(google.auth.transport.requests.Request())
+        except Exception as e: raise SheetsError("مش قادر يتصل بـ Google (اتأكد من النت ومن ملف المفتاح)") from e
+    return cr.token
+
+def gs_api(keyfile, method, url, body=None):
+    req = urllib.request.Request("https://sheets.googleapis.com/v4/spreadsheets/" + url, method=method,
+                                 data=json.dumps(body).encode("utf-8") if body is not None else None,
+                                 headers={"Authorization": "Bearer " + _gs_token(keyfile), "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r: return json.loads(r.read().decode("utf-8") or "{}")
+    except urllib.error.HTTPError as e:
+        msg = e.read().decode("utf-8", "ignore")
+        if e.code == 403: raise SheetsError("الشيت مش متشارك مع إيميل البرنامج (شاركه كـ Editor)")
+        if e.code == 404: raise SheetsError("الشيت مش موجود — راجع اللينك")
+        raise SheetsError(f"Google رد بخطأ {e.code}: {msg[:200]}")
+    except (urllib.error.URLError, OSError) as e:
+        raise SheetsError("مفيش نت") from e
+
+def sheets_data():
+    """التابات اللي بتتبعت للشيت: {اسم التاب: صفوف}."""
+    today = date.today().isoformat(); since = (date.today() - timedelta(days=30)).isoformat()
+    tabs = {}
+    summ = [["آخر تحديث", now_ts()], [], ["البند", "القيمة"]]
+    for kind, label, val in daily_rows(today):
+        try: num = float(str(val).replace(",", ""))
+        except ValueError: num = val
+        summ.append([("— " + label + " —") if kind == "h" else label, "" if kind == "h" else num])
+    with db() as c:
+        st = stock_map(c)
+        items = c.execute("SELECT * FROM items ORDER BY name").fetchall()
+        parties = c.execute("SELECT p.*, e.name rep FROM parties p LEFT JOIN employees e ON e.id=p.rep_id ORDER BY p.name").fetchall()
+        bals = {p["id"]: party_balance(c, p["id"], None) for p in parties}
+        invs = c.execute(f"SELECT i.*, p.name pname, e.name rep, {NET_SQL} net, COALESCE((SELECT SUM(amount) FROM payments x WHERE x.invoice_id=i.id),0) paid "
+                         "FROM invoices i LEFT JOIN parties p ON p.id=i.party_id LEFT JOIN employees e ON e.id=i.rep_id WHERE i.inv_date>=? ORDER BY i.inv_date DESC, i.id DESC", (since,)).fetchall()
+        pays = c.execute("SELECT x.*, p.name pname FROM payments x LEFT JOIN parties p ON p.id=x.party_id WHERE x.pay_date>=? AND x.invoice_id IS NULL ORDER BY x.pay_date DESC, x.id DESC", (since,)).fetchall()
+        cb = cash_balance(c)
+    summ += [[], ["رصيد الخزنة دلوقتي", round(cb, 2)],
+             ["إجمالي اللي لينا عند العملاء", round(sum(b for b in bals.values() if b > 0), 2)],
+             ["إجمالي اللي علينا للموردين", round(-sum(b for b in bals.values() if b < 0), 2)]]
+    # تاب «ملخص» اتشال بناءً على طلب المالك (الملخص بيوصل على تليجرام)
+    rows = [["الكود", "اسم الصنف", "الوحدة", "الرصيد", "سعر الشراء", "سعر البيع", "قيمة المخزون (بسعر الشراء)"]]
+    for it in items:
+        q = round(st.get(it["id"], 0), 3)
+        rows.append([it["code"] or "", it["name"], it["unit"] or "", q, float(it["buy_price"] or 0), float(it["sell_price"] or 0),
+                     round(q * float(it["buy_price"] or 0), 2)])
+    tabs["الأصناف"] = rows
+    rows = [["الاسم", "النوع", "الهاتف", "المندوب", "الرصيد", "عليه / له", "الحد الائتماني", "عدّى الحد؟"]]
+    for p in parties:
+        b = round(bals[p["id"]], 2); lim = float(p["credit_limit"] or 0)
+        rows.append([p["name"], p["kind"] or "", p["phone"] or "", p["rep"] or "", b, "عليه" if b > 0.005 else ("له" if b < -0.005 else ""), lim, "نعم" if lim > 0 and b > lim + 0.005 else ""])
+    tabs["العملاء والموردين"] = rows
+    rows = [["التاريخ", "النوع", "الرقم", "العميل / المورد", "الصافي", "المدفوع", "نقدي / آجل", "المندوب", "وقت التسجيل"]]
+    for i in invs:
+        rows.append([i["inv_date"], i["kind"], i["number"], i["pname"] or "", round(float(i["net"]), 2), round(float(i["paid"]), 2), i["pay_type"] or "", i["rep"] or "", fmt_time(i["created_at"])])
+    tabs["فواتير آخر 30 يوم"] = rows
+    rows = [["التاريخ", "النوع", "العميل / المورد", "المبلغ", "ملاحظات"]]
+    for x in pays: rows.append([x["pay_date"], x["kind"], x["pname"] or "", round(float(x["amount"]), 2), x["notes"] or ""])
+    tabs["سندات آخر 30 يوم"] = rows
+    stamp = "آخر تحديث: " + datetime.now().strftime("%Y-%m-%d ") + fmt_time(now_ts())
+    for t in tabs: tabs[t][0] = list(tabs[t][0]) + ["", stamp]
+    return tabs
+
+def sheets_sync(cfg):
+    key, sid = cfg.get("gs_key"), gs_sheet_id(cfg.get("gs_sheet"))
+    if not key or not os.path.exists(key): raise SheetsError("اختار ملف مفتاح Google الأول")
+    if not sid: raise SheetsError("حط لينك الشيت")
+    tabs = sheets_data()
+    meta = gs_api(key, "GET", f"{sid}?fields=sheets.properties")
+    have = {s["properties"]["title"]: s["properties"]["sheetId"] for s in meta.get("sheets", [])}
+    reqs = []
+    for t in tabs:
+        if t not in have:
+            reqs.append({"addSheet": {"properties": {"title": t, "rightToLeft": True, "gridProperties": {"frozenRowCount": 1 if t != "ملخص" else 0}}}})
+    if reqs:
+        res = gs_api(key, "POST", f"{sid}:batchUpdate", {"requests": reqs})
+        for r in res.get("replies", []):
+            p = r.get("addSheet", {}).get("properties")
+            if p: have[p["title"]] = p["sheetId"]
+        fmt_reqs = [{"repeatCell": {"range": {"sheetId": have[t], "startRowIndex": 0, "endRowIndex": 1 if t != "ملخص" else 3},
+                                    "cell": {"userEnteredFormat": {"textFormat": {"bold": True}}}, "fields": "userEnteredFormat.textFormat.bold"}} for t in tabs]
+        try: gs_api(key, "POST", f"{sid}:batchUpdate", {"requests": fmt_reqs})
+        except SheetsError: pass
+    gs_api(key, "POST", f"{sid}/values:batchClear", {"ranges": [f"'{t}'" for t in tabs]})
+    gs_api(key, "POST", f"{sid}/values:batchUpdate", {"valueInputOption": "RAW", "data": [{"range": f"'{t}'!A1", "values": rows} for t, rows in tabs.items()]})
+    return sum(len(r) for r in tabs.values())
+
+# ---------- طلبات تحصيل المناديب من الموبايل ----------
+REQ_STATUS = {"pending": "⏳ مستني موافقة", "approved": "✅ اتوافق", "rejected": "❌ اترفض"}
+_AR_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩٫", "0123456789.")
+
+def _norm_cmd(txt):
+    return (txt or "").strip().lstrip("/").split("@")[0].strip().lower().replace("أ", "ا").replace("إ", "ا")
+
+def parse_amount(txt):
+    try: return round(float((txt or "").translate(_AR_DIGITS).replace(",", "").replace("٬", "").replace("ج.م", "").replace("جنيه", "").strip()), 2)
+    except ValueError: return None
+
+LOC_KB = {"keyboard": [[{"text": "📍 ابعت موقعي دلوقتي", "request_location": True}], [{"text": "إلغاء"}]], "resize_keyboard": True, "one_time_keyboard": True}
+
+def tg_send_markup(token, chat_id, text, markup):
+    tg_call(token, "sendMessage", {"chat_id": chat_id, "text": text[:3900], "parse_mode": "HTML", "reply_markup": markup, "disable_web_page_preview": True})
+
+def tg_send_buttons(token, chat_id, text, rows):
+    """رسالة بزراير؛ بترجع رقم الرسالة."""
+    kb = {"inline_keyboard": [[{"text": t, "callback_data": d} for t, d in row] for row in rows]}
+    res = tg_call(token, "sendMessage", {"chat_id": chat_id, "text": text[:3900], "parse_mode": "HTML", "reply_markup": kb})
+    return (res or {}).get("message_id")
+
+def tg_edit(token, chat_id, message_id, text):
+    if not message_id: return
+    try: tg_call(token, "editMessageText", {"chat_id": chat_id, "message_id": message_id, "text": text[:3900], "parse_mode": "HTML"})
+    except TelegramError as e:
+        if "not modified" not in str(e): raise
+
+def is_acct(r): return isinstance(r, dict) and r.get("role") == "acct"
+
+def tg_approvers(cfg):
+    """اللي يوافقوا على الطلبات: المديرين + المحاسبين."""
+    out = dict(cfg.get("tg_chats") or {})
+    for cid, r in (cfg.get("tg_reps") or {}).items():
+        if is_acct(r): out[cid] = r.get("name", "") + " (محاسب)"
+    return out
+
+def acct_help_text():
+    return ("أهلًا 👋 (محاسب)\n• <b>حضور</b> — تسجّل حضورك بموقعك\n• <b>اليوم</b> — تقرير النهارده لحد دلوقتي\n• <b>امبارح</b> — تقرير امبارح\n• <b>خزنة</b> — رصيد الخزنة\n"
+            "• <b>تقرير الحضور</b> — حضور النهارده\n• <b>طلبات</b> — طلبات التحصيل والحضور اللي مستنية موافقة\n• <b>تارجت</b> — تارجت المناديب\n• <b>متوقع</b> — العملاء المتوقعين النهارده")
+
+def rep_help_text():
+    return "أهلًا 👋\n• <b>حضور</b> — تسجّل حضورك بموقعك\n• اكتب <b>تحصيل</b> — علشان تعمل طلب سند تحصيل\n• <b>تارجت</b> — التارجت بتاعك الشهر ده\n• <b>متوقع</b> — عملاءك اللي متوقع يطلبوا النهارده\n• <b>طلباتي</b> — آخر طلباتك وحالتها\n• <b>إلغاء</b> — تلغي الطلب اللي بتعمله"
+
+def create_rep_request(rep_id, party_id, amount, notes, chat_id):
+    with db() as c:
+        rid = c.execute("INSERT INTO rep_requests(created_at,rep_id,party_id,amount,notes,status,chat_id,notified) VALUES(?,?,?,?,?,'pending',?,0)",
+                        (now_ts(), rep_id, party_id, amount, notes or "", str(chat_id))).lastrowid
+        p = c.execute("SELECT name FROM parties WHERE id=?", (party_id,)).fetchone()
+        log(c, "طلب تحصيل من الموبايل", f"طلب رقم {rid}: {p['name'] if p else party_id} — {fmt(amount)} — المندوب: {rep_name_of(c, rep_id)}")
+    return rid
+
+def rep_request_row(rid):
+    with db() as c:
+        return c.execute("SELECT r.*, p.name pname, e.name rname FROM rep_requests r LEFT JOIN parties p ON p.id=r.party_id "
+                         "LEFT JOIN employees e ON e.id=r.rep_id WHERE r.id=?", (rid,)).fetchone()
+
+def rep_request_text(r):
+    t = (f"🧾 <b>طلب تحصيل رقم {r['id']}</b> — {REQ_STATUS.get(r['status'], r['status'])}\n"
+         f"المندوب: {_e(r['rname'] or '')}\nالعميل: {_e(r['pname'] or '')}\nالمبلغ: <b>{fmt(r['amount'])}</b> ج.م\nالوقت: {_e(r['created_at'])}")
+    if r["notes"]: t += f"\nملاحظة: {_e(r['notes'])}"
+    if r["status"] != "pending": t += f"\n— {REQ_STATUS[r['status']]} بواسطة {_e(r['decided_by'] or '')} ({_e((r['decided_at'] or '')[11:16])})"
+    if r["status"] == "approved" and r["payment_id"]: t += f"\nرقم السند: {r['payment_id']}"
+    return t
+
+def rep_requests_text(emp_id):
+    with db() as c:
+        rows = c.execute("SELECT r.*, p.name pname FROM rep_requests r LEFT JOIN parties p ON p.id=r.party_id WHERE r.rep_id=? ORDER BY r.id DESC LIMIT 10", (emp_id,)).fetchall()
+    if not rows: return "لسه مفيش طلبات"
+    return "<b>آخر طلباتك:</b>\n" + "\n".join(f"• رقم {r['id']} — {_e(r['pname'])} — {fmt(r['amount'])} — {REQ_STATUS.get(r['status'])}" for r in rows)
+
+# ---------- حضور المناديب من تليجرام بالموقع ----------
+def geo_dist(lat1, lon1, lat2, lon2):
+    """المسافة بالمتر بين نقطتين."""
+    import math
+    p1, p2 = math.radians(lat1), math.radians(lat2); dp = p2 - p1; dl = math.radians(lon2 - lon1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 6371000 * 2 * math.asin(math.sqrt(a))
+
+def maps_link(lat, lon): return f"https://maps.google.com/?q={lat:.6f},{lon:.6f}"
+
+def att_place(c):
+    r = c.execute("SELECT wh_lat, wh_lon, COALESCE(wh_radius,200), COALESCE(att_auto,1), COALESCE(att_live,0) FROM settings WHERE id=1").fetchone()
+    return dict(lat=r[0], lon=r[1], radius=int(r[2] or 200), auto=bool(r[3]), live=bool(r[4]))
+
+def record_attendance(c, emp_id, day, hhmm, note):
+    """بيسجّل الموظف حاضر في اليوم ده بالساعة دي (لو كان متسجل غايب بيتعدل). بيرجع دقايق التأخير."""
+    e = c.execute("SELECT name, att_grace FROM employees WHERE id=?", (emp_id,)).fetchone()
+    grace = (e["att_grace"] if e else "") or (c.execute("SELECT att_grace FROM settings WHERE id=1").fetchone()[0] or "09:30")
+    late = max(0, minutes_of(hhmm) - minutes_of(grace))
+    c.execute("DELETE FROM attendance WHERE employee_id=? AND a_date=?", (emp_id, day))
+    c.execute("INSERT INTO attendance(employee_id,a_date,present,check_in,late_min,notes,created_at) VALUES(?,?,1,?,?,?,?)", (emp_id, day, hhmm, late, note, now_ts()))
+    return late
+
+def att_request_row(rid):
+    with db() as c:
+        return c.execute("SELECT r.*, e.name rname FROM att_requests r LEFT JOIN employees e ON e.id=r.rep_id WHERE r.id=?", (rid,)).fetchone()
+
+def att_request_text(r):
+    d = "مش معروفة (موقع المخزن مش متحدد)" if r["dist"] is None else (f"{r['dist'] / 1000:.1f} كم" if r["dist"] >= 1000 else f"{r['dist']:.0f} متر")
+    t = (f"📍 <b>طلب حضور رقم {r['id']}</b> — {REQ_STATUS.get(r['status'], r['status'])}\nالاسم: {_e(r['rname'] or '')}\n"
+         f"الساعة: <b>{time12(r['check_in'])}</b> — {_e(r['a_date'])}\nالبعد عن المخزن: {d}" + (" 📡 موقع مباشر" if r["live"] else ""))
+    if r["reason"]: t += f"\nالسبب: {_e(r['reason'])}"
+    if r["lat"] is not None: t += f'\n<a href="{maps_link(r["lat"], r["lon"])}">🗺 افتح الموقع على الخريطة</a>'
+    if r["status"] != "pending": t += f"\n— {REQ_STATUS[r['status']]} بواسطة {_e(r['decided_by'] or '')}"
+    return t
+
+def decide_att_request(rid, approve, by):
+    with db() as c:
+        db_lock(c, 8)
+        r = c.execute("SELECT r.*, e.name rname FROM att_requests r LEFT JOIN employees e ON e.id=r.rep_id WHERE r.id=?", (rid,)).fetchone()
+        if not r: return False, "الطلب مش موجود"
+        if r["status"] != "pending": return False, f"الطلب ده {REQ_STATUS.get(r['status'])} بالفعل"
+        c.execute("UPDATE att_requests SET status=?, decided_at=?, decided_by=?, notified=0 WHERE id=?", ("approved" if approve else "rejected", now_ts(), by, rid))
+        if approve:
+            late = record_attendance(c, r["rep_id"], r["a_date"], r["check_in"], f"📍 طلب حضور {rid} — وافق {by}")
+            log(c, "حضور مندوب من الموبايل", f"{r['a_date']} {r['rname']}: {time12(r['check_in'])}" + (f" متأخر {late} د" if late else "") + f" — موافقة {by}")
+            return True, f"✅ اتسجل حضور {r['rname']} الساعة {time12(r['check_in'])}"
+        log(c, "رفض حضور مندوب", f"طلب {rid}: {r['rname']} {r['a_date']} (رفض: {by})")
+        return True, "❌ اترفض"
+
+def decide_rep_request(rid, approve, by):
+    """موافقة (بيتعمل سند تحصيل) أو رفض. بترجع (تم؟, رسالة)."""
+    with db() as c:
+        db_lock(c, 7)
+        r = c.execute("SELECT r.*, p.name pname FROM rep_requests r LEFT JOIN parties p ON p.id=r.party_id WHERE r.id=?", (rid,)).fetchone()
+        if not r: return False, "الطلب مش موجود"
+        if r["status"] != "pending": return False, f"الطلب ده {REQ_STATUS.get(r['status'])} بالفعل"
+        today = date.today().isoformat(); now = now_ts()
+        if approve:
+            notes = f"تحصيل مندوب من الموبايل (طلب رقم {rid} — {r['created_at'][:16]})" + (f" — {r['notes']}" if r["notes"] else "")
+            is_rep = c.execute("SELECT kind FROM employees WHERE id=?", (r["rep_id"],)).fetchone()
+            pay_rep = r["rep_id"] if is_rep and is_rep[0] == "مندوب" else None
+            if not pay_rep: notes = notes.replace("تحصيل مندوب من الموبايل", f"تحصيل من الموبايل — {rep_name_of(c, r['rep_id'])}")
+            pay_id = c.execute("INSERT INTO payments(party_id,pay_date,kind,amount,notes,rep_id,created_at) VALUES(?,?,?,?,?,?,?)",
+                               (r["party_id"], today, "تحصيل", float(r["amount"]), notes, pay_rep, now)).lastrowid
+            c.execute("UPDATE rep_requests SET status='approved', decided_at=?, decided_by=?, payment_id=?, notified=0 WHERE id=?", (now, by, pay_id, rid))
+            log(c, "سند تحصيل", f"{r['pname']}: {fmt(r['amount'])} بتاريخ {today} — المندوب: {rep_name_of(c, r['rep_id'])} — من طلب موبايل رقم {rid} (وافق: {by})")
+            return True, f"✅ اتعمل سند تحصيل رقم {pay_id}"
+        c.execute("UPDATE rep_requests SET status='rejected', decided_at=?, decided_by=?, notified=0 WHERE id=?", (now, by, rid))
+        log(c, "رفض طلب تحصيل", f"طلب رقم {rid}: {r['pname']} — {fmt(r['amount'])} (رفض: {by})")
+        return True, "❌ اترفض"
+
+# ---------- الخدمة اللي بتشتغل في الخلفية ----------
+class OnlineService(threading.Thread):
+    def __init__(self):
+        super().__init__(daemon=True, name="online-service")
+        self.wake = threading.Event(); self.sig = None; self.conv = {}
+        SERVICE_GEN[0] += 1; self.gen = SERVICE_GEN[0]; self.beat = time.time()
+    def stale(self): return self.gen != SERVICE_GEN[0]       # فيه خدمة أحدث اشتغلت مكانها
+    def nudge(self): self.wake.set()
+    def status(self, text, key="status"):
+        save_online_config(**{key: f"{datetime.now().strftime('%H:%M')} — {text}"})
+    def run(self):
+        while not self.stale():
+            self.beat = time.time()
+            cfg = dict(ONLINE_CFG)
+            waited = False
+            if cfg.get("enabled"):
+                sig = (DB_CFG.get("mode"), DB_CFG.get("host"), DB_CFG.get("port"), DB_CFG.get("dbname"), DB_CFG.get("user"))
+                if sig != self.sig:
+                    self.sig = sig
+                    if using_pg(): pg_reset_connection()
+                _TLS.as_owner = bool(cfg.get("show_profit")); _TLS.viewer_only = not cfg.get("show_profit")
+                if using_pg():      # الخدمة متستناش قفل أو استعلام للأبد (ده كان ممكن يعلّق البوت)
+                    try:
+                        with db() as c: c.execute("SET lock_timeout = 20000"); c.execute("SET statement_timeout = 180000")
+                    except Exception: pass
+                try:
+                    if cfg.get("tg_token") and cfg.get("tg_chats"):
+                        self.watch(cfg); self.daily(cfg); self.morning(cfg); self.flush()
+                    if cfg.get("tg_token"): self.notify_decisions(cfg["tg_token"])   # موافقات/رفض من البرنامج
+                except DBUnavailable as e: self.status("قاعدة البيانات مش متاحة: " + str(e).splitlines()[0])
+                except Exception as e: self.status("خطأ: " + str(e)[:150])
+                if cfg.get("gs_enabled"):
+                    try: self.sheets(cfg)
+                    except Exception as e: self.status(str(e)[:150], "status_gs")
+                if cfg.get("tg_token"):
+                    try:
+                        self.commands(cfg); waited = True
+                        if (ONLINE_CFG.get("status_tg") or "").startswith("✖"): self.status("✔ تليجرام واصل", "status_tg")
+                    except Exception as e:
+                        self.status("✖ تليجرام: " + str(e)[:200], "status_tg")
+            if not waited:
+                self.wake.wait(20); self.wake.clear()
+
+    def watch(self, cfg):
+        """تنبيهات من اللي حصل من آخر مرة (من كل الأجهزة)."""
+        with db() as c:
+            ma = c.execute("SELECT COALESCE(MAX(id),0) FROM audit_log").fetchone()[0]
+            mi = c.execute("SELECT COALESCE(MAX(id),0) FROM invoices").fetchone()[0]
+            la, li = cfg.get("last_audit_id"), cfg.get("last_invoice_id")
+            if la is None or li is None or la > ma or li > mi:      # أول مرة (أو قاعدة بيانات جديدة): نبدأ من دلوقتي
+                return save_online_config(last_audit_id=ma, last_invoice_id=mi)
+            if ma == la and mi == li: return
+            msgs = []
+            for i in c.execute(f"SELECT i.*, p.name pname, {NET_SQL} net FROM invoices i LEFT JOIN parties p ON p.id=i.party_id WHERE i.id>? ORDER BY i.id", (li,)).fetchall():
+                net = float(i["net"])
+                if cfg.get("al_returns") and i["kind"] in ("مرتجع مبيعات", "مرتجع مشتريات"):
+                    msgs.append(f"↩️ <b>{_e(i['kind'])}</b> رقم {_e(i['number'])}\n{_e(i['pname'])} — {fmt(net)} ج.م")
+                elif float(cfg.get("al_big") or 0) > 0 and i["kind"] == "مبيعات" and net >= float(cfg["al_big"]):
+                    msgs.append(f"💰 <b>فاتورة مبيعات كبيرة</b> رقم {_e(i['number'])}\n{_e(i['pname'])} — {fmt(net)} ج.م")
+            att_today = False
+            for r in c.execute("SELECT * FROM audit_log WHERE id>? ORDER BY id", (la,)).fetchall():
+                a = r["action"]
+                if cfg.get("al_credit") and a == "تجاوز الحد الائتماني":
+                    msgs.append(f"🚫 <b>تجاوز الحد الائتماني</b>\n{_e(r['details'])}\n👤 {_e(r['user'])}")
+                elif cfg.get("al_sensitive") and a in SENSITIVE_ACTIONS:
+                    msgs.append(f"⚠️ <b>{_e(a)}</b>\n{_e(r['details'])}\n👤 {_e(r['user'])} — {fmt_time(r['at'])}")
+                elif a == "تسجيل حضور" and (r["details"] or "").startswith(date.today().isoformat()): att_today = True
+        today = date.today().isoformat()
+        if cfg.get("al_attendance") and att_today and cfg.get("last_att") != today:
+            t = attendance_text(today)
+            if t: msgs.append(t); save_online_config(last_att=today)
+        for m in msgs: queue_message(m)
+        save_online_config(last_audit_id=ma, last_invoice_id=mi)
+
+    def daily(self, cfg):
+        if not cfg.get("tg_daily"): return
+        now = datetime.now(); today = now.date().isoformat(); yday = (now.date() - timedelta(days=1)).isoformat()
+        last = cfg.get("last_daily") or ""
+        hh = minutes_of(cfg.get("tg_time") or "21:00") if re.fullmatch(r"\d{1,2}:\d{2}", cfg.get("tg_time") or "") else 21 * 60
+        if now.hour * 60 + now.minute >= hh and last != today:
+            queue_message(report_text(today)); save_online_config(last_daily=today)
+        elif last and last < yday:        # البرنامج كان مقفول وقت التقرير: يبعت تقرير امبارح
+            queue_message(report_text(yday, "تقرير (اتأخر) — يوم")); save_online_config(last_daily=yday)
+        elif not last:
+            save_online_config(last_daily=yday)
+
+    def morning(self, cfg):
+        """الصبح: قايمة العملاء المتوقعين للمديرين، وكل مندوب بيوصله عملاءه بس."""
+        if not cfg.get("al_expected"): return
+        now = datetime.now(); today = now.date().isoformat()
+        t = cfg.get("tg_morning") or "09:00"
+        hh = minutes_of(t) if re.fullmatch(r"\d{1,2}:\d{2}", t) else 9 * 60
+        if cfg.get("last_morning") == today or now.hour * 60 + now.minute < hh: return
+        save_online_config(last_morning=today)
+        queue_message(expected_text())
+        for cid, r in (cfg.get("tg_reps") or {}).items():
+            if is_acct(r): continue
+            try: tg_send_text(cfg["tg_token"], cid, expected_text(rep_id=r["emp_id"]))
+            except TelegramError: pass
+
+    def flush(self):
+        cfg = dict(ONLINE_CFG); box = list(cfg.get("outbox") or [])
+        if not box: return
+        sent = 0
+        try:
+            for m in box:
+                for cid in list(cfg.get("tg_chats") or {}): tg_send_text(cfg["tg_token"], cid, m)
+                sent += 1
+        finally:
+            with _ONLINE_LOCK:
+                save_online_config(outbox=list(ONLINE_CFG.get("outbox") or [])[sent:])
+            if sent: self.status(f"✔ اتبعت {sent} رسالة")
+
+    def commands(self, cfg):
+        tok = cfg["tg_token"]
+        ups = tg_call(tok, "getUpdates", {"offset": int(cfg.get("tg_offset") or 0), "timeout": 15, "allowed_updates": ["message", "callback_query"]}, timeout=25)
+        off = int(cfg.get("tg_offset") or 0); chats = cfg.get("tg_chats") or {}; reps = cfg.get("tg_reps") or {}
+        pending = dict(ONLINE_CFG.get("tg_pending") or {})
+        for u in ups or []:
+            if self.stale(): return
+            self.beat = time.time()
+            off = max(off, u["update_id"] + 1)
+            save_online_config(tg_offset=off)          # الرسالة متتعالجش مرتين حتى لو حصل خطأ
+            try:
+                apv = tg_approvers(cfg)
+                if u.get("callback_query"): self.on_button(tok, u["callback_query"], apv, reps); continue
+                m = u.get("message") or {}; cid = str((m.get("chat") or {}).get("id", "")); txt = (m.get("text") or "").strip()
+                if not cid: continue
+                if m.get("location") and cid in reps: self.on_rep_location(tok, cid, reps[cid], m, {k: v for k, v in apv.items() if k != cid}); continue
+                if m.get("location") and cid in chats and self.conv.get(cid, {}).get("step") == "wh_loc": self.on_wh_location(tok, cid, m); continue
+                if cid in reps and is_acct(reps[cid]): self.on_acct_text(tok, cid, reps[cid], txt); continue
+                if cid in reps: self.on_rep_text(tok, cid, reps[cid], txt); continue
+                if cid not in chats:
+                    if cid in pending and time.time() - self.conv.get("_pend_" + cid, 0) > 60:
+                        self.conv["_pend_" + cid] = time.time()
+                        tg_send_text(tok, cid, "⏳ لسه مستني موافقة المالك.\nالمالك يفتح البرنامج ← الإعدادات ← إعدادات المتابعة ← «👥 مستخدمين البوت» أو «ربط الموبايل».")
+                    if cid not in pending:
+                        ch = m.get("chat") or {}
+                        pending[cid] = " ".join(x for x in (ch.get("first_name"), ch.get("last_name")) if x) or ch.get("title") or ch.get("username") or cid
+                        save_online_config(tg_pending=pending)
+                        tg_send_text(tok, cid, "تم استلام طلبك ✋\nالمالك لازم يوافق عليه من إعدادات المتابعة في البرنامج.")
+                    continue
+                if not cfg.get("tg_commands"): continue
+                t = _norm_cmd(txt)
+                if t in ("طلبات", "الطلبات", "requests"): self.send_pending_list(tok, cid); continue
+                if t in ("موقع المخزن", "موقع", "location"):
+                    self.conv[cid] = {"step": "wh_loc"}
+                    tg_send_markup(tok, cid, "📍 وانت واقف في المخزن، دوس الزرار اللي تحت علشان تبعت موقعك — ده هيبقى مكان الحضور.", LOC_KB); continue
+                if t in ("شيت", "الشيت", "حدث الشيت", "حدّث الشيت", "sheet"):
+                    if not cfg.get("gs_enabled"): tg_send_text(tok, cid, "مزامنة الشيت مقفولة في البرنامج"); continue
+                    tg_send_text(tok, cid, "⏳ بيحدّث الشيت ...")
+                    try: self.sheets(cfg, force=True); r = "✅ الشيت اتحدث — " + fmt_time(now_ts())
+                    except Exception as e: r = "✖ " + str(e)[:200]
+                    tg_send_text(tok, cid, r); continue
+                if t in ("اليوم", "today", "تقرير"): r = report_text(date.today().isoformat(), "تقرير النهارده لحد دلوقتي —")
+                elif t in ("امبارح", "yesterday"): r = report_text((date.today() - timedelta(days=1)).isoformat())
+                elif t in ("خزنة", "الخزنة", "cash"): r = cash_text()
+                elif t in ("تارجت", "التارجت", "target"): r = targets_text()
+                elif t in ("متوقع", "المتوقع", "عملاء", "expected"): r = expected_text()
+                elif t in ("حضور", "attendance"): r = attendance_text(date.today().isoformat()) or "لسه محدش سجّل حضور النهارده"
+                else: r = tg_help_text()
+                tg_send_text(tok, cid, r)
+            except DBUnavailable:
+                try: tg_send_text(tok, str(((u.get("message") or {}).get("chat") or (u.get("callback_query") or {}).get("from") or {}).get("id", "")), "قاعدة البيانات مش متاحة دلوقتي (الجهاز الأساسي مقفول؟) — جرّب كمان شوية")
+                except Exception: pass
+
+    # ----- المحاسب: تقارير (من غير المكسب) + موافقة على الطلبات + حضوره بالموقع -----
+    def on_acct_text(self, tok, cid, acct, txt):
+        t = _norm_cmd(txt); self.conv.pop(cid, None)
+        if t in ("حضور", "حاضر", "تسجيل حضور", "checkin"):
+            return tg_send_markup(tok, cid, "📍 دوس الزرار اللي تحت علشان تبعت موقعك دلوقتي، وحضورك هيتسجل بالساعة دي.", LOC_KB)
+        if t in ("الغاء", "إلغاء", "cancel"): return tg_send_markup(tok, cid, "اتلغى ✋", {"remove_keyboard": True})
+        if t in ("طلبات", "الطلبات", "requests"): return self.send_pending_list(tok, cid)
+        old = getattr(_TLS, "viewer_only", False); _TLS.viewer_only = True        # المحاسب مبيشوفش المكسب
+        try:
+            if t in ("اليوم", "today", "تقرير"): r = report_text(date.today().isoformat(), "تقرير النهارده لحد دلوقتي —")
+            elif t in ("امبارح", "yesterday"): r = report_text((date.today() - timedelta(days=1)).isoformat())
+            elif t in ("خزنة", "الخزنة", "cash"): r = cash_text()
+            elif t in ("تارجت", "التارجت", "target"): r = targets_text()
+            elif t in ("متوقع", "المتوقع", "عملاء"): r = expected_text()
+            elif t in ("تقرير الحضور", "الحضور", "حضور النهارده", "attendance"): r = attendance_text(date.today().isoformat()) or "لسه محدش سجّل حضور النهارده"
+            else: r = acct_help_text()
+        finally: _TLS.viewer_only = old
+        tg_send_text(tok, cid, r)
+
+    # ----- الحضور بالموقع -----
+    def on_wh_location(self, tok, cid, m):
+        loc = m["location"]; self.conv.pop(cid, None)
+        with db() as c:
+            c.execute("UPDATE settings SET wh_lat=?, wh_lon=? WHERE id=1", (loc["latitude"], loc["longitude"]))
+            log(c, "موقع المخزن", f"{loc['latitude']:.6f},{loc['longitude']:.6f} (من تليجرام)")
+            rad = att_place(c)["radius"]
+        tg_send_markup(tok, cid, f"✅ اتحفظ موقع المخزن\nالمندوب اللي يبعت موقعه في حدود {rad} متر منه، حضوره بيتسجل.", {"remove_keyboard": True})
+
+    def on_rep_location(self, tok, cid, rep, m, chats):
+        """المندوب بعت موقعه: جوه المخزن ← حضور على طول. بعيد أو مش مباشر ← طلب للمدير."""
+        self.conv.pop(cid, None)
+        loc = m["location"]; emp = rep["emp_id"]; nokb = {"remove_keyboard": True}
+        if m.get("forward_origin") or m.get("forward_date") or m.get("forward_from"):
+            return tg_send_markup(tok, cid, "✖ الموقع ده متحوّل من رسالة تانية. ابعت موقعك انت دلوقتي من الزرار.", LOC_KB)
+        at = datetime.fromtimestamp(int(m.get("date") or time.time()))      # وقت سيرفر تليجرام — مش ساعة الموبايل
+        day, hhmm = at.date().isoformat(), at.strftime("%H:%M")
+        lat, lon = float(loc["latitude"]), float(loc["longitude"]); live = bool(loc.get("live_period"))
+        with db() as c:
+            old = c.execute("SELECT check_in FROM attendance WHERE employee_id=? AND a_date=? AND present=1", (emp, day)).fetchone()
+            if old: return tg_send_markup(tok, cid, f"انت متسجل حضور النهارده بالفعل الساعة {time12(old[0])} ✔", nokb)
+            if c.execute("SELECT 1 FROM att_requests WHERE rep_id=? AND a_date=? AND status='pending'", (emp, day)).fetchone():
+                return tg_send_markup(tok, cid, "⏳ طلب الحضور بتاعك النهارده لسه مستني موافقة المدير", nokb)
+            pl = att_place(c)
+            dist = geo_dist(pl["lat"], pl["lon"], lat, lon) if pl["lat"] is not None else None
+            acc = min(float(loc.get("horizontal_accuracy") or 0), 100)
+            inside = dist is not None and dist - acc <= pl["radius"]
+            reason = ""
+            if dist is None: reason = "موقع المخزن مش متحدد في البرنامج"
+            elif not inside: reason = "بعيد عن المخزن"
+            elif pl["live"] and not live: reason = "الموقع مش مباشر (Live)"
+            elif not pl["auto"]: reason = "كل الحضور محتاج موافقة"
+            if not reason:
+                late = record_attendance(c, emp, day, hhmm, f"📍 تليجرام — {dist:.0f} م من المخزن" + (" (مباشر)" if live else ""))
+                log(c, "حضور مندوب من الموبايل", f"{day} {rep_name_of(c, emp)}: {time12(hhmm)} — {dist:.0f} م من المخزن" + (f" — متأخر {late} د" if late else ""))
+                return tg_send_markup(tok, cid, f"✅ اتسجل حضورك الساعة <b>{time12(hhmm)}</b>" + (f"\n⚠️ متأخر {fmt_minutes(late)}" if late else " — في الميعاد 👍"), nokb)
+            rid = c.execute("INSERT INTO att_requests(created_at,rep_id,a_date,check_in,lat,lon,dist,live,reason,status,chat_id) VALUES(?,?,?,?,?,?,?,?,?,'pending',?)",
+                            (now_ts(), emp, day, hhmm, lat, lon, dist, int(live), reason, cid)).lastrowid
+            log(c, "طلب حضور من الموبايل", f"طلب {rid}: {rep_name_of(c, emp)} {time12(hhmm)} — {reason}")
+        far = f" (على بعد {dist:.0f} متر)" if dist is not None and not inside else ""
+        tg_send_markup(tok, cid, f"⏳ {reason}{far}\nاتبعت طلب حضور للمدير الساعة {time12(hhmm)} — طلب رقم {rid}", nokb)
+        r = att_request_row(rid); sent = []
+        for mc in chats:
+            try:
+                mid = tg_send_buttons(tok, mc, att_request_text(r), [[("✅ موافقة", f"aa:{rid}"), ("❌ رفض", f"ar:{rid}")]])
+                if mid: sent.append([mc, mid])
+            except TelegramError: pass
+        with db() as c: c.execute("UPDATE att_requests SET mgr_msgs=? WHERE id=?", (json.dumps(sent), rid))
+
+    # ----- المندوب: طلب سند تحصيل -----
+    def on_rep_text(self, tok, cid, rep, txt):
+        st = self.conv.setdefault(cid, {})
+        t = _norm_cmd(txt)
+        if t in ("الغاء", "إلغاء", "cancel", "خروج"):
+            self.conv.pop(cid, None); return tg_send_markup(tok, cid, "اتلغى ✋\n\n" + rep_help_text(), {"remove_keyboard": True})
+        if t in ("حضور", "حاضر", "تسجيل حضور", "checkin"):
+            self.conv.pop(cid, None)
+            return tg_send_markup(tok, cid, "📍 دوس الزرار اللي تحت علشان تبعت موقعك دلوقتي، وحضورك هيتسجل بالساعة دي.", LOC_KB)
+        if t in ("تحصيل", "سند", "سند تحصيل", "new"):
+            self.conv[cid] = {"step": "party"}
+            return self.ask_party(tok, cid, rep, None)
+        if t in ("تارجت", "التارجت", "تارجتي", "target"):
+            self.conv.pop(cid, None); return tg_send_text(tok, cid, targets_text(rep_id=rep["emp_id"]))
+        if t in ("متوقع", "المتوقع", "عملاء", "عملائي"):
+            self.conv.pop(cid, None); return tg_send_text(tok, cid, expected_text(rep_id=rep["emp_id"]))
+        if t in ("طلباتي", "طلبات", "my"):
+            self.conv.pop(cid, None); return tg_send_text(tok, cid, rep_requests_text(rep["emp_id"]))
+        if st.get("step") == "party":
+            return self.ask_party(tok, cid, rep, txt)
+        if st.get("step") == "amount":
+            amt = parse_amount(txt)
+            if amt is None or amt <= 0: return tg_send_text(tok, cid, "اكتب المبلغ أرقام بس (مثلًا 1500) — أو اكتب «إلغاء»")
+            st["amount"] = amt; st["step"] = "notes"
+            return tg_send_buttons(tok, cid, f"المبلغ: <b>{fmt(amt)}</b> ج.م\nلو عايز تكتب ملاحظة (رقم إيصال مثلًا) اكتبها دلوقتي، أو دوس «من غير ملاحظة».", [[("من غير ملاحظة", "rn")]])
+        if st.get("step") == "notes":
+            st["notes"] = txt[:200]; return self.confirm(tok, cid, st)
+        tg_send_text(tok, cid, rep_help_text())
+
+    def ask_party(self, tok, cid, rep, query):
+        with db() as c:
+            if query:
+                q = "%" + query.strip() + "%"
+                rows = c.execute("SELECT id,name FROM parties WHERE name LIKE ? AND COALESCE(kind,'')<>'مورد' ORDER BY name LIMIT 15", (q,)).fetchall()
+            else:
+                rows = c.execute("SELECT id,name FROM parties WHERE rep_id=? AND COALESCE(kind,'')<>'مورد' ORDER BY name LIMIT 21", (rep["emp_id"],)).fetchall()
+        if query and not rows: return tg_send_text(tok, cid, "مفيش عميل بالاسم ده. اكتب جزء تاني من الاسم — أو «إلغاء»")
+        if not query and (not rows or len(rows) > 20):
+            return tg_send_text(tok, cid, "اكتب اسم العميل (أو جزء منه):")
+        tg_send_buttons(tok, cid, "اختار العميل" + ("" if query else " — أو اكتب جزء من اسمه") + ":", [[(r["name"][:40], f"rc:{r['id']}")] for r in rows])
+
+    def confirm(self, tok, cid, st):
+        with db() as c:
+            p = c.execute("SELECT name FROM parties WHERE id=?", (st["party"],)).fetchone()
+            bal = party_balance(c, st["party"], None)
+        st["step"] = "confirm"
+        txt = (f"🧾 <b>طلب سند تحصيل</b>\nالعميل: {_e(p['name'])}\nالمبلغ: <b>{fmt(st['amount'])}</b> ج.م\n"
+               f"رصيده دلوقتي: {fmt(bal)}\nرصيده بعد التحصيل: {fmt(bal - st['amount'])}" + (f"\nملاحظة: {_e(st.get('notes'))}" if st.get("notes") else ""))
+        tg_send_buttons(tok, cid, txt, [[("✅ ابعت الطلب", "rok"), ("❌ إلغاء", "rno")]])
+
+    def on_button(self, tok, cq, chats, reps):
+        cid = str((cq.get("from") or {}).get("id", "")); data = cq.get("data") or ""
+        msg = cq.get("message") or {}; mcid = str((msg.get("chat") or {}).get("id", cid)); mid = msg.get("message_id")
+        answer = ""
+        try:
+            if cid in reps and not is_acct(reps[cid]):
+                rep = reps[cid]; st = self.conv.setdefault(cid, {})
+                if data.startswith("rc:"):
+                    pid = int(data[3:])
+                    with db() as c:
+                        p = c.execute("SELECT name FROM parties WHERE id=?", (pid,)).fetchone(); bal = party_balance(c, pid, None)
+                    if not p: answer = "العميل ده مش موجود"
+                    else:
+                        self.conv[cid] = {"step": "amount", "party": pid}
+                        tg_edit(tok, mcid, mid, f"العميل: <b>{_e(p['name'])}</b>\nرصيده: {fmt(bal)}")
+                        tg_send_text(tok, cid, "اكتب المبلغ اللي حصّلته:")
+                elif data == "rn" and st.get("step") == "notes":
+                    st["notes"] = ""; tg_edit(tok, mcid, mid, f"المبلغ: <b>{fmt(st['amount'])}</b> ج.م"); self.confirm(tok, cid, st)
+                elif data == "rok" and st.get("step") == "confirm":
+                    rid = create_rep_request(rep["emp_id"], st["party"], st["amount"], st.get("notes", ""), cid)
+                    self.conv.pop(cid, None)
+                    tg_edit(tok, mcid, mid, (msg.get("text") or "") + f"\n\n⏳ اتبعت للمراجعة — طلب رقم {rid}")
+                    self.notify_managers(tok, rid, {k: v for k, v in chats.items() if k != cid})   # المديرين + المحاسبين (مش صاحب الطلب)
+                    answer = "اتبعت ✔"
+                elif data == "rno":
+                    self.conv.pop(cid, None); tg_edit(tok, mcid, mid, "اتلغى ✋"); answer = "اتلغى"
+                else: answer = "الطلب ده خلص — اكتب «تحصيل» تبدأ من جديد"
+            elif cid in chats and data[:3] in ("aa:", "ar:"):
+                r0 = att_request_row(int(data[3:]))
+                if r0 and is_acct(reps.get(cid)) and r0["rep_id"] == reps[cid].get("emp_id"): answer = "مينفعش توافق على حضورك انت"; return
+                ok, text = decide_att_request(int(data[3:]), data.startswith("aa:"), chats.get(cid, "") + " (تليجرام)")
+                answer = text; self.notify_decisions(tok)
+            elif cid in chats and data[:3] in ("ap:", "rj:"):
+                r0 = rep_request_row(int(data[3:]))
+                if r0 and is_acct(reps.get(cid)) and r0["rep_id"] == reps[cid].get("emp_id"): answer = "مينفعش توافق على طلبك انت"; return
+                ok, text = decide_rep_request(int(data[3:]), data.startswith("ap:"), chats.get(cid, "") + " (تليجرام)")
+                answer = text
+                self.notify_decisions(tok)
+            else: answer = "مش مسموح"
+        finally:
+            try: tg_call(tok, "answerCallbackQuery", {"callback_query_id": cq["id"], "text": answer[:190]})
+            except Exception: pass
+
+    def notify_managers(self, tok, rid, chats):
+        r = rep_request_row(rid)
+        if not r: return
+        text = rep_request_text(r)
+        sent = []
+        for mc in chats:
+            try:
+                mid = tg_send_buttons(tok, mc, text, [[("✅ موافقة", f"ap:{rid}"), ("❌ رفض", f"rj:{rid}")]])
+                if mid: sent.append([mc, mid])
+            except TelegramError: pass
+        with db() as c: c.execute("UPDATE rep_requests SET mgr_msgs=? WHERE id=?", (json.dumps(sent), rid))
+
+    def send_pending_list(self, tok, cid):
+        with db() as c:
+            ids = [r[0] for r in c.execute("SELECT id FROM rep_requests WHERE status='pending' ORDER BY id").fetchall()]
+            me = (dict(ONLINE_CFG).get("tg_reps") or {}).get(cid) or {}
+            aids = [r[0] for r in c.execute("SELECT id FROM att_requests WHERE status='pending' AND rep_id<>? ORDER BY id", (me.get("emp_id") or -1,)).fetchall()]
+        for rid in aids[:20]:
+            mid = tg_send_buttons(tok, cid, att_request_text(att_request_row(rid)), [[("✅ موافقة", f"aa:{rid}"), ("❌ رفض", f"ar:{rid}")]])
+            if mid:
+                with db() as c:
+                    old = json.loads(c.execute("SELECT mgr_msgs FROM att_requests WHERE id=?", (rid,)).fetchone()[0] or "[]")
+                    c.execute("UPDATE att_requests SET mgr_msgs=? WHERE id=?", (json.dumps(old + [[cid, mid]]), rid))
+        if not ids: return tg_send_text(tok, cid, "✅ مفيش طلبات تحصيل مستنية موافقة")
+        for rid in ids[:20]:
+            r = rep_request_row(rid)
+            mid = tg_send_buttons(tok, cid, rep_request_text(r), [[("✅ موافقة", f"ap:{rid}"), ("❌ رفض", f"rj:{rid}")]])
+            if mid:
+                with db() as c:
+                    old = json.loads(c.execute("SELECT mgr_msgs FROM rep_requests WHERE id=?", (rid,)).fetchone()[0] or "[]")
+                    c.execute("UPDATE rep_requests SET mgr_msgs=? WHERE id=?", (json.dumps(old + [[cid, mid]]), rid))
+
+    def notify_decisions(self, tok):
+        """الطلبات اللي اتوافق عليها أو اترفضت (من البرنامج أو من تليجرام): نبلّغ المندوب ونحدّث رسايل المديرين."""
+        with db() as c: ids = [r[0] for r in c.execute("SELECT id FROM rep_requests WHERE status<>'pending' AND COALESCE(notified,0)=0").fetchall()]
+        for rid in ids:
+            r = rep_request_row(rid); text = rep_request_text(r)
+            for mc, mid in json.loads(r["mgr_msgs"] or "[]"):
+                try: tg_edit(tok, mc, mid, text)
+                except TelegramError: pass
+            if r["chat_id"]:
+                ok = r["status"] == "approved"
+                try: tg_send_text(tok, r["chat_id"], ("✅ <b>اتوافق</b> على طلب التحصيل رقم " if ok else "❌ <b>اترفض</b> طلب التحصيل رقم ") + f"{rid}\n{_e(r['pname'])} — {fmt(r['amount'])} ج.م")
+                except TelegramError: continue
+            with db() as c: c.execute("UPDATE rep_requests SET notified=1 WHERE id=?", (rid,))
+        with db() as c: ids = [r[0] for r in c.execute("SELECT id FROM att_requests WHERE status<>'pending' AND COALESCE(notified,0)=0").fetchall()]
+        for rid in ids:
+            r = att_request_row(rid); text = att_request_text(r)
+            for mc, mid in json.loads(r["mgr_msgs"] or "[]"):
+                try: tg_edit(tok, mc, mid, text)
+                except TelegramError: pass
+            if r["chat_id"]:
+                try: tg_send_text(tok, r["chat_id"], (f"✅ <b>اتوافق</b> على حضورك الساعة {time12(r['check_in'])}" if r["status"] == "approved" else f"❌ <b>اترفض</b> طلب الحضور ({time12(r['check_in'])})"))
+                except TelegramError: continue
+            with db() as c: c.execute("UPDATE att_requests SET notified=1 WHERE id=?", (rid,))
+
+    def sheets(self, cfg, force=False):
+        every = max(int(cfg.get("gs_every") or 10), 2) * 60
+        if not force and time.time() - float(cfg.get("gs_last") or 0) < every: return
+        with db() as c:
+            mark = f"{c.execute('SELECT COALESCE(MAX(id),0) FROM audit_log').fetchone()[0]}|{date.today().isoformat()}|{datetime.now().hour}"
+        if not force and mark == cfg.get("gs_mark"):
+            return save_online_config(gs_last=time.time())
+        n = sheets_sync(cfg)
+        save_online_config(gs_last=time.time(), gs_mark=mark)
+        self.status(f"✔ الشيت اتحدث ({n} صف)", "status_gs")
+
+ONLINE_SERVICE = [None]
+SERVICE_GEN = [0]
+_WATCHDOG = [None]
+class _NoService:
+    """البرنامج التاني (القديم أو الجديد) على نفس الجهاز هو اللي شغّال تليجرام والشيت."""
+    def nudge(self): pass
+
+_SERVICE_LOCK = [None]
+
+def _take_service_lock():
+    """نسخة واحدة بس على الجهاز تشغّل تليجرام والشيت (لو القديم والجديد مفتوحين مع بعض، البوت ميتلخبطش)."""
+    if _SERVICE_LOCK[0] is not None: return True
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        if os.name == "nt": s.setsockopt(socket.SOL_SOCKET, getattr(socket, "SO_EXCLUSIVEADDRUSE", socket.SO_REUSEADDR), 1)
+        s.bind(("127.0.0.1", 47851)); s.listen(1)
+    except OSError:
+        s.close(); return False
+    _SERVICE_LOCK[0] = s; return True
+
+def start_online_service():
+    if ONLINE_SERVICE[0] is None:
+        if not _take_service_lock(): return _NoService()
+        ONLINE_SERVICE[0] = OnlineService(); ONLINE_SERVICE[0].start()
+    if _WATCHDOG[0] is None:
+        _WATCHDOG[0] = threading.Thread(target=_service_watchdog, daemon=True, name="online-watchdog"); _WATCHDOG[0].start()
+    return ONLINE_SERVICE[0]
+
+def _service_watchdog():
+    """كل دقيقة: لو خدمة تليجرام/الشيت وقفت أو اتعلقت أكتر من 6 دقايق، بيشغّل واحدة جديدة مكانها."""
+    while True:
+        time.sleep(60)
+        try:
+            s = ONLINE_SERVICE[0]
+            if s is None: continue
+            dead = not s.is_alive(); stuck = time.time() - s.beat > 360
+            if dead or stuck:
+                new = OnlineService(); new.conv = getattr(s, "conv", {})      # القديمة هتقف لوحدها أول ما تصحى
+                ONLINE_SERVICE[0] = new; new.start()
+                write_error_log(f"online-service {'وقفت' if dead else 'اتعلقت'} — اتشغّلت خدمة جديدة")
+                try: new.status("⚠ الخدمة كانت واقفة — اشتغلت تاني لوحدها", "status_tg")
+                except Exception: pass
+        except Exception: pass
+
+# ---------------- شاشة الاتصال بقاعدة البيانات (SQLite / سيرفر PostgreSQL) ----------------
+APP_RESTART = [False]     # True = البرنامج يقفل ويفتح تاني بإعدادات الاتصال الجديدة
+
+def _center(win, w, h):
+    sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+    win.geometry(f"{w}x{h}+{(sw - w) // 2}+{max((sh - h) // 3, 0)}")
+
+def _local_data_counts(path=None):
+    """عدد الفواتير والأصناف والعملاء في ملف SQLite."""
+    path = path or DB_PATH
+    if not os.path.exists(path): return None
+    try:
+        con = sqlite3.connect(path)
+        try:
+            names = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            return {t: (con.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] if t in names else 0) for t in ("invoices", "items", "parties", "users")}
+        finally: con.close()
+    except Exception: return None
+
+def choice_dialog(parent, title, message, buttons):
+    """رسالة بزراير مختارة؛ بترجع مفتاح الزرار اللي اتداس (أو None لو اتقفلت)."""
+    d = tk.Toplevel(parent); d.title(title); d.configure(bg=BG); d.resizable(False, False)
+    _center(d, 560, 300)
+    tk.Label(d, text=title, font=("Tahoma", 14, "bold"), fg=NAVY, bg=BG).pack(pady=(16, 6))
+    tk.Label(d, text=message, font=("Tahoma", 11), bg=BG, justify="center", wraplength=500).pack(padx=16, pady=6, fill="both", expand=True)
+    res = {"v": None}
+    bf = tk.Frame(d, bg=BG); bf.pack(pady=12)
+    for key, text in buttons:
+        ttk.Button(bf, text=text, command=lambda k=key: (res.update(v=k), d.destroy())).pack(side="right", padx=5)
+    d.protocol("WM_DELETE_WINDOW", d.destroy); d.lift(); d.grab_set(); d.focus_force(); parent.wait_window(d)
+    return res["v"]
+
+def db_connection_dialog(parent):
+    """إعدادات الاتصال. بترجع True لو الإعدادات اتغيرت (البرنامج لازم يفتح من جديد)."""
+    d = tk.Toplevel(parent); d.title("الاتصال بقاعدة البيانات"); d.configure(bg=BG); d.resizable(False, False)
+    _center(d, 600, 690)
+    top = tk.Frame(d, bg=NAVY); top.pack(fill="x")
+    tk.Label(top, text="🌐 الاتصال بقاعدة البيانات", font=("Tahoma", 16, "bold"), fg="white", bg=NAVY).pack(pady=10)
+    cfg = dict(DB_CFG)
+    mode = tk.StringVar(value=cfg["mode"])
+    v = {k: tk.StringVar(value=str(cfg.get(k) or "")) for k in ("host", "port", "dbname", "user", "password")}
+    if not v["host"].get(): v["host"].set("127.0.0.1")
+    body = tk.Frame(d, bg=BG); body.pack(fill="both", expand=True, padx=24, pady=10)
+    tk.Radiobutton(body, text="الجهاز ده بس (من غير شبكة) — زي النسخة العادية", variable=mode, value="sqlite", bg=BG, anchor="e", font=("Tahoma", 12)).pack(fill="x")
+    tk.Radiobutton(body, text="سيرفر على الشبكة — أكتر من جهاز على نفس الداتا", variable=mode, value="postgres", bg=BG, anchor="e", font=("Tahoma", 12)).pack(fill="x")
+    pf = tk.LabelFrame(body, text="بيانات السيرفر (PostgreSQL)", bg=BG, padx=12, pady=8); pf.pack(fill="x", pady=10)
+    entries = []
+    for k, label, show in (("host", "عنوان الجهاز الأساسي (IP) — على الجهاز الأساسي نفسه اكتب 127.0.0.1", ""), ("port", "المنفذ (Port)", ""),
+                           ("dbname", "اسم قاعدة البيانات", ""), ("user", "اسم مستخدم PostgreSQL", ""), ("password", "كلمة سر PostgreSQL (اللي كتبتها وقت التسطيب)", "•")):
+        tk.Label(pf, text=label, bg=BG, anchor="e", font=("Tahoma", 11)).pack(fill="x")
+        e = ttk.Entry(pf, textvariable=v[k], justify="left", show=show); e.pack(fill="x", pady=(0, 6)); entries.append(e)
+    msg = tk.Label(body, text="", bg=BG, fg=NAVY, font=("Tahoma", 11), justify="center", wraplength=540); msg.pack(fill="x", pady=4)
+    def sync_state(*a):
+        st = "normal" if mode.get() == "postgres" else "disabled"
+        for e in entries: e.config(state=st)
+    mode.trace_add("write", sync_state); sync_state()
+    result = {"changed": False}
+
+    def read_cfg():
+        c = dict(DB_CFG); c["mode"] = mode.get()
+        for k in ("host", "dbname", "user", "password"): c[k] = v[k].get().strip() if k != "password" else v[k].get()
+        try: c["port"] = int(v["port"].get().strip() or 5432)
+        except ValueError: raise ValueError("المنفذ لازم يكون رقم (عادةً 5432)")
+        if c["mode"] == "postgres" and not c["host"]: raise ValueError("اكتب عنوان الجهاز الأساسي")
+        return c
+
+    def say(text, color=NAVY): msg.config(text=text, fg=color); d.update()
+
+    def test():
+        try: c = read_cfg()
+        except ValueError as e: return say(str(e), "#b91c1c")
+        if c["mode"] != "postgres": return say("الوضع ده مش محتاج اختبار.")
+        say("بيجرّب يوصل للسيرفر...")
+        try:
+            con = _pg_connect(c); con.close()
+            say("✔ الاتصال تمام", "#1c7c4d")
+        except Exception as e:
+            if "does not exist" in str(e):
+                try: _pg_connect(c, dbname="postgres").close(); return say("✔ الاتصال بالسيرفر تمام.\nقاعدة البيانات لسه مش موجودة، وهتتعمل لوحدها لما تدوس حفظ.", "#1c7c4d")
+                except Exception as e2: e = e2
+            old = dict(DB_CFG); DB_CFG.update(c)
+            try: say("✖ " + pg_error_text(e), "#b91c1c")
+            finally: DB_CFG.clear(); DB_CFG.update(old)
+
+    def save():
+        try: c = read_cfg()
+        except ValueError as e: return say(str(e), "#b91c1c")
+        old = dict(DB_CFG)
+        if c["mode"] == "sqlite":
+            if old["mode"] == "postgres" and not messagebox.askyesno("تأكيد",
+                    "الجهاز ده هيرجع يشتغل لوحده على الداتا اللي عليه، ومش هيشوف الشغل اللي على السيرفر.\n\nمتأكد؟", parent=d): return
+            save_db_config(c); result["changed"] = old["mode"] != "sqlite"; return d.destroy()
+        say("بيجهّز السيرفر...")
+        try:
+            DB_CFG.clear(); DB_CFG.update(c); pg_reset_connection()
+            created = pg_ensure_database(c)
+            init_db()
+            empty = pg_is_empty()
+        except Exception as e:
+            DB_CFG.clear(); DB_CFG.update(old); pg_reset_connection()
+            return say("✖ " + (str(e) if isinstance(e, DBUnavailable) else pg_error_text(e)), "#b91c1c")
+        src_path, local = DB_PATH, None
+        for p in (DB_PATH, OFFLINE_DB_PATH):          # الداتا بتاعة النسخة دي، وإلا بتاعة النسخة الأوفلاين على نفس الجهاز
+            cnt = _local_data_counts(p)
+            if cnt and (cnt["invoices"] or cnt["items"] or cnt["parties"]): src_path, local = p, cnt; break
+        has_local = local is not None
+        if empty and has_local:
+            src_name = "النسخة الأوفلاين" if src_path == OFFLINE_DB_PATH else "النسخة دي"
+            q = (f"السيرفر فاضي. تنقل الداتا اللي على الجهاز ده ({src_name}) للسيرفر؟\n\n"
+                 f"فواتير: {local['invoices']}   •   أصناف: {local['items']}   •   عملاء وموردين: {local['parties']}   •   مستخدمين: {local['users']}\n\n"
+                 f"⚠️ اعمل الخطوة دي من جهاز واحد بس (الجهاز اللي عليه الداتا الحقيقية).\nالملف القديم هيفضل على الجهاز زي ما هو كنسخة احتياطية.")
+            if messagebox.askyesno("نقل الداتا للسيرفر", q, parent=d):
+                try:
+                    os.makedirs(LOCAL_BACKUP_DIR, exist_ok=True)
+                    bk = os.path.join(LOCAL_BACKUP_DIR, f"warehouse_before_server_{datetime.now().strftime('%Y-%m-%d_%H%M%S')}.db")
+                    s = sqlite3.connect(src_path); t = sqlite3.connect(bk)
+                    try: s.backup(t)
+                    finally: t.close(); s.close()
+                    pg_reset_connection()
+                    # النقل بيتعمل من النسخة (الملف الأصلي مبيتلمسش)
+                    rep = import_sqlite_to_pg(bk, progress=lambda t, n: say(f"بينقل: {t} ({n})"))
+                except Exception as e:
+                    DB_CFG.clear(); DB_CFG.update(old); pg_reset_connection()
+                    return say("✖ النقل اتلغى ومفيش حاجة اتغيرت على السيرفر:\n" + (pg_error_text(e) if not isinstance(e, DBUnavailable) else str(e)), "#b91c1c")
+                fixed = sum(r[2] for r in rep); dropped = sum(r[3] for r in rep)
+                note = f"\n\nملاحظة: اتصلّح {fixed} خانة فيها قيم غير مظبوطة" if fixed else ""
+                if dropped: note += f"\nواتشال {dropped} صف مربوط بحاجة متمسحة"
+                messagebox.showinfo("نقل الداتا", "✔ الداتا اتنقلت للسيرفر." + note, parent=d)
+        elif not empty and has_local and old["mode"] != "postgres":
+            messagebox.showinfo("السيرفر", "السيرفر عليه داتا بالفعل، والجهاز ده هيشتغل عليها.\nالداتا اللي كانت على الجهاز ده لوحده متمسحتش، وهتفضل في ملفها لو احتجتها.", parent=d)
+        save_db_config(c); pg_reset_connection()
+        result["changed"] = True; d.destroy()
+
+    bf = tk.Frame(d, bg=BG); bf.pack(pady=(0, 14))
+    ttk.Button(bf, text="حفظ", command=save).pack(side="right", padx=5)
+    ttk.Button(bf, text="اختبار الاتصال", command=test).pack(side="right", padx=5)
+    ttk.Button(bf, text="إلغاء", command=d.destroy).pack(side="right", padx=5)
+    d.protocol("WM_DELETE_WINDOW", d.destroy); d.lift(); d.grab_set(); d.focus_force(); parent.wait_window(d)
+    if not result["changed"]: pg_reset_connection()
+    return result["changed"]
+
+def ensure_db_ready():
+    """على السيرفر: يتأكد إن الاتصال شغال قبل ما البرنامج يفتح. بيرجع False لو المستخدم اختار الخروج."""
+    while using_pg():
+        try:
+            with db() as c: c.execute("SELECT 1").fetchone()
+            return True
+        except Exception as e:
+            text = str(e) if isinstance(e, DBUnavailable) else pg_error_text(e)
+            root = tk.Tk(); root.withdraw()
+            try:
+                ans = choice_dialog(root, "السيرفر مش متاح", f"{text}\n\n({server_label()})",
+                                    [("retry", "إعادة المحاولة"), ("settings", "إعدادات الاتصال"), ("exit", "خروج")])
+                if ans == "settings": db_connection_dialog(root)
+                elif ans != "retry": return False
+            finally: root.destroy()
+            pg_reset_connection()
+    return True
+
+def main():
+    try:
+        while True:
+            APP_RESTART[0] = False
+            if not ensure_db_ready(): break
+            init_db()
+            start_online_service()      # Telegram و Google Sheets في الخلفية (لو متفعّلين على الجهاز ده)
+            warn = None
+            if not os.path.exists(auto_backup_path()): _, warn = auto_backup()
+            while True:
+                app = App()
+                if not getattr(app, "logged_in", False):
+                    app.destroy(); break
+                if warn:
+                    app.after(600, lambda a=app, w=warn: messagebox.showwarning("النسخة الاحتياطية", w, parent=a)); warn = None
+                app.mainloop()
+                if APP_RESTART[0] or not getattr(app, "relogin", False): break
+            if not APP_RESTART[0]: break
+    except Exception as e:
+        # أي خطأ وقت فتح البرنامج يتسجل ويظهر في رسالة (البرنامج بيشتغل من غير نافذة أوامر)
+        import traceback
+        write_error_log(traceback.format_exc())
+        try:
+            r = tk.Tk(); r.withdraw()
+            messagebox.showerror("تعذّر تشغيل البرنامج", f"{e}\n\nتفاصيل الخطأ محفوظة في:\n{os.path.join(APP_DATA_DIR, 'error_log.txt')}", parent=r)
+            r.destroy()
+        except Exception: pass
+
+if __name__ == "__main__":
+    main()
