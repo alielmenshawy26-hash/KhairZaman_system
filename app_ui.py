@@ -41,7 +41,7 @@ for _keys, _methods in [
     (["home"], "dashboard expected mark_called unmark_called hide_expected unhide_expected"),
     (_INV + ["log", "home"], "invoice_setup save_invoice invoice print_invoice invoice_for_edit delete_invoice"),
     (["log", "home"], "invoices"),
-    (["vch:new", "vch:log"], "voucher_setup save_voucher voucher_preview add_expense_cat delete_expense_cat rename_expense_cat vouchers voucher delete_voucher print_receipt"),
+    (["vch:new", "vch:log"], "voucher_setup save_voucher voucher_preview add_expense_cat delete_expense_cat rename_expense_cat expense_cat_log vouchers voucher delete_voucher print_receipt"),
     (["acc:statement", "acc:balances"], "parties_list statement print_statement payment_detail"),
     (["acc:balances"], "balances delete_parties print_balances"),
     (["acc:cash"], "cash add_cash_move delete_cash_move cash_count cash_count_setup cash_count_save cash_count_print cash_count_pdf cash_transfer_add cash_transfer_delete"),
@@ -52,7 +52,7 @@ for _keys, _methods in [
     (["itm:stock"], "stock save_price print_stock_count"),
     (["itm:sales", "itm:buys"], "items_flow"),
     (["itm:damaged"], "damaged save_damaged delete_damaged"),
-    (["prd:new"], "production_setup save_production delete_production bread_sizes_save"),
+    (["prd:new"], "production_setup save_production delete_production bread_sizes_save prod_supplies_get prod_supplies_save"),
     (["prd:new", "prd:log"], "production_get bread_sizes_get"),
     (["prd:new", "prd:log", "rep:production"], "production_sheet print_production"),
     (["rep:production"], "production_report"),
@@ -74,12 +74,12 @@ for _keys, _methods in [
     (["rep:monthly"], "monthly_report monthly_print"),
 ]:
     for _m in _methods.split(): METHOD_SCREENS[_m] = set(_keys)
-NO_REP = {"close_day", "day_unlock", "req_decide", "inv_request_get",
+NO_REP = {"close_day", "expense_cat_log", "day_unlock", "req_decide", "inv_request_get",
           # المندوب بيبعت طلبات بس: مايحذفش فاتورة أو سند اتقبل (كان ممكن يلف على الموافقة بالحذف)،
           # ومايشوفش تقرير الشركة اليومي (مبيعات الكل والخزنة والمصروفات)، ومايغيرش بنود المصروفات
           "delete_invoice", "delete_voucher", "daily_report", "print_daily", "daily_trend",
           "add_expense_cat", "rename_expense_cat", "delete_expense_cat",
-          "save_production", "delete_production", "bread_sizes_save"}       # المندوب مايقفلش اليوم ومايفتحش أيام مقفولة
+          "save_production", "delete_production", "bread_sizes_save", "prod_supplies_save"}       # المندوب مايقفلش اليوم ومايفتحش أيام مقفولة
 
 
 def user_screens(r):
@@ -249,10 +249,10 @@ class Api:
             out["profit"] = {"gross": _r2(ps["gross"]), "net": _r2(ps["actual"])}
         return out
 
-    def today_bar(self):
-        """الشريط اللي تحت في كل الشاشات: ملخص النهارده."""
+    def today_bar(self, day=None):
+        """الشريط اللي تحت في كل الشاشات: ملخص النهارده (بتاريخ الجهاز اللي فاتح)."""
         self._need_login()
-        day = _today()
+        day = W.check_date(day or _today())
         with W.db() as c:
             r = {k: c.execute(f"SELECT COUNT(*), COALESCE(SUM({W.NET_SQL}),0) FROM invoices i WHERE i.kind=? AND i.inv_date=?", (k, day)).fetchone() for k in W.KINDS}
             col = c.execute("SELECT COALESCE(SUM(amount),0) FROM payments WHERE kind='تحصيل' AND pay_date=?", (day,)).fetchone()[0]
@@ -563,29 +563,36 @@ class Api:
         return name
 
     def delete_expense_cat(self, name, pw):
-        """حذف بند مصروفات من القايمة — بكلمة سر اليوزر الداخل. المصروفات القديمة بتفضل باسم البند زي ما هي."""
+        """حذف بند مصروفات من القايمة — بكلمة سر المالك. المصروفات القديمة بتفضل باسم البند زي ما هي."""
         self._need_login()
         name = (name or "").strip()
         if not name: raise UIError("اختار البند الأول")
         if name == "مصروفات أخرى": raise UIError("«مصروفات أخرى» بند أساسي ومينفعش يتمسح")
+        if not W.verify_owner_password(pw): raise UIError("كلمة سر المالك غلط")
         with W.db() as c:
-            u = c.execute("SELECT * FROM users WHERE id=?", (W.CURRENT_USER.get("id"),)).fetchone()
-            if not u or not W.check_pw(pw or "", u["pw_hash"], u["salt"]): raise UIError("كلمة السر غلط")
             if not c.execute("SELECT 1 FROM expense_cats WHERE name=?", (name,)).fetchone(): raise UIError("البند ده مش موجود في القايمة")
             used = c.execute("SELECT COUNT(*) FROM expenses WHERE category=?", (name,)).fetchone()[0]
             c.execute("DELETE FROM expense_cats WHERE name=?", (name,))
             W.log(c, "حذف بند مصروفات", name + (f" — عليه {used} مصروف قديم فضل زي ما هو" if used else ""))
         return {"used": used}
 
+    def expense_cat_log(self, name):
+        """سجل مصروفات بند واحد بس (كل التواريخ) — للكليك يمين على البند."""
+        self._need_login()
+        name = (name or "").strip()
+        if not name: raise UIError("اختار البند الأول")
+        with W.db() as c:
+            rows = [dict(r) for r in c.execute("SELECT id, exp_date, amount, notes FROM expenses WHERE kind='مصروف' AND category=? ORDER BY exp_date DESC, id DESC", (name,)).fetchall()]
+        return {"name": name, "rows": rows, "total": round(sum(r["amount"] or 0 for r in rows), 2)}
+
     def rename_expense_cat(self, old, new, pw):
-        """تعديل اسم بند — بكلمة سر اليوزر. المصروفات القديمة بتتنقل للاسم الجديد."""
+        """تعديل اسم بند — بكلمة سر المالك. المصروفات القديمة بتتنقل للاسم الجديد."""
         self._need_login()
         old = (old or "").strip(); new = (new or "").strip()
         if not old or not new: raise UIError("اكتب الاسم الجديد")
         if old == "مصروفات أخرى": raise UIError("«مصروفات أخرى» بند أساسي ومينفعش يتغير اسمه")
+        if not W.verify_owner_password(pw): raise UIError("كلمة سر المالك غلط")
         with W.db() as c:
-            u = c.execute("SELECT * FROM users WHERE id=?", (W.CURRENT_USER.get("id"),)).fetchone()
-            if not u or not W.check_pw(pw or "", u["pw_hash"], u["salt"]): raise UIError("كلمة السر غلط")
             if c.execute("SELECT 1 FROM expense_cats WHERE name=?", (new,)).fetchone(): raise UIError(f"فيه بند اسمه «{new}» بالفعل")
             c.execute("UPDATE expense_cats SET name=? WHERE name=?", (new, old))
             used = c.execute("SELECT COUNT(*) FROM expenses WHERE category=?", (old,)).fetchone()[0]
@@ -1456,9 +1463,10 @@ class Api:
             last = c.execute("SELECT flour_item_id FROM production ORDER BY id DESC LIMIT 1").fetchone()
             nxt = c.execute("SELECT COALESCE(MAX(sack_no),0) FROM production WHERE p_date=?", (d,)).fetchone()[0]
             sizes = [{**z, "stock": _r2(st.get(z["item_id"], 0.0))} for z in W.bread_sizes(c)]
+            sups = [{**x, "stock": _r2(st.get(x["item_id"], 0.0))} for x in W.prod_supplies(c)]
             sheet = self._prod_sheet(c, d, d)
         return {"date": d, "sizes": sizes, "flours": flours, "flour_id": (last[0] if last and any(f["id"] == last[0] for f in flours) else (flours[0]["id"] if flours else None)),
-                "next_no": int(nxt or 0) + 1, "sheet": sheet}
+                "next_no": int(nxt or 0) + 1, "sheet": sheet, "supplies": sups}
 
     def production_sheet(self, d_from, d_to):
         self._need_login()
@@ -1481,7 +1489,7 @@ class Api:
         try:
             d = W.check_date(p.get("date") or _today())
             no = int(W._f(p.get("sack_no") or 0))
-            fq = W._f(p.get("flour_qty") if p.get("flour_qty") not in (None, "") else 1)
+            fq = 1.0                                   # كل تسجيل = شيكارة واحدة بالظبط
         except ValueError: raise UIError("راجع التاريخ ورقم الشيكارة")
         if no <= 0: raise UIError("رقم الشيكارة لازم يكون 1 أو أكتر")
         if fq <= 0: raise UIError("كمية الدقيق لازم تكون أكبر من صفر")
@@ -1511,6 +1519,7 @@ class Api:
                     self._day(old["p_date"])
                     if old["flour_item_id"]: touched.add(old["flour_item_id"])
                     touched |= {r[0] for r in c.execute("SELECT item_id FROM production_lines WHERE production_id=? AND item_id IS NOT NULL", (pid,)).fetchall()}
+                    touched |= {r[0] for r in c.execute("SELECT item_id FROM production_supplies WHERE production_id=?", (pid,)).fetchall()}
                     old_lines = {r["size_id"]: r for r in c.execute("SELECT * FROM production_lines WHERE production_id=?", (pid,)).fetchall()}
                     c.execute("UPDATE production SET p_date=?, sack_no=?, flour_item_id=?, flour_qty=?, notes=? WHERE id=?", (d, no, fl["id"], fq, (p.get("notes") or "").strip(), pid))
                     c.execute("DELETE FROM production_lines WHERE production_id=?", (pid,))
@@ -1518,6 +1527,9 @@ class Api:
                     old_lines = {}
                     pid = c.execute("INSERT INTO production(p_date,created_at,sack_no,flour_item_id,flour_qty,notes,username) VALUES(?,?,?,?,?,?,?)",
                                     (d, W.now_ts(), no, fl["id"], fq, (p.get("notes") or "").strip(), W.CURRENT_USER.get("username") or "")).lastrowid
+                    for x in W.prod_supplies(c):         # المستلزمات الثابتة وقت التسجيل (التعديل بعدين مابيغيّرهاش)
+                        if x["qty"] > 0:
+                            c.execute("INSERT INTO production_supplies(production_id,item_id,qty) VALUES(?,?,?)", (pid, x["item_id"], x["qty"] * fq)); touched.add(x["item_id"])
                 desc, loaves_all, value_all = [], 0.0, 0.0
                 for sid, t in tables.items():
                     z = sizes.get(sid)
@@ -1532,7 +1544,7 @@ class Api:
                 W.check_stock(c, list(touched))
                 W.log(c, "تعديل إنتاج" if p.get("id") else "تسجيل إنتاج",
                       f"شيكارة {no} بتاريخ {d} ({W.fmt(fq)} {fl['name']}): " + "، ".join(desc) + f" = {W.fmt(loaves_all)} رغيف بـ {W.fmt(value_all)} ج")
-        except W.NegativeStock as e: return {"ok": False, "need": "neg", "error": str(e) + "\nرصيد الدقيق هيبقى بالسالب — مسموح بس بكلمة سر المالك."}
+        except W.NegativeStock as e: return {"ok": False, "need": "neg", "error": str(e) + "\nالرصيد هيبقى بالسالب — مسموح بس بكلمة سر المالك."}
         finally: W._TLS.allow_neg = None
         return {"ok": True, "id": pid}
 
@@ -1547,7 +1559,9 @@ class Api:
                 if not r: return {"ok": True}
                 self._day(r["p_date"])
                 items = {r["flour_item_id"]} | {x[0] for x in c.execute("SELECT item_id FROM production_lines WHERE production_id=?", (pid,)).fetchall()}
+                items |= {x[0] for x in c.execute("SELECT item_id FROM production_supplies WHERE production_id=?", (pid,)).fetchall()}
                 c.execute("DELETE FROM production_lines WHERE production_id=?", (pid,))
+                c.execute("DELETE FROM production_supplies WHERE production_id=?", (pid,))
                 c.execute("DELETE FROM production WHERE id=?", (pid,))
                 W.check_stock(c, [i for i in items if i])
                 W.log(c, "حذف إنتاج", f"شيكارة {r['sack_no']} بتاريخ {r['p_date']}")
@@ -1558,6 +1572,36 @@ class Api:
     def bread_sizes_get(self):
         self._need_login()
         with W.db() as c: return W.bread_sizes(c, active_only=False)
+
+    def prod_supplies_get(self):
+        """المستلزمات الثابتة لكل شيكارة + أصناف قسم المستلزمات علشان تختار منها."""
+        self._need_login()
+        with W.db() as c:
+            items = [{"id": r["id"], "name": r["name"], "unit": r["unit"] or ""} for r in
+                     c.execute("SELECT id,name,unit FROM items WHERE COALESCE(category,'') NOT IN (?,?) ORDER BY name", (W.CAT_FLOUR, W.CAT_BREAD)).fetchall()]
+            return {"rows": W.prod_supplies(c), "items": items}
+
+    def prod_supplies_save(self, rows):
+        """المالك بس: كل شيكارة بتاخد قد إيه من كل مستلزم (بيتطبق على الشكاير الجديدة بس)."""
+        self._need_login()
+        if not W.is_owner(): raise UIError("تعديل مستلزمات الشيكارة للمالك بس")
+        clean, seen = [], set()
+        with W.db() as c:
+            for r in rows or []:
+                if not r.get("item_id"): continue
+                iid = int(r["item_id"])
+                try: q = W._f(r.get("qty"))
+                except ValueError: raise UIError("كمية المستلزم لازم تبقى رقم")
+                if q < 0: raise UIError("كمية المستلزم مينفعش تبقى بالسالب")
+                if q == 0 or iid in seen: continue
+                it = c.execute("SELECT name,unit FROM items WHERE id=?", (iid,)).fetchone()
+                if not it: raise UIError("صنف مش موجود")
+                seen.add(iid); clean.append((iid, q, f"{it['name']} {W.fmt(q)} {it['unit'] or ''}".strip()))
+            old = [f"{x['name']} {W.fmt(x['qty'])}" for x in W.prod_supplies(c)]
+            c.execute("DELETE FROM prod_supplies")
+            for i, (iid, q, _) in enumerate(clean): c.execute("INSERT INTO prod_supplies(item_id,qty,sort) VALUES(?,?,?)", (iid, q, i + 1))
+            W.log(c, "تعديل مستلزمات الشيكارة", ("، ".join(x[2] for x in clean) or "مفيش") + " (كانت: " + ("، ".join(old) or "مفيش") + ")")
+            return W.prod_supplies(c)
 
     def bread_sizes_save(self, rows):
         """المالك بس: عدد الأرغفة في الطاولة وسعر الرغيف (بيتطبق على الإنتاج الجديد بس)."""

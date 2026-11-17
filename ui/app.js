@@ -49,7 +49,7 @@ async function loadTodayBar() {
   const el = $("#todaybar"); if (!el || TB_BUSY || !S.me) return;
   TB_BUSY = true;
   try {
-    const t = await api("today_bar");
+    const t = await api("today_bar", deviceToday());
     const lu = $("#last-up b"); if (lu) lu.textContent = new Date().toLocaleTimeString("ar-EG", { hour: "2-digit", minute: "2-digit" });
     const it = (label, v, cls = "") => h("span", { class: "tb-i " + cls }, label, h("b", null, v));
     el.replaceChildren(h("b", { class: "tb-h" }, "اليوم"), it("عدد فواتير اليوم:", String(t.count)), it("مبيعات:", fmt(t.sales)),
@@ -405,7 +405,9 @@ function renderLogin() {
 
 /* ===================== الهيكل: القايمة الجانبية + الشريط اللي فوق ===================== */
 // الصلاحيات: المالك كله، وغيره الشاشات المسموحله بيها بس
-const can = (k) => !!S.me && (S.me.owner || (S.me.screens || []).includes(k));
+/* مخفية مؤقتاً في خير زمان (لحد ما نظام المناديب يتحدد) — الكود موجود بس مش ظاهر */
+const HIDDEN_SCREENS = new Set(["req", "rep:reps", "rep:targets", "emp:veh"]);
+const can = (k) => !!S.me && !HIDDEN_SCREENS.has(k) && (S.me.owner || (S.me.screens || []).includes(k));
 const firstScreen = () => (can("home") ? "home" : (S.me.screens || [])[0] || "home");
 function navBtn(key) {
   const sc = SCREENS[key];
@@ -418,13 +420,12 @@ function navGroups() {
   const G = [
     ["الإنتاج", "plus", ["prd:new", "prd:log", "rep:production"]],
     ["الفواتير", "list", ["inv:مبيعات", "inv:مشتريات", "inv:مرتجع مبيعات", "inv:مرتجع مشتريات", "log"]],
-    ["السندات", "cash", ["vch:new", "vch:log"], [["طباعة إيصال أمانة", "print", trustPrint], ...(S.boot && !S.boot.web ? [["إيصال أمانة PDF", "save", () => pdfExport("print_trust_form", [])]] : [])]],
-    ["الطلبات", "check", ["req"]],
+    ["السندات", "cash", ["vch:new", "vch:log"]],
     ["العملاء والموردون", "users", ["par:list"]],
     ["الأصناف والمخزون", "box", ["itm:list", "itm:stock", "itm:sales", "itm:buys", "itm:damaged", ["العينات", "box", ["smp:items", "smp:out", "smp:in"]]]],
-    ["الموظفون", "users", ["emp:list", "emp:att", "emp:attlog", "emp:veh"]],
+    ["الموظفون", "users", ["emp:list", "emp:att", "emp:attlog"]],
     ["الحسابات", "calc", ["acc:statement", "acc:balances", "acc:cash", "acc:subcash", "acc:assets"]],
-    ["التقارير", "chart", ["rep:daily", "rep:production", S.me.owner ? "rep:monthly" : null, S.me.owner ? "rep:profit" : null, "rep:reps", "rep:targets", "rep:log"]],
+    ["التقارير", "chart", ["rep:daily", "rep:production", S.me.owner ? "rep:monthly" : null, S.me.owner ? "rep:profit" : null, "rep:log"]],
     ["الإعدادات", "edit", ["set:main", S.me.owner ? "set:users" : null], [["إصدار نسخة احتياطية", "save", backupNow], ...(S.me.owner && S.boot && !S.boot.web ? [["استرجاع نسخة احتياطية", "upload", restoreBackup]] : [])]],
   ];
   S.openGroups = S.openGroups || new Set();
@@ -457,7 +458,7 @@ function renderShell() {
     h("div", { class: "who" }, h("div", { class: "av" }, (S.me.username || "?").slice(0, 1)),
       h("div", { class: "lbl" }, h("b", null, S.me.username), h("small", null, S.me.role)),
       h("button", { class: "btn ghost", style: { color: "#e5dcca", marginInlineStart: "auto", padding: "0 8px" }, title: "خروج", "aria-label": "خروج", onclick: logout }, icon("logout", 18))),
-    h("div", { class: "sig", title: S.boot.version || "" }, h("span", { dir: "ltr", class: "sig-v" }, S.boot.build ? `V2.1.${S.boot.build}` : "dev"), h("span", { dir: "ltr", class: "sig-n" }, "by Ali ElMenshawy")));
+    h("div", { class: "sig", title: S.boot.version || "" }, h("span", { dir: "ltr", class: "sig-v" }, S.boot.build ? `V1.0.${S.boot.build}` : "dev"), h("span", { dir: "ltr", class: "sig-n" }, "by Ali ElMenshawy")));
   const top = h("header", { class: "top" },
     h("button", { class: "btn icon-btn m-menu", "aria-label": "القايمة", onclick: () => toggleMobileNav() }, icon("menu", 22)),
     h("div", { class: "grow" }, h("h1", { id: "top-title" }, ""), h("div", { class: "sub", id: "top-sub" }, "")),
@@ -465,8 +466,7 @@ function renderShell() {
     h("button", { class: "btn gold icon-btn", id: "refresh-all", title: "تحديث الشاشة", "aria-label": "تحديث", onclick: refreshAll }, icon("refresh", 22)),
     S.me.rep ? h("button", { class: "btn gold close-day", id: "checkin", onclick: repCheckin }, icon("check", 18), "تسجيل حضور") : null,
     S.me.rep ? null : h("button", { class: "btn gold close-day", id: "close-day", onclick: closeDay }, icon("lock", 18), "تقفيل اليوم"),
-    !S.me.rep && can("req") ? h("button", { class: "btn gold icon-btn", id: "req-btn", title: "طلبات المناديب", "aria-label": "طلبات المناديب", onclick: () => go("req") }, icon("inbox", 22), h("span", { class: "badge zero", id: "req-n" }, "0")) : null,
-    !can("home") ? null : h("button", { class: "btn gold icon-btn", id: "bell", "aria-label": "العملاء المتوقعين", onclick: openDrawer }, icon("bell", 22, "ring"), h("span", { class: "badge zero", id: "bell-n" }, "0")));
+    null);
   const main = h("div", { class: "main" }, top, h("div", { id: "screen" }), h("footer", { class: "todaybar", id: "todaybar", "aria-label": "ملخص النهارده" }), h("footer", { class: "pagebar", id: "pagebar", hidden: true, "aria-label": "إجمالي الجدول" }));
   $("#app").replaceChildren(h("div", { class: "shell" }, side, main), h("div", { class: "shade", id: "shade", onclick: closeDrawer }), h("aside", { class: "drawer", id: "drawer", "aria-label": "العملاء المتوقعين" }));
   go(S.screen, true); REQ_LAST = -1; loadReqCount();
@@ -507,6 +507,9 @@ setInterval(() => {                                   // عدّى نص اللي�
   if (!S.me || !syncToday()) return;
   if (S.screen && !S.dirty && !S.screen.startsWith("inv:") && S.screen !== "vch:new") go(S.screen, true);
 }, 60000);
+function rollIfNewDay() { if (S.me && syncToday() && S.screen && !S.dirty && !S.screen.startsWith("inv:") && S.screen !== "vch:new") go(S.screen, true); }
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") rollIfNewDay(); });
+window.addEventListener("focus", rollIfNewDay);
 function resetDates(k) {
   const td = S.boot.today, ms = monthStart();
   const R = {
@@ -518,6 +521,7 @@ function resetDates(k) {
     "emp:att": () => (S.attDay = null), "emp:attlog": () => (S.alSt = null),
     "emp:veh": () => { if (S.vehSt) S.vehSt = { from: td, to: td, sel: S.vehSt.sel }; },
     "rep:targets": () => (S.tgMonth = null),
+    "prd:new": () => (S.prodSt = null), "prd:log": () => (S.prodLog = null), "rep:production": () => (S.prodRep = null),
     "itm:sales": () => (S["flowمبيعات"] = null), "itm:buys": () => (S["flowمشتريات"] = null),
     "smp:out": () => (S["smpعينات مبيعات"] = null), "smp:in": () => (S["smpعينات مشتريات"] = null),
   };
@@ -582,7 +586,7 @@ async function go(key, force) {
 
 /* ===================== الرئيسية ===================== */
 async function renderHome(box) {
-  const d = await api("dashboard");
+  const d = await api("dashboard", S.boot.today);
   const sales = d.inv["مبيعات"], buys = d.inv["مشتريات"];
   markClosed(d.closed);
   const rows = d.rows.map((r) => h("tr", { class: "click", tabindex: "0", ondblclick: () => showInvoice(r.id), onkeydown: (e) => { if (e.key === "Enter") showInvoice(r.id); },
@@ -1300,6 +1304,15 @@ const money = (v) => fmt(v);
 const numOrEmpty = (v) => (Math.abs(v) > 0.004 ? fmt(v) : "");
 
 /* قايمة كليك يمين صغيرة */
+/* سجل مصروفات بند واحد بس (من الكليك يمين على البند في شاشة السندات) */
+async function expenseCatLog(name) {
+  let r; try { r = await api("expense_cat_log", name); } catch (e) { return toast(e.message, "err"); }
+  const T = selTable({ maxH: "55vh", empty: "مفيش مصروفات على البند ده لسه",
+    cols: [{ h: "التاريخ", key: "exp_date" }, { h: "المبلغ", num: true, fn: (x) => h("b", null, fmt(x.amount)) }, { h: "ملاحظات", key: "notes", cls: "hint" }],
+    totals: (rs, isSel) => [h("b", null, isSel ? "إجمالي المحدد" : "الإجمالي"), totItem("العدد", rs.length), totItem("المبلغ", fmt(rs.reduce((a, x) => a + (x.amount || 0), 0)), true)] });
+  T.setRows(r.rows);
+  modal({ title: `سجل مصروفات «${r.name}»`, body: T.el, wide: true, actions: [{ label: "قفل", ret: true }] });
+}
 function ctxMenu(e, items) {
   document.querySelectorAll(".ctx").forEach((m) => m.remove());
   const m = h("div", { class: "ctx", role: "menu" }, items.map((it) => h("button", { class: "ctx-i" + (it.danger ? " danger" : ""), disabled: it.disabled ? true : null,
@@ -1375,7 +1388,7 @@ async function renderVoucher(box) {
   catSel.addEventListener("contextmenu", (e) => {            // كليك يمين = تعديل أو حذف البند المختار (بكلمة سر اليوزر)
     e.preventDefault();
     const name = catSel.value;
-    const askPw = (what) => promptBox(`اكتب كلمة السر بتاعتك (${S.me.username}) عشان ${what}:`, "🔒 تأكيد", { password: true });
+    const askPw = (what) => promptBox(`اكتب كلمة سر المالك عشان ${what}:`, "🔒 كلمة سر المالك", { password: true });
     if (!name) return ctxMenu(e, [{ label: "اختار البند الأول وبعدين كليك يمين", disabled: true }]);
     ctxMenu(e, [
       { label: `🗑 حذف «${name}»`, danger: true, fn: async () => {
@@ -1396,7 +1409,8 @@ async function renderVoucher(box) {
           [...catSel.options].forEach((o) => { if (o.value === name) { o.value = r.name; o.textContent = r.name; } }); catSel.value = V.cat = r.name;
           toast(`✔ البند بقى «${r.name}»` + (r.used ? ` — واتعدّل في ${r.used} مصروف قديم` : ""), "ok", 4500);
         } catch (x) { alertBox(x.message, "مينفعش يتعدّل"); }
-      } }]);
+      } },
+      S.me.rep ? null : { label: `📒 سجل مصروفات «${name}»`, fn: () => expenseCatLog(name) }].filter(Boolean));
   });
   const addCat = h("button", { class: "btn", type: "button", onclick: async () => { const n = await promptBox("اسم البند (مثال: صيانة، كهربا، شيال):", "بند جديد"); if (!n) return;
     try { const nm = await api("add_expense_cat", n); if (!st.cats.includes(nm)) { st.cats.push(nm); catSel.appendChild(h("option", { value: nm }, nm)); } catSel.value = V.cat = nm; } catch (e) { toast(e.message, "err"); } } }, icon("plus", 16), "بند جديد");
@@ -1586,8 +1600,8 @@ async function renderBalances(box) {
       onkeydown: onclick ? (e) => { if (e.key === "Enter") onclick(); } : null }, h("div", { class: "h" }, h("span", { class: "ic", style: { background: bg, color: fg } }, icon(ic, 20)), t), el); };
   const T = selTable({
     cols: [{ h: "ID", key: "id", cls: "hint" }, { h: "الاسم", fn: (r) => h("b", null, r.name) }, { h: "النوع", key: "kind", cls: "hint" },
-      { h: "مدين (عليه)", num: true, fn: (r) => (r.balance > 0.005 ? h("b", { style: { color: "var(--red)" } }, fmt(r.balance)) : "") },
-      { h: "دائن (له)", num: true, fn: (r) => (r.balance < -0.005 ? h("b", { style: { color: "var(--green)" } }, fmt(-r.balance)) : "") },
+      { h: "مدين (عليه)", num: true, fn: (r) => (r.balance > 0.005 ? h("b", { style: { color: "var(--green)" } }, fmt(r.balance)) : "") },
+      { h: "دائن (له)", num: true, fn: (r) => (r.balance < -0.005 ? h("b", { style: { color: "var(--red)" } }, fmt(-r.balance)) : "") },
       { h: "آخر تحصيل", key: "lc", cls: "hint" }, { h: "آخر دفع", key: "lp", cls: "hint" }, { h: "آخر فاتورة", key: "li", cls: "hint" }],
     onOpen: (r) => { S.pendingStatement = r.id; go("acc:statement", true); },
     onKey: (e) => { if (e.key === "Delete") del(); },
@@ -1969,7 +1983,13 @@ function prodTotals(sh) {
     h("tbody", null, row("الطاولات", "tables", fq, fq(sh.sizes.reduce((a, n) => a + (T[n] ? T[n].tables : 0), 0))), row("الأرغفة", "loaves", fq, fq(sh.loaves)), row("القيمة (ج)", "value", fmt, fmt(sh.value)))));
 }
 async function breadSizesForm() {
-  let rows; try { rows = await api("bread_sizes_get"); } catch (e) { return toast(e.message, "err"); }
+  let rows, sup; try { rows = await api("bread_sizes_get"); sup = await api("prod_supplies_get"); } catch (e) { return toast(e.message, "err"); }
+  /* المستلزمات الثابتة لكل شيكارة (خميرة، ملح ...) */
+  const supSel = (v) => { const el = h("select", { class: "in", "aria-label": "المستلزم" }, h("option", { value: "" }, "— اختار —"), sup.items.map((i) => h("option", { value: i.id }, `${i.name}${i.unit ? " (" + i.unit + ")" : ""}`))); el.value = v ? String(v) : ""; return el; };
+  const sins = sup.rows.map((r) => ({ item: supSel(r.item_id), qty: h("input", { class: "in num", value: r.qty, inputmode: "decimal", "aria-label": "الكمية لكل شيكارة" }) }));
+  const str = (x) => h("tr", null, h("td", null, x.item), h("td", null, x.qty));
+  const stb = h("tbody", null, sins.map(str));
+  const sadd = () => { const x = { item: supSel(null), qty: h("input", { class: "in num", inputmode: "decimal", "aria-label": "الكمية لكل شيكارة" }) }; sins.push(x); stb.appendChild(str(x)); x.item.focus(); };
   const ins = rows.map((r) => ({ r, name: h("input", { class: "in", value: r.name, "aria-label": "المقاس" }), per: h("input", { class: "in num", value: r.per_table, inputmode: "decimal", "aria-label": "أرغفة الطاولة" }),
     price: h("input", { class: "in num", value: r.price, inputmode: "decimal", "aria-label": "سعر الرغيف" }), act: Object.assign(h("input", { type: "checkbox" }), { checked: !!r.active }) }));
   const add = () => { const x = { r: {}, name: h("input", { class: "in", placeholder: "مقاس جديد", "aria-label": "المقاس" }), per: h("input", { class: "in num", inputmode: "decimal", "aria-label": "أرغفة الطاولة" }),
@@ -1978,18 +1998,24 @@ async function breadSizesForm() {
   const tb = h("tbody", null, ins.map(tr));
   const body = h("div", null, h("div", { class: "hint", style: { marginBottom: "8px" } }, "التعديل بيتطبق على الإنتاج الجديد بس — الشكاير القديمة فاضلة على أسعارها. سعر الرغيف بيتحط كمان سعر بيع لصنف العيش."),
     h("div", { class: "tbl-wrap" }, h("table", { class: "t" }, h("thead", null, h("tr", null, h("th", null, "المقاس"), h("th", null, "أرغفة في الطاولة"), h("th", null, "سعر الرغيف"), h("th", null, "شغال"))), tb)),
-    h("button", { class: "btn", style: { marginTop: "8px" }, onclick: add }, icon("plus", 18), "مقاس جديد"));
-  return modal({ title: "مقاسات العيش والأسعار 🔒", body, actions: [{ label: "حفظ", cls: "primary", icon: "save", value: async () => {
-    try { await api("bread_sizes_save", ins.map((x) => ({ id: x.r.id || null, name: x.name.value, per_table: x.per.value, price: x.price.value, active: x.act.checked ? 1 : 0 }))); toast("✔ اتحفظت المقاسات", "ok"); return true; }
+    h("button", { class: "btn", style: { marginTop: "8px" }, onclick: add }, icon("plus", 18), "مقاس جديد"),
+    h("h3", { style: { margin: "18px 0 4px", color: "var(--navy)" } }, "المستلزمات لكل شيكارة"),
+    h("div", { class: "hint", style: { marginBottom: "8px" } }, "زي الخميرة: كل شيكارة بتاخد 2 — بتتخصم من المخزون لوحدها مع كل شيكارة. الأصناف من قسم «مستلزمات» في الأصناف. اكتب 0 علشان تشيله."),
+    h("div", { class: "tbl-wrap" }, h("table", { class: "t" }, h("thead", null, h("tr", null, h("th", null, "المستلزم"), h("th", null, "الكمية لكل شيكارة"))), stb)),
+    h("button", { class: "btn", style: { marginTop: "8px" }, onclick: sadd }, icon("plus", 18), "مستلزم جديد"));
+  return modal({ title: "المقاسات والأسعار والمستلزمات 🔒", body, actions: [{ label: "حفظ", cls: "primary", icon: "save", value: async () => {
+    try { await api("bread_sizes_save", ins.map((x) => ({ id: x.r.id || null, name: x.name.value, per_table: x.per.value, price: x.price.value, active: x.act.checked ? 1 : 0 })));
+      await api("prod_supplies_save", sins.map((x) => ({ item_id: x.item.value ? +x.item.value : null, qty: x.qty.value }))); toast("✔ اتحفظت المقاسات والمستلزمات", "ok"); return true; }
     catch (e) { alertBox(e.message); return false; } } }, { label: "إلغاء", value: () => null }] });
 }
 async function renderProduction(box) {
   const P = S.prodSt || (S.prodSt = { date: S.boot.today });
   let st, editId = null;
   const dDate = dateIn(P.date, "التاريخ"), sackNo = h("input", { class: "in num", inputmode: "numeric", "aria-label": "رقم الشيكارة" });
-  const flour = h("select", { class: "in", "aria-label": "صنف الدقيق" }), fQty = h("input", { class: "in num", value: "1", inputmode: "decimal", "aria-label": "كمية الدقيق" });
+  const flour = h("select", { class: "in", "aria-label": "صنف الدقيق" }), fQty = h("input", { class: "in num", value: "1", disabled: true, title: "كل تسجيل = شيكارة واحدة", "aria-label": "كمية الدقيق" });
+  const supBox = h("div", { class: "prod-sup" });
   const notes = h("input", { class: "in", "aria-label": "ملاحظات" }), flourChip = h("span", { class: "chip info" });
-  const tilesEl = h("div", { class: "prod-tiles" }), sumEl = h("div", { class: "prod-sum" }), headEl = h("h2"), sheetBox = h("div"), totBox = h("div");
+  const tilesEl = h("div", { class: "prod-tiles" }), sumEl = h("div", { class: "prod-sum" });
   const saveBtn = h("button", { class: "btn primary big", onclick: () => save() }, icon("save", 18), "حفظ الشيكارة");
   const cancelBtn = h("button", { class: "btn", style: { display: "none" }, onclick: () => resetForm() }, "إلغاء التعديل");
   let tin = [];
@@ -2019,25 +2045,23 @@ async function renderProduction(box) {
     flourChip.replaceChildren("رصيد الدقيق: ", h("b", { style: { color: f && f.stock <= 0 ? "var(--red)" : "" } }, f ? `${fq(f.stock)} ${f.unit}` : "—"));
   }
   flour.addEventListener("change", drawFlour);
-  function drawSheet() {
-    const sh = st.sheet;
-    headEl.textContent = `إنتاج يوم ${st.date}`;
-    const T = prodSheetTable(sh.sizes, { onOpen: (r) => edit(r.id), onKey: (e) => { if (e.key === "Delete") del(T.selected()[0]); } });
-    T.setRows(sh.rows);
-    T.__T = T; sheetBox.replaceChildren(T.el); sheetBox._T = T; totBox.replaceChildren(prodTotals(sh));
-    pinTotals();
+  function drawSup() {
+    const L = st.supplies || [];
+    supBox.replaceChildren(h("b", null, "المستلزمات لكل شيكارة:"),
+      L.length ? L.map((x) => h("span", { class: "chip" + (x.stock < x.qty ? " warn" : "") }, `${x.name}: ${fq(x.qty)} ${x.unit}`, h("small", null, ` (الرصيد ${fq(x.stock)})`)))
+        : h("span", { class: "hint" }, S.me.owner ? "مفيش — ضيفها من زرار «المقاسات والأسعار والمستلزمات»" : "مفيش"));
   }
   async function load(keepForm) {
     P.date = dDate.value || S.boot.today;
     try { st = await api("production_setup", P.date); } catch (e) { return toast(e.message, "err"); }
     if (!keepForm || !tin.length) drawTiles();
-    drawFlour(); if (!editId) sackNo.value = st.next_no; calc(); drawSheet();
+    drawFlour(); drawSup(); if (!editId) sackNo.value = st.next_no; calc();
   }
   function resetForm() { editId = null; tin.forEach((i) => { i.value = ""; }); notes.value = ""; fQty.value = "1"; sackNo.value = st.next_no; saveBtn.lastChild.textContent = "حفظ الشيكارة"; cancelBtn.style.display = "none"; calc(); (tin[0] || notes).focus(); }
   async function edit(id) {
     let r; try { r = await api("production_get", id); } catch (e) { return toast(e.message, "err"); }
     editId = r.id; if (r.date !== dDate.value) { dDate.value = r.date; await load(true); }
-    sackNo.value = r.sack_no; fQty.value = r.flour_qty; notes.value = r.notes; if (r.flour_id) { flour.value = String(r.flour_id); drawFlour(); }
+    sackNo.value = r.sack_no; notes.value = r.notes; if (r.flour_id) { flour.value = String(r.flour_id); drawFlour(); }
     tin.forEach((i) => { const v = r.tables[String(i._z.id)]; i.value = v ? v : ""; });
     saveBtn.lastChild.textContent = `حفظ تعديل الشيكارة ${r.sack_no}`; cancelBtn.style.display = ""; calc(); (tin[0] || notes).focus();
     toast(`✏️ بتعدّل الشيكارة ${r.sack_no}`, "", 1800);
@@ -2051,36 +2075,35 @@ async function renderProduction(box) {
     toast(editId ? `✔ اتعدلت الشيكارة ${p.sack_no}` : `✔ اتسجلت الشيكارة ${p.sack_no}`, "ok");
     editId = null; await load(true); resetForm();
   }
-  async function del(r) {
-    r = r || (sheetBox._T && sheetBox._T.selected()[0]); if (!r) return toast("حدد شيكارة من الجدول الأول");
-    if (!(await confirmBox(`تحذف الشيكارة ${r.sack_no} (${fq(r.loaves)} رغيف)؟\nالدقيق هيرجع للمخزن والعيش هيتشال من المخزون.`, "حذف", "احذف"))) return;
-    try { const x = await ownerRetry((pw) => api("delete_production", r.id, pw)); if (!x) return; toast("✔ اتحذفت", "ok"); if (editId === r.id) editId = null; await load(true); resetForm(); } catch (e) { alertBox(e.message); }
-  }
   dDate.addEventListener("change", () => { editId = null; load(true).then(resetForm); });
-  enterChain([sackNo, fQty], () => (tin[0] || notes).focus());
+  enterChain([sackNo], () => (tin[0] || notes).focus());
   box.replaceChildren(h("div", { class: "page" },
     h("section", { class: "card anim-up d1" }, h("div", { class: "card-h" }, h("h2", null, "تسجيل شيكارة"), flourChip,
-        S.me.owner ? h("button", { class: "btn", onclick: async () => { if (await breadSizesForm()) { tin = []; load(true); } } }, icon("edit", 18), "مقاسات العيش والأسعار") : null),
+        S.me.owner ? h("button", { class: "btn", onclick: async () => { if (await breadSizesForm()) { tin = []; load(true); } } }, icon("edit", 18), "المقاسات والأسعار والمستلزمات") : null),
       h("div", { class: "form" }, h("label", { class: "fld" }, "التاريخ", dDate), h("label", { class: "fld" }, "رقم الشيكارة", sackNo),
         h("label", { class: "fld" }, "صنف الدقيق", flour), h("label", { class: "fld" }, "عدد الشكاير", fQty), h("label", { class: "fld" }, "ملاحظات", notes)),
       h("div", { class: "hint", style: { padding: "0 18px 6px" } }, "اكتب عدد الطاولات من كل مقاس للشيكارة دي — البرنامج بيحسب الأرغفة والقيمة • Enter = اللي بعده • آخر خانة Enter = حفظ"),
-      tilesEl,
-      h("div", { class: "prod-foot" }, sumEl, h("span", { style: { flex: 1 } }), cancelBtn, saveBtn)),
-    h("section", { class: "card anim-up d2" }, h("div", { class: "card-h" }, headEl, h("span", { class: "hint" }, "ضغطتين على شيكارة = تعديلها"),
-        h("button", { class: "btn gold", onclick: async () => { try { await api("print_production", dDate.value, dDate.value, true); toast("🖨 شاشة الطباعة هتفتح خلال ثواني ...", "ok"); } catch (e) { toast(e.message, "err"); } } }, icon("print", 18), "طباعة"),
-        pdfBtn(() => pdfExport("print_production", [dDate.value, dDate.value, true], dDate.value)),
-        h("button", { class: "btn danger", onclick: () => del() }, icon("trash", 18), "حذف")),
-      sheetBox, totBox)));
-  await load(); (tin[0] || notes).focus();
+      supBox, tilesEl,
+      h("div", { class: "prod-foot" }, sumEl, h("span", { style: { flex: 1 } }), cancelBtn, saveBtn))));
+  await load();
+  if (S.prodEdit) { const id = S.prodEdit; S.prodEdit = null; await edit(id); } else (tin[0] || notes).focus();
 }
 async function renderProdLog(box) {
-  const L = S.prodLog || (S.prodLog = { from: monthStart(), to: S.boot.today });
+  const L = S.prodLog || (S.prodLog = { from: S.boot.today, to: S.boot.today });
   const from = dateIn(L.from, "من"), to = dateIn(L.to, "إلى"), sheetBox = h("div"), totBox = h("div");
   async function load() {
     L.from = from.value; L.to = to.value || from.value;
     let sh; try { sh = await api("production_sheet", L.from, L.to); } catch (e) { return toast(e.message, "err"); }
-    const T = prodSheetTable(sh.sizes, { showDate: true, maxH: "calc(100vh - 470px)", onOpen: can("prd:new") ? (r) => { S.prodSt = { date: r.date }; go("prd:new", true); } : null });
-    T.setRows(sh.rows); sheetBox.replaceChildren(T.el); totBox.replaceChildren(prodTotals(sh)); pinTotals();
+    const T = prodSheetTable(sh.sizes, { showDate: true, maxH: "calc(100vh - 470px)", onOpen: can("prd:new") ? (r) => edit(r) : null,
+      onKey: (e) => { if (e.key === "Delete") del(T.selected()[0]); } });
+    T.setRows(sh.rows); sheetBox.replaceChildren(T.el); sheetBox._T = T;
+    const tt = prodTotals(sh); totBox.replaceChildren(tt || h("div", { class: "hint", style: { padding: "14px 18px" } }, "مفيش إنتاج في الفترة دي")); pinTotals();
+  }
+  function edit(r) { r = r || (sheetBox._T && sheetBox._T.selected()[0]); if (!r) return toast("حدد شيكارة من الجدول الأول"); S.prodSt = { date: r.date }; S.prodEdit = r.id; go("prd:new", true); }
+  async function del(r) {
+    r = r || (sheetBox._T && sheetBox._T.selected()[0]); if (!r) return toast("حدد شيكارة من الجدول الأول");
+    if (!(await confirmBox(`تحذف الشيكارة ${r.sack_no} يوم ${r.date} (${fq(r.loaves)} رغيف)؟\nالدقيق والمستلزمات هيرجعوا للمخزن والعيش هيتشال من المخزون.`, "حذف", "احذف"))) return;
+    try { const x = await ownerRetry((pw) => api("delete_production", r.id, pw)); if (!x) return; toast("✔ اتحذفت", "ok"); await load(); } catch (e) { alertBox(e.message); }
   }
   [from, to].forEach((x) => x.addEventListener("change", load));
   box.replaceChildren(h("div", { class: "page" },
@@ -2088,11 +2111,14 @@ async function renderProdLog(box) {
       h("div", { class: "fld", style: { justifyContent: "flex-end", flexDirection: "row", gap: "8px", alignItems: "flex-end" } },
         h("button", { class: "btn gold", onclick: async () => { try { await api("print_production", from.value, to.value || from.value, true); toast("🖨 شاشة الطباعة هتفتح خلال ثواني ...", "ok"); } catch (e) { toast(e.message, "err"); } } }, icon("print", 18), "طباعة"),
         pdfBtn(() => pdfExport("print_production", [from.value, to.value || from.value, true], `${from.value} - ${to.value}`))))),
-    h("section", { class: "card anim-up d2" }, h("div", { class: "card-h" }, h("h2", null, "سجل الإنتاج (زي الورقة)"), h("span", { class: "hint" }, "كل صف = شيكارة • الأرقام = عدد الطاولات")), sheetBox, totBox)));
+    h("section", { class: "card anim-up d2" }, h("div", { class: "card-h" }, h("h2", null, "سجل الإنتاج"), h("span", { class: "hint" }, "كل صف = شيكارة • الأرقام = عدد الطاولات" + (can("prd:new") ? " • ضغطتين = تعديل" : "")),
+        can("prd:new") ? h("span", { style: { display: "flex", gap: "8px", marginInlineStart: "auto" } },
+          h("button", { class: "btn", onclick: () => edit() }, icon("edit", 18), "تعديل"), h("button", { class: "btn danger", onclick: () => del() }, icon("trash", 18), "حذف")) : null), sheetBox),
+    h("section", { class: "card anim-up d3", style: { marginTop: "18px" } }, h("div", { class: "card-h" }, h("h2", null, "إجمالي كل مقاس"), h("span", { class: "hint" }, "طاولات • أرغفة • جنيه")), totBox)));
   await load();
 }
 async function renderProdReport(box) {
-  const R = S.prodRep || (S.prodRep = { from: monthStart(), to: S.boot.today });
+  const R = S.prodRep || (S.prodRep = { from: S.boot.today, to: S.boot.today });
   const from = dateIn(R.from, "من"), to = dateIn(R.to, "إلى"), kpis = h("div", { class: "kpis" }), sizesBox = h("div"), daysBox = h("div");
   const kpi = (t, v, bg, fg) => h("div", { class: "card kpi anim-up" }, h("div", { class: "h" }, h("span", { class: "ic", style: { background: bg, color: fg } }, icon("chart", 20)), t), h("div", { class: "v" }, v));
   async function load() {
@@ -2831,8 +2857,8 @@ async function accessModal(u, setup) {
   const fEmp = h("label", { class: "fld" }, "المندوب (من الموظفين)", emp);
   const groups = [["الرئيسية", ["home"]], ["الفواتير", ["inv:مبيعات", "inv:مشتريات", "inv:مرتجع مبيعات", "inv:مرتجع مشتريات", "log"]], ["السندات", ["vch:new", "vch:log"]],
     ["العملاء والموردون", ["par:list"]], ["الإنتاج", ["prd:new", "prd:log", "rep:production"]], ["الأصناف والمخزون", ["itm:list", "itm:stock", "itm:sales", "itm:buys", "itm:damaged", "smp:items", "smp:out", "smp:in"]],
-    ["الموظفون", ["emp:list", "emp:att", "emp:attlog", "emp:veh"]], ["الحسابات", ["acc:statement", "acc:balances", "acc:cash", "acc:subcash"]],
-    ["التقارير", ["rep:daily", "rep:reps", "rep:targets", "rep:log"]], ["الإعدادات", ["set:main"]]];
+    ["الموظفون", ["emp:list", "emp:att", "emp:attlog"]], ["الحسابات", ["acc:statement", "acc:balances", "acc:cash", "acc:subcash"]],
+    ["التقارير", ["rep:daily", "rep:log"]], ["الإعدادات", ["set:main"]]];
   const chk = {};
   const cur = new Set(u ? u.screens : setup.defaults["محاسب"]);
   const grid = h("div", { class: "acc-grid" }, groups.map(([g, keys]) => h("div", { class: "acc-g" }, h("b", null, g),
@@ -2844,7 +2870,7 @@ async function accessModal(u, setup) {
     h("button", { class: "btn ghost", type: "button", onclick: () => Object.values(chk).forEach((c) => (c.checked = true)) }, "علّم الكل"),
     h("button", { class: "btn ghost", type: "button", onclick: () => Object.values(chk).forEach((c) => (c.checked = false)) }, "شيل الكل"),
     h("button", { class: "btn ghost", type: "button", onclick: () => preset(role.value) }, "الافتراضي للصلاحية دي"));
-  return { role, emp, fEmp, grid, tools, screens: () => Object.entries(chk).filter(([, c]) => c.checked).map(([k]) => k) };
+  return { role, emp, fEmp, grid, tools, screens: () => [...Object.entries(chk).filter(([, c]) => c.checked).map(([k]) => k), ...[...cur].filter((k) => HIDDEN_SCREENS.has(k))] };
 }
 async function renderUsers(box) {
   const setup = await api("access_setup");

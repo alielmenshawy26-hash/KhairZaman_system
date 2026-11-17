@@ -508,3 +508,8 @@ html.standalone .shell{background:var(--ground);min-height:100dvh}
   .prod-foot{padding:10px 12px 14px}
   .prod-foot .btn.big{width:100%}
 }
+.prod-sup{display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding:2px 18px 8px;font-size:14px;color:var(--navy)}
+.prod-sup .chip small{color:var(--muted);font-weight:600}
+.prod-sup .chip.warn{background:var(--red-bg);color:var(--red)}
+@media (max-width:700px){.prod-sup{padding:2px 12px 8px}}
+.in:disabled{background:#f3ece0;color:var(--muted);cursor:not-allowed}

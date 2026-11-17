@@ -1677,7 +1677,8 @@ ITEM_CATS = (CAT_FLOUR, CAT_BREAD, CAT_SUPPLY)
 DEFAULT_BREAD_SIZES = (("صغير", 20, 1.5), ("كبير", 12, 2.5), ("وسط", 15, 2.0), ("ساندوتش", 18, 1.75), ("حبة كاملة", 15, 2.5))
 # حركات المخزون من الإنتاج: الدقيق خارج (بالسالب) والعيش داخل
 PROD_MOVES_SQL = ("SELECT p.p_date m_date, p.flour_item_id item_id, -COALESCE(p.flour_qty,1) qty FROM production p WHERE p.flour_item_id IS NOT NULL "
-                  "UNION ALL SELECT p.p_date m_date, l.item_id item_id, l.loaves qty FROM production_lines l JOIN production p ON p.id=l.production_id WHERE l.item_id IS NOT NULL")
+                  "UNION ALL SELECT p.p_date m_date, l.item_id item_id, l.loaves qty FROM production_lines l JOIN production p ON p.id=l.production_id WHERE l.item_id IS NOT NULL "
+                  "UNION ALL SELECT p.p_date m_date, s.item_id item_id, -s.qty qty FROM production_supplies s JOIN production p ON p.id=s.production_id WHERE s.item_id IS NOT NULL")
 
 def item_cat_guess(name):
     n = name or ""
@@ -1692,6 +1693,10 @@ def init_production(c):
                  flour_item_id INTEGER, flour_qty REAL DEFAULT 1, notes TEXT DEFAULT '', username TEXT DEFAULT '')""")
     c.execute("""CREATE TABLE IF NOT EXISTS production_lines(id INTEGER PRIMARY KEY, production_id INTEGER NOT NULL, size_id INTEGER, size_name TEXT NOT NULL,
                  item_id INTEGER, tables REAL NOT NULL DEFAULT 0, per_table REAL NOT NULL DEFAULT 0, price REAL NOT NULL DEFAULT 0, loaves REAL NOT NULL DEFAULT 0)""")
+    # المستلزمات الثابتة لكل شيكارة (خميرة، ملح ...): بتتخصم لوحدها مع كل شيكارة
+    c.execute("CREATE TABLE IF NOT EXISTS prod_supplies(id INTEGER PRIMARY KEY, item_id INTEGER NOT NULL, qty REAL NOT NULL DEFAULT 0, sort INTEGER DEFAULT 0)")
+    c.execute("CREATE TABLE IF NOT EXISTS production_supplies(id INTEGER PRIMARY KEY, production_id INTEGER NOT NULL, item_id INTEGER NOT NULL, qty REAL NOT NULL DEFAULT 0)")
+    c.execute("CREATE INDEX IF NOT EXISTS ix_prods_prod ON production_supplies(production_id)")
     for name, sql in (("ix_prod_date", "production(p_date)"), ("ix_prodl_prod", "production_lines(production_id)"), ("ix_prodl_item", "production_lines(item_id)")):
         c.execute(f"CREATE INDEX IF NOT EXISTS {name} ON {sql}")
     if add_col(c, "items", "category", "TEXT DEFAULT ''"):
@@ -1716,15 +1721,21 @@ def bread_sizes(c, active_only=True):
     return [dict(id=r["id"], name=r["name"], per_table=float(r["per_table"] or 0), price=float(r["price"] or 0), item_id=r["item_id"], active=int(r["active"] or 0))
             for r in c.execute("SELECT * FROM bread_sizes" + (" WHERE COALESCE(active,1)=1" if active_only else "") + " ORDER BY sort, id").fetchall()]
 
+def prod_supplies(c):
+    return [dict(id=r["id"], item_id=r["item_id"], name=r["name"], unit=r["unit"] or "", qty=float(r["qty"] or 0))
+            for r in c.execute("SELECT s.id, s.item_id, s.qty, it.name, it.unit FROM prod_supplies s JOIN items it ON it.id=s.item_id ORDER BY s.sort, s.id").fetchall()]
+
 def prod_used(c, item_id):
-    """عدد مرات استخدام الصنف في الإنتاج (دقيق أو عيش) — علشان مايتحذفش."""
-    return c.execute("SELECT (SELECT COUNT(*) FROM production WHERE flour_item_id=?)+(SELECT COUNT(*) FROM production_lines WHERE item_id=?)+(SELECT COUNT(*) FROM bread_sizes WHERE item_id=?)",
-                     (item_id, item_id, item_id)).fetchone()[0]
+    """عدد مرات استخدام الصنف في الإنتاج (دقيق أو عيش أو مستلزمات) — علشان مايتحذفش."""
+    return c.execute("SELECT (SELECT COUNT(*) FROM production WHERE flour_item_id=?)+(SELECT COUNT(*) FROM production_lines WHERE item_id=?)+(SELECT COUNT(*) FROM bread_sizes WHERE item_id=?)"
+                     "+(SELECT COUNT(*) FROM production_supplies WHERE item_id=?)+(SELECT COUNT(*) FROM prod_supplies WHERE item_id=?)",
+                     (item_id, item_id, item_id, item_id, item_id)).fetchone()[0]
 
 def _fifo_sig(c):
     r = c.execute("SELECT (SELECT COUNT(*) FROM invoice_lines), (SELECT COALESCE(MAX(id),0) FROM invoice_lines), (SELECT COALESCE(SUM(qty*price),0) FROM invoice_lines), "
                   "(SELECT COUNT(*) FROM damaged), (SELECT COALESCE(SUM(qty),0) FROM damaged), "
                   "(SELECT COUNT(*) FROM production), (SELECT COALESCE(MAX(id),0) FROM production), (SELECT COALESCE(SUM(loaves*(1+price)),0) FROM production_lines), (SELECT COALESCE(SUM(COALESCE(flour_qty,1)*(1+COALESCE(flour_item_id,0))),0) FROM production), "
+                  "(SELECT COUNT(*) FROM production_supplies), (SELECT COALESCE(SUM(qty*(1+item_id)),0) FROM production_supplies), "
                   "(SELECT COALESCE(SUM(COALESCE(opening_qty,0)*(1+COALESCE(buy_price,0))),0) FROM items), (SELECT COALESCE(MAX(id),0) FROM audit_log), (SELECT COUNT(*) FROM items)").fetchone()
     return (DB_CFG.get("mode"), DB_CFG.get("host"), DB_CFG.get("dbname"), DB_PATH) + tuple(float(x or 0) for x in r)
 
@@ -1750,8 +1761,11 @@ def fifo_engine(c):
     plines = {}
     for r in c.execute("SELECT production_id, item_id, loaves, price FROM production_lines WHERE item_id IS NOT NULL").fetchall():
         plines.setdefault(r[0], []).append((r[1], float(r[2] or 0), float(r[3] or 0)))
+    psup = {}
+    for r in c.execute("SELECT production_id, item_id, qty FROM production_supplies").fetchall():
+        psup.setdefault(r[0], []).append((r[1], float(r[2] or 0)))
     for r in c.execute("SELECT id, p_date, COALESCE(created_at,''), flour_item_id, COALESCE(flour_qty,1) FROM production").fetchall():
-        ev.append((r[1] or "", r[2] or "", 1, 0, r[0], "P", r[3], float(r[4] or 0), 0.0, 0, plines.get(r[0], [])))
+        ev.append((r[1] or "", r[2] or "", 1, 0, r[0], "P", r[3], float(r[4] or 0), 0.0, psup.get(r[0], []), plines.get(r[0], [])))
     ev.sort(key=lambda e: e[:5])
     line, dmg, prod, snap = {}, {}, {}, None
     deficit = {}   # كمية اتباعت والرصيد صفر (بالسالب): أول بضاعة تدخل بعد كده بتغطيها الأول
@@ -1783,6 +1797,8 @@ def fifo_engine(c):
         if snap is None and d > today: snap = {k: [list(x) for x in v] for k, v in layers.items()}
         if typ == "P":                                                    # شيكارة إنتاج
             cost = take(iid, q) if (iid and q > 1e-9) else 0.0
+            for sid, sq in (damaged or []):                               # المستلزمات الثابتة (خميرة ...) تكلفتها بتدخل على العيش
+                if sid and sq > 1e-9: cost += take(sid, sq)
             prod[rid] = cost
             tot_v = sum(lq * lp for _, lq, lp in kind); tot_q = sum(lq for _, lq, _ in kind)
             for bid, lq, lp in kind:
