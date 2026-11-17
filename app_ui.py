@@ -38,7 +38,7 @@ _INV = ["inv:مبيعات", "inv:مشتريات", "inv:مرتجع مبيعات",
 # كل أمر بيتسمح لو اليوزر عنده شاشة من الشاشات دي (الأوامر اللي مش هنا مسموحة لأي حد داخل)
 METHOD_SCREENS = {}
 for _keys, _methods in [
-    (["home"], "dashboard expected mark_called unmark_called hide_expected unhide_expected"),
+    (["home"], "dashboard expected mark_called unmark_called hide_expected unhide_expected quick_setup quick_sale print_quick"),
     (_INV + ["log", "home"], "invoice_setup save_invoice invoice print_invoice invoice_for_edit delete_invoice"),
     (["log", "home"], "invoices"),
     (["vch:new", "vch:log"], "voucher_setup save_voucher voucher_preview add_expense_cat delete_expense_cat rename_expense_cat expense_cat_log vouchers voucher delete_voucher print_receipt"),
@@ -74,7 +74,7 @@ for _keys, _methods in [
     (["rep:monthly"], "monthly_report monthly_print"),
 ]:
     for _m in _methods.split(): METHOD_SCREENS[_m] = set(_keys)
-NO_REP = {"close_day", "expense_cat_log", "day_unlock", "req_decide", "inv_request_get",
+NO_REP = {"close_day", "expense_cat_log", "quick_setup", "quick_sale", "print_quick", "day_unlock", "req_decide", "inv_request_get",
           # المندوب بيبعت طلبات بس: مايحذفش فاتورة أو سند اتقبل (كان ممكن يلف على الموافقة بالحذف)،
           # ومايشوفش تقرير الشركة اليومي (مبيعات الكل والخزنة والمصروفات)، ومايغيرش بنود المصروفات
           "delete_invoice", "delete_voucher", "daily_report", "print_daily", "daily_trend",
@@ -1452,6 +1452,63 @@ class Api:
         totals = {nm: {k: _r2(v) for k, v in tot.get(nm, {"tables": 0, "loaves": 0, "value": 0}).items()} for nm in order}
         return {"sizes": order, "rows": rows, "totals": totals, "sacks": _r2(sum(r["flour_qty"] for r in rows)),
                 "loaves": _r2(sum(r["loaves"] for r in rows)), "value": _r2(sum(r["value"] for r in rows)), "cost": _r2(sum(r["cost"] for r in rows))}
+
+    # ---------- البيع السريع (الكاشير) في الرئيسية ----------
+    def quick_setup(self, d=None):
+        self._need_login()
+        d = W.check_date(d or _today())
+        with W.db() as c:
+            gid = W.gate_party_id(c)
+            st = W.stock_map(c)
+            sizes = [{"id": z["id"], "name": z["name"], "item_id": z["item_id"], "price": z["price"], "stock": _r2(st.get(z["item_id"], 0.0))} for z in W.bread_sizes(c)]
+            rows = c.execute(f"SELECT i.id, i.number, i.created_at, {W.NET_SQL} net, (SELECT COALESCE(SUM(qty),0) FROM invoice_lines WHERE invoice_id=i.id) loaves "
+                             "FROM invoices i WHERE i.kind='مبيعات' AND i.party_id=? AND i.inv_date=? ORDER BY i.id DESC", (gid, d)).fetchall()
+        recent = [{"id": r["id"], "number": r["number"], "time": W.fmt_time(r["created_at"]), "net": _r2(r["net"]), "loaves": _r2(r["loaves"])} for r in rows]
+        return {"date": d, "sizes": sizes, "gate_id": gid, "recent": recent[:30], "count": len(recent),
+                "total": _r2(sum(r["net"] for r in recent)), "loaves": _r2(sum(r["loaves"] for r in recent))}
+
+    def quick_sale(self, lines, d=None, neg_pw=None):
+        """بيع سريع: فاتورة مبيعات نقدي على «البوابة» — بتتحفظ وتتطبع مع بعض (مفيش حفظ من غير بون)."""
+        self._need_login()
+        d = W.check_date(d or _today())
+        with W.db() as c:
+            gid = W.gate_party_id(c)
+            sizes = {z["item_id"]: z for z in W.bread_sizes(c)}
+            units = {r[0]: r[1] for r in c.execute("SELECT id, unit FROM items").fetchall()}
+        L = []
+        for l in (lines or []):
+            try: iid = int(l.get("item_id")); qty = float(l.get("qty") or 0)
+            except (TypeError, ValueError): raise UIError("راجع الأعداد")
+            if qty <= 0: continue
+            if qty != int(qty): raise UIError("عدد الأرغفة لازم رقم صحيح")
+            z = sizes.get(iid)
+            if not z: raise UIError("المقاس ده مش موجود — حدّث الشاشة")
+            L.append({"item_id": iid, "name": "عيش " + z["name"], "unit": units.get(iid) or "رغيف", "qty": qty, "price": float(z["price"])})
+        if not L: raise UIError("اختار الرغيف واكتب العدد الأول")
+        r = self.save_invoice({"kind": "مبيعات", "party_id": gid, "date": d, "paid": 0, "pay_type": "نقدي", "notes": "بيع سريع (كاشير)", "lines": L}, neg_pw=neg_pw)
+        if not r.get("ok"): return r
+        with W.db() as c: W.log(c, "بيع سريع", f"بون {r['number']} — {W.fmt(r['net'])} ج")
+        self._print_receipt(r["id"], copy=False)
+        return r
+
+    def print_quick(self, inv_id):
+        """إعادة طباعة بون — للمالك بس، وبيتكتب عليه «نسخة مكررة»."""
+        self._need_login()
+        if not W.is_owner(): raise UIError("إعادة طباعة البون للمالك بس")
+        with W.db() as c:
+            i = c.execute("SELECT kind, party_id FROM invoices WHERE id=?", (int(inv_id),)).fetchone()
+            if not i or i["kind"] != "مبيعات" or i["party_id"] != W.gate_party_id(c): raise UIError("ده مش بون بيع سريع")
+        self._print_receipt(int(inv_id), copy=True)
+        return True
+
+    def _print_receipt(self, inv_id, copy):
+        os.makedirs(W.PRINT_DIR, exist_ok=True)
+        path = os.path.join(W.PRINT_DIR, f"receipt_{inv_id}.html")
+        with open(path, "w", encoding="utf-8") as f: f.write(W.receipt_html(inv_id, copy=copy))
+        W.print_page(path)
+        try:
+            with W.db() as c: c.execute("UPDATE invoices SET printed_at=?, print_count=COALESCE(print_count,0)+1 WHERE id=?", (W.now_ts(), inv_id))
+        except Exception: pass
 
     def production_setup(self, d=None):
         self._need_login()

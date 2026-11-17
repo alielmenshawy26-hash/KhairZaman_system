@@ -1717,6 +1717,52 @@ def init_production(c):
         c.execute("UPDATE items SET category=? WHERE id=?", (CAT_BREAD, iid))
         c.execute("UPDATE bread_sizes SET item_id=? WHERE id=?", (iid, r[0]))
 
+GATE_PARTY = "البوابة"
+
+def gate_party_id(c):
+    """عميل «البوابة»: كل البيع السريع (الكاشير) بيتسجل عليه نقدي."""
+    r = c.execute("SELECT id FROM parties WHERE name=?", (GATE_PARTY,)).fetchone()
+    if r: return r[0]
+    return c.execute("INSERT INTO parties(name,kind,phone,address,opening) VALUES(?,?,?,?,?)", (GATE_PARTY, "عميل", "", "", 0)).lastrowid
+
+def receipt_html(inv_id, copy=False):
+    """بون الكاشير — ورق حراري 80 مم (الطول على قد عدد الأصناف)."""
+    with db() as c:
+        i = c.execute("SELECT * FROM invoices WHERE id=?", (inv_id,)).fetchone()
+        if not i: raise ValueError("البون مش موجود")
+        lines = c.execute("SELECT * FROM invoice_lines WHERE invoice_id=? ORDER BY id", (inv_id,)).fetchall()
+        by = (c.execute("SELECT user FROM audit_log WHERE action='بيع سريع' AND details LIKE ? ORDER BY id DESC LIMIT 1", (f"بون {i['number']} %",)).fetchone() or [""])[0]
+    total = sum(float(l["qty"]) * float(l["price"]) for l in lines) - float(i["discount"] or 0)
+    q = lambda v: (f"{float(v):g}")
+    rows = "".join(f"<tr><td class='n'>{esc(l['item_name'])}</td><td>{q(l['qty'])}</td><td>{fmt(l['price'])}</td><td><b>{fmt(float(l['qty']) * float(l['price']))}</b></td></tr>" for l in lines)
+    loaves = sum(float(l["qty"]) for l in lines)
+    h_mm = 82 + 7 * len(lines) + (9 if copy else 0)
+    return f"""<!doctype html><html lang="ar" dir="rtl"><head><meta charset="utf-8"><title>بون {esc(i['number'])}</title><style>
+@page {{ size: 80mm {h_mm}mm; margin: 0; }}
+* {{ box-sizing: border-box; }}
+html, body {{ margin: 0; padding: 0; background: #fff; color: #000; }}
+body {{ width: 80mm; padding: 4mm 4mm 3mm; font-family: Tahoma, Arial, sans-serif; font-size: 12px; }}
+.c {{ text-align: center; }} .co {{ font-size: 20px; font-weight: 800; margin: 1mm 0; }}
+.meta {{ display: flex; justify-content: space-between; font-size: 11px; margin: 1mm 0; }}
+.no {{ font-size: 16px; font-weight: 800; border: 1.5px solid #000; border-radius: 3px; padding: 1mm 0; margin: 2mm 0; }}
+table {{ width: 100%; border-collapse: collapse; margin-top: 2mm; }}
+th {{ font-size: 11px; border-bottom: 1.5px solid #000; padding: 1mm 0; text-align: center; }}
+td {{ padding: 1.2mm 0; text-align: center; border-bottom: 1px dashed #999; font-size: 12px; }} td.n, th.n {{ text-align: right; }}
+.tot {{ display: flex; justify-content: space-between; font-size: 18px; font-weight: 800; border-top: 2px solid #000; margin-top: 2mm; padding-top: 2mm; }}
+.copy {{ font-size: 13px; font-weight: 800; border: 1px dashed #000; padding: 1mm; margin-top: 2mm; }}
+.ft {{ font-size: 11px; margin-top: 3mm; }}
+</style></head><body>
+<div class="c co">{esc(LICENSED_COMPANY)}</div>
+<div class="c no">بون رقم {esc(i['number'])}</div>
+<div class="meta"><span>{esc(i['inv_date'])}</span><span>{esc(fmt_time(i['created_at']))}</span></div>
+{f'<div class="meta"><span>الكاشير: {esc(by)}</span><span>نقدي</span></div>' if by else ''}
+<table><thead><tr><th class="n">الصنف</th><th>العدد</th><th>السعر</th><th>الإجمالي</th></tr></thead><tbody>{rows}</tbody></table>
+<div class="meta" style="margin-top:2mm"><span>عدد الأرغفة</span><b>{q(loaves)}</b></div>
+<div class="tot"><span>الإجمالي</span><span>{fmt(total)} ج</span></div>
+{'<div class="c copy">نسخة مكررة</div>' if copy else ''}
+<div class="c ft">شكرًا لزيارتكم 🌾</div>
+</body></html>"""
+
 def bread_sizes(c, active_only=True):
     return [dict(id=r["id"], name=r["name"], per_table=float(r["per_table"] or 0), price=float(r["price"] or 0), item_id=r["item_id"], active=int(r["active"] or 0))
             for r in c.execute("SELECT * FROM bread_sizes" + (" WHERE COALESCE(active,1)=1" if active_only else "") + " ORDER BY sort, id").fetchall()]

@@ -586,6 +586,7 @@ async function go(key, force) {
 
 /* ===================== الرئيسية ===================== */
 async function renderHome(box) {
+  if (!S.me.rep) return renderCashier(box);
   const d = await api("dashboard", S.boot.today);
   const sales = d.inv["مبيعات"], buys = d.inv["مشتريات"];
   markClosed(d.closed);
@@ -605,6 +606,96 @@ async function renderHome(box) {
       d.rows.length ? h("div", { class: "tbl-wrap" }, h("table", { class: "t" },
         h("thead", null, h("tr", null, ["النوع", "رقم", "الوقت", "العميل / المورد", "المندوب", "الدفع"].map((x) => h("th", null, x)), h("th", { class: "num" }, "الصافي"), h("th", null, ""))),
         h("tbody", null, rows))) : h("div", { class: "empty" }, "لسه مفيش فواتير النهارده"))));
+}
+
+/* ===================== البيع السريع (الكاشير) — الرئيسية =====================
+   تختار الرغيف وعدده ← «طباعة وحفظ» بس (مفيش حفظ من غير بون) ← فاتورة مبيعات نقدي على «البوابة» */
+async function renderCashier(box) {
+  let st;
+  try { st = await api("quick_setup", S.boot.today); } catch (e) { return box.replaceChildren(h("div", { class: "card empty" }, e.message)); }
+  const day = new Date(S.boot.today + "T12:00:00").toLocaleDateString("ar-EG", { weekday: "long" });
+  const mTot = h("b", null, "0.00"), mBtn = h("button", { class: "btn primary", onclick: () => doSale() }, icon("print", 18), "طباعة وحفظ");
+  const mBar = h("div", { class: "qs-mbar" }, h("span", null, "الإجمالي: ", mTot), mBtn);
+  const totalEl = h("b", { class: "qs-total-v" }, "0.00"), linesEl = h("div", { class: "qs-lines" }), cntEl = h("span", { class: "hint" });
+  const printBtn = h("button", { class: "btn primary big qs-print", onclick: () => doSale() }, icon("print", 22), "طباعة وحفظ");
+  const clearBtn = h("button", { class: "btn", onclick: () => clearAll() }, icon("x", 18), "مسح");
+  let busy = false;
+  const tiles = st.sizes.map((z) => {
+    const inp = h("input", { class: "in num qs-in", inputmode: "numeric", placeholder: "0", "aria-label": "عدد " + z.name });
+    const stockEl = h("small", { class: "qs-stock" + (z.stock <= 0 ? " neg" : "") }, `المخزن: ${fq(z.stock)}`);
+    const step = (n) => { const v = Math.max(0, Math.round(num(inp.value) + n)); inp.value = v ? String(v) : ""; calc(); };
+    const el = h("div", { class: "qs-tile" },
+      h("button", { class: "qs-head", type: "button", title: "دوسة = رغيف زيادة", onclick: () => { step(1); inp.focus(); } },
+        h("b", null, z.name), h("span", { class: "qs-price" }, fmt(z.price) + " ج"), stockEl),
+      h("div", { class: "qs-qty" },
+        h("button", { class: "btn qs-step", type: "button", "aria-label": "أقل", onclick: () => step(-1) }, "−"), inp,
+        h("button", { class: "btn qs-step", type: "button", "aria-label": "أكتر", onclick: () => step(1) }, "+")),
+      h("div", { class: "qs-quick" }, [5, 10, 20].map((n) => h("button", { class: "btn ghost", type: "button", onclick: () => step(n) }, "+" + n))));
+    inp.addEventListener("input", () => { inp.value = inp.value.replace(/[^\d٠-٩]/g, ""); calc(); });
+    inp.addEventListener("keydown", (e) => { if (e.key === "ArrowUp") { e.preventDefault(); step(1); } else if (e.key === "ArrowDown") { e.preventDefault(); step(-1); } });
+    return { z, inp, el };
+  });
+  function picked() { return tiles.map((t) => ({ t, q: Math.round(num(t.inp.value)) })).filter((x) => x.q > 0); }
+  function calc() {
+    const P = picked(); let tot = 0, loaves = 0;
+    linesEl.replaceChildren(...(P.length ? P.map(({ t, q }) => { const v = q * t.z.price; tot += v; loaves += q;
+      return h("div", { class: "qs-line" }, h("span", null, t.z.name), h("span", { class: "hint" }, `${q} × ${fmt(t.z.price)}`), h("b", null, fmt(v))); })
+      : [h("div", { class: "hint qs-empty" }, "دوس على الرغيف أو اكتب العدد")]));
+    tiles.forEach(({ inp, el }) => el.classList.toggle("on", num(inp.value) > 0));
+    totalEl.textContent = fmt(tot); mTot.textContent = fmt(tot) + " ج"; cntEl.textContent = loaves ? `${loaves} رغيف` : "";
+    printBtn.disabled = mBtn.disabled = !P.length;
+  }
+  function clearAll() { tiles.forEach((t) => (t.inp.value = "")); calc(); tiles[0] && tiles[0].inp.focus(); }
+  async function doSale() {
+    if (busy) return;
+    const P = picked(); if (!P.length) { toast("اختار الرغيف واكتب العدد الأول", "err"); return; }
+    busy = true; printBtn.disabled = mBtn.disabled = true;
+    try {
+      const r = await ownerRetry((pw) => api("quick_sale", P.map(({ t, q }) => ({ item_id: t.z.item_id, qty: q })), S.boot.today, pw));
+      if (!r) return;
+      toast(`✔ بون رقم ${r.number} — ${fmt(r.net)} ج • البون بيتطبع ...`, "ok", 3500);
+      tiles.forEach((t) => (t.inp.value = ""));
+      await reload();
+    } catch (e) { alertBox(e.message); }
+    finally { busy = false; calc(); tiles[0] && tiles[0].inp.focus(); }
+  }
+  const sumEl = h("div", { class: "home-sum" }), listBox = h("div", { class: "qs-recent" });
+  function drawRecent() {
+    sumEl.replaceChildren(h("b", null, "بيع النهارده"), h("span", null, "البونات: ", h("b", null, String(st.count))), h("span", null, "الأرغفة: ", h("b", null, fq(st.loaves))), h("span", null, "الإجمالي: ", h("b", null, fmt(st.total))));
+    listBox.replaceChildren(st.recent.length ? h("table", { class: "t" },
+      h("thead", null, h("tr", null, h("th", null, "بون"), h("th", null, "الوقت"), h("th", { class: "num" }, "أرغفة"), h("th", { class: "num" }, "المبلغ"), S.me.owner ? h("th", null, "") : null)),
+      h("tbody", null, st.recent.map((r) => h("tr", { class: "click", ondblclick: () => showInvoice(r.id), title: "ضغطتين = تفاصيل البون" },
+        h("td", null, h("b", null, r.number)), h("td", { class: "hint" }, r.time), h("td", { class: "num" }, fq(r.loaves)), h("td", { class: "num" }, h("b", null, fmt(r.net))),
+        S.me.owner ? h("td", null, h("button", { class: "btn ghost sm", title: "إعادة طباعة (نسخة مكررة)", onclick: async (e) => { e.stopPropagation();
+          try { await api("print_quick", r.id); toast("🖨 نسخة مكررة بتتطبع ...", "ok"); } catch (x) { toast(x.message, "err"); } } }, icon("print", 16))) : null)))) :
+      h("div", { class: "empty" }, "لسه مفيش بونات النهارده"));
+  }
+  async function reload() {
+    try { st = { ...st, ...(await api("quick_setup", S.boot.today)) }; } catch (e) { return; }
+    const m = Object.fromEntries(st.sizes.map((z) => [z.item_id, z]));
+    tiles.forEach((t) => { const z = m[t.z.item_id]; if (z) { t.z.stock = z.stock; const s_ = t.el.querySelector(".qs-stock"); s_.textContent = `المخزن: ${fq(z.stock)}`; s_.classList.toggle("neg", z.stock <= 0); } });
+    drawRecent();
+  }
+  enterChain(tiles.map((t) => t.inp), () => doSale());
+  box.replaceChildren(h("div", { class: "home qs-home" },
+    h("section", { class: "qs-hero anim-up d1" }, h("img", { src: S.boot.logo, alt: "" }), h("b", null, S.boot.company),
+      h("span", { class: "qs-date" }, `${day}  ${S.boot.today.split("-").reverse().join("-")}`)),
+    h("div", { class: "qs-grid" },
+      h("section", { class: "card anim-up d2" },
+        h("div", { class: "card-h" }, h("h2", null, "بيع سريع"), h("span", { class: "hint" }, "اختار الرغيف وعدده • البون بيتطبع مع الحفظ • Enter في آخر خانة = طباعة وحفظ")),
+        h("div", { class: "qs-tiles" }, tiles.map((t) => t.el))),
+      h("div", { class: "qs-side" },
+        h("section", { class: "card anim-up d2 qs-cart" }, h("div", { class: "card-h" }, h("h2", null, "البون"), cntEl), h("div", { class: "qs-cart-in" }, linesEl,
+          h("div", { class: "qs-total" }, h("span", null, "الإجمالي"), totalEl),
+          h("div", { class: "qs-foot" }, clearBtn, printBtn))),
+        h("section", { class: "card anim-up d3" }, h("div", { class: "card-h" }, h("h2", null, "بونات النهارده"), h("span", { class: "hint" }, "على «البوابة»")), sumEl, listBox))),
+    mBar));
+  drawRecent(); calc();
+  { const tb = $("#todaybar");                       // على الموبايل: شريط «طباعة وحفظ» فوق شريط النهارده الثابت
+    if (tb && window.ResizeObserver) { const ro = new ResizeObserver(() => { if (!mBar.isConnected) return ro.disconnect();
+      mBar.style.bottom = (getComputedStyle(tb).position === "fixed" ? tb.offsetHeight : 0) + "px"; }); ro.observe(tb); } }
+  if (!st.sizes.length) toast("مفيش مقاسات عيش — ضيفها من شاشة الإنتاج", "err");
+  tiles[0] && tiles[0].inp.focus();
 }
 
 /* عدد طلبات المناديب المستنية — بيتحدث كل دقيقة ومع أي تحديث */
