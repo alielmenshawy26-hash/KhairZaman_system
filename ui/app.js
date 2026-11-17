@@ -1,4 +1,4 @@
-/* شركة زلط — الواجهة الجديدة (تجريبي). كل البيانات والحسابات من نفس سيستم المخازن. */
+/* مخبز خير زمان — كل الشاشات. كل البيانات والحسابات من نفس سيستم المخازن. */
 "use strict";
 
 /* ===================== الاتصال بالبرنامج ===================== */
@@ -121,7 +121,7 @@ function qtyText(lines) {
   }
   return `${fmt(tons)} طن (${fmt(bags)} شيكارة)`;
 }
-function store(k, v) { try { if (v === undefined) return JSON.parse(localStorage.getItem("zalat." + k)); localStorage.setItem("zalat." + k, JSON.stringify(v)); } catch (e) { return null; } }
+function store(k, v) { try { if (v === undefined) return JSON.parse(localStorage.getItem("kz." + k)); localStorage.setItem("kz." + k, JSON.stringify(v)); } catch (e) { return null; } }
 function fitNum(el) { const n = el.textContent.length; el.classList.toggle("long", n > 11 && n <= 14); el.classList.toggle("xlong", n > 14); }
 function countUp(el, to, money = true) {
   const fin = money ? fmt(to) : String(Math.round(to)); el.textContent = fin; fitNum(el);
@@ -395,7 +395,7 @@ function renderLogin() {
     catch (x) { err.textContent = x.message; p.value = ""; p.focus(); box.classList.add("shake"); setTimeout(() => box.classList.remove("shake"), 500); }
     finally { btn.disabled = false; btn.replaceChildren("دخول"); }
   } },
-    h("div", { class: "logo" }, h("img", { src: S.boot.logo, alt: "" }), h("b", null, S.boot.company), h("span", { class: "hint" }, "الواجهة الجديدة — تجريبي")),
+    h("div", { class: "logo" }, h("img", { src: S.boot.logo, alt: "" }), h("b", null, S.boot.company)),
     h("label", { class: "fld", for: "lg-user" }, "اسم المستخدم", u),
     h("label", { class: "fld", for: "lg-pass" }, "كلمة السر", p), err, btn,
     h("div", { class: "meta" }, S.boot.version + " • " + S.boot.server, " • ", h("a", { href: "#", onclick: (e) => { e.preventDefault(); serverSettings(true); } }, "إعدادات الاتصال")));
@@ -448,7 +448,7 @@ function navGroups() {
 function renderShell() {
   SCREENS.req.title = S.me.rep ? "طلباتي" : "طلبات المناديب";
   const side = h("nav", { class: "side" + (S.mini ? " mini" : ""), "aria-label": "القايمة الرئيسية" },
-    h("div", { class: "brand" }, h("img", { src: S.boot.logo, alt: "" }), h("div", { class: "t" }, h("b", null, S.boot.company), h("small", null, "للتوريدات العمومية"))),
+    h("div", { class: "brand" }, h("img", { src: S.boot.logo, alt: "" }), h("div", { class: "t" }, h("b", null, S.boot.company))),
     can("home") ? navBtn("home") : null,
     ...navGroups(),
     h("div", { class: "spacer" }),
@@ -456,7 +456,7 @@ function renderShell() {
       e.currentTarget.querySelector(".lbl").textContent = S.mini ? "تثبيت القايمة مفتوحة" : "تصغير القايمة"; } }, icon("menu", 22), h("span", { class: "lbl" }, S.mini ? "تثبيت القايمة مفتوحة" : "تصغير القايمة")),
     h("div", { class: "who" }, h("div", { class: "av" }, (S.me.username || "?").slice(0, 1)),
       h("div", { class: "lbl" }, h("b", null, S.me.username), h("small", null, S.me.role)),
-      h("button", { class: "btn ghost", style: { color: "#c9d6e6", marginInlineStart: "auto", padding: "0 8px" }, title: "خروج", "aria-label": "خروج", onclick: logout }, icon("logout", 18))),
+      h("button", { class: "btn ghost", style: { color: "#e5dcca", marginInlineStart: "auto", padding: "0 8px" }, title: "خروج", "aria-label": "خروج", onclick: logout }, icon("logout", 18))),
     h("div", { class: "sig", title: S.boot.version || "" }, h("span", { dir: "ltr", class: "sig-v" }, S.boot.build ? `V2.1.${S.boot.build}` : "dev"), h("span", { dir: "ltr", class: "sig-n" }, "by Ali ElMenshawy")));
   const top = h("header", { class: "top" },
     h("button", { class: "btn icon-btn m-menu", "aria-label": "القايمة", onclick: () => toggleMobileNav() }, icon("menu", 22)),
@@ -591,7 +591,7 @@ async function renderHome(box) {
   box.replaceChildren(h("div", { class: "home" },
     h("section", { class: "hero anim-up d1" },
       h("div", { class: "hero-in" }, h("img", { src: S.boot.logo, alt: "" }),
-        h("div", { class: "hero-t" }, h("b", null, S.boot.company), h("span", null, "للتوريدات العمومية"))),
+        h("div", { class: "hero-t" }, h("b", null, S.boot.company))),
       h("div", { class: "hero-date" }, `${day}  ${S.boot.today.split("-").reverse().join("-")}`)),
     h("section", { class: "card home-inv anim-up d2" },
       h("div", { class: "card-h" }, h("h2", null, "فواتير اليوم"), h("span", { class: "hint" }, "ضغطتين على فاتورة = تفتحها")),
@@ -639,7 +639,7 @@ function cloudBox(owner) {
         owner ? h("button", { class: "btn", onclick: async () => { try { const d = await api("pick_file", "folder"); if (d) set([d, false]); } catch (e) { alertBox(e.message); } } }, "اختار فولدر الدرايف بإيدك") : null,
         owner && c.custom ? h("button", { class: "btn ghost", onclick: () => set(["", null]) }, "رجّعه أوتوماتيك") : null,
         owner ? h("button", { class: c.off ? "btn gold" : "btn ghost", onclick: () => set([null, !c.off]) }, c.off ? "▶ شغّلها" : "⏸ اقفلها") : null),
-      h("div", { class: "hint" }, c.dir || c.off ? "النسخة بتتحفظ باسم zalat_latest.db (آخر نسخة) + نسخة لكل يوم (آخر 30 يوم). لو الكمبيوتر باظ: سطّب البرنامج على الجهاز الجديد، اعمل يوزر مالك مؤقت، ونزّل zalat_latest.db من الدرايف واعمل منها «استرجاع نسخة احتياطية»."
+      h("div", { class: "hint" }, c.dir || c.off ? "النسخة بتتحفظ باسم khairzaman_latest.db (آخر نسخة) + نسخة لكل يوم (آخر 30 يوم). لو الكمبيوتر باظ: سطّب البرنامج على الجهاز الجديد، اعمل يوزر مالك مؤقت، ونزّل zalat_latest.db من الدرايف واعمل منها «استرجاع نسخة احتياطية»."
         : "علشان تشتغل: نزّل برنامج «Google Drive للكمبيوتر» (Google Drive for desktop) وسجّل دخول بإيميل الشركة — البرنامج هيلاقيه لوحده ويبدأ يرفع."));
   }
   draw();
@@ -2221,9 +2221,9 @@ async function renderTargets(box) {
     cards.replaceChildren(...rows.map((r, i) => {
       const pct = r.pct ?? 0, color = pct >= 100 ? "#15803d" : pct >= 60 ? "#c8a24a" : "#c2410c";
       return h("div", { class: "card kpi lift anim-up", style: { animationDelay: i * 0.05 + "s", gap: "8px" } },
-        h("div", { class: "h" }, h("span", { class: "ic", style: { background: "#e8effa", color: "#1e5aa8" } }, icon("users", 20)), h("b", { style: { color: "var(--navy)", fontSize: "16px" } }, r.name)),
+        h("div", { class: "h" }, h("span", { class: "ic", style: { background: "#f9f4e9", color: "#975c2f" } }, icon("users", 20)), h("b", { style: { color: "var(--navy)", fontSize: "16px" } }, r.name)),
         h("div", { class: "s" }, r.target ? `المحقق ${fmt(r.done)} من ${fmt(r.target)} ${r.unit}` : `المحقق ${fmt(r.tons)} طن (${fmt(r.bags)} شيكارة دقيق) — مفيش تارجت`),
-        h("div", { class: "track", style: { height: "12px", borderRadius: "6px", background: "#edf2f8", overflow: "hidden" } }, h("div", { class: "fill", style: { height: "100%", width: Math.min(100, pct) + "%", background: color, transformOrigin: "right", animation: "grow 1s var(--ease) .2s both" } })),
+        h("div", { class: "track", style: { height: "12px", borderRadius: "6px", background: "#f7f4ee", overflow: "hidden" } }, h("div", { class: "fill", style: { height: "100%", width: Math.min(100, pct) + "%", background: color, transformOrigin: "right", animation: "grow 1s var(--ease) .2s both" } })),
         h("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center" } }, h("b", { style: { color, fontSize: "20px" } }, r.target ? pct + "%" : "—"),
           h("div", { style: { display: "flex", gap: "6px" } },
             h("button", { class: "btn", style: { minHeight: "34px" }, onclick: async () => {
@@ -2518,7 +2518,7 @@ async function renderVehicles(box) {
     if (!fKind.children.length) data.kinds.forEach((k) => fKind.appendChild(h("option", { value: k }, k)));
     if (!data.rows.some((v) => v.id === V.sel)) V.sel = data.rows[0] ? data.rows[0].id : null;
     cards.replaceChildren(...data.rows.map((v, i) => h("div", { class: "card kpi lift anim-up", style: { animationDelay: i * 0.05 + "s", cursor: "pointer", outline: v.id === V.sel ? "3px solid var(--gold)" : "" }, onclick: () => { V.sel = v.id; load(); } },
-      h("div", { class: "h" }, h("span", { class: "ic", style: { background: "#e8effa", color: "#1e5aa8" } }, icon("truck", 20)), h("b", { style: { color: "var(--navy)", fontSize: "16px" } }, v.name), v.active ? null : h("span", { class: "pill k-مرتجع" }, "متوقفة")),
+      h("div", { class: "h" }, h("span", { class: "ic", style: { background: "#f9f4e9", color: "#975c2f" } }, icon("truck", 20)), h("b", { style: { color: "var(--navy)", fontSize: "16px" } }, v.name), v.active ? null : h("span", { class: "pill k-مرتجع" }, "متوقفة")),
       h("div", { class: "s" }, [v.plate, v.driver].filter(Boolean).join(" • ") || " "), h("div", { class: "v" }, fmt(v.total)),
       h("div", { class: "s" }, `${fmt(v.km)} كم • ${fmt(v.liters)} لتر` + (v.km_per_l ? ` • ${fmt(v.km_per_l)} كم/لتر` : "") + (v.cost_km ? ` • ${fmt(v.cost_km)} ج/كم` : "")),
       h("div", { class: "s" }, v.last_odo != null ? `آخر عداد: ${fmt(v.last_odo)}` : ""))));

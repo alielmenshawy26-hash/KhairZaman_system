@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-شركة زلط — الواجهة الجديدة (تجريبي).
+مخبز خير زمان — البرنامج (نسخة من سيستم زلط).
 نفس قاعدة البيانات ونفس الحسابات بتاعة Warehouse_app.py — الشكل بس اللي جديد (HTML/CSS/JS جوه نافذة WebView2).
 التشغيل:  python zalat_ui.py            → نافذة البرنامج
           python zalat_ui.py --serve 8765 → للتجربة من المتصفح (http://127.0.0.1:8765)
@@ -2614,7 +2614,7 @@ class Api:
     def server_get(self):
         self._owner()
         c = dict(W.DB_CFG)
-        return {"mode": c.get("mode") or "sqlite", "host": c.get("host") or "", "port": c.get("port") or 5432, "dbname": c.get("dbname") or "warehouse",
+        return {"mode": c.get("mode") or "sqlite", "host": c.get("host") or "", "port": c.get("port") or 5432, "dbname": c.get("dbname") or "khairzaman",
                 "user": c.get("user") or "postgres", "password": c.get("password") or "", "label": W.server_label()}
 
     def _read_cfg(self, v):
@@ -2715,7 +2715,7 @@ class Api:
     def server_settings_boot(self):
         """لما السيرفر مش متاح وقت الفتح: إعدادات الاتصال من غير تسجيل دخول."""
         c = dict(W.DB_CFG)
-        return {"mode": c.get("mode") or "sqlite", "host": c.get("host") or "", "port": c.get("port") or 5432, "dbname": c.get("dbname") or "warehouse", "user": c.get("user") or "postgres", "password": c.get("password") or ""}
+        return {"mode": c.get("mode") or "sqlite", "host": c.get("host") or "", "port": c.get("port") or 5432, "dbname": c.get("dbname") or "khairzaman", "user": c.get("user") or "postgres", "password": c.get("password") or ""}
 
     def server_save_boot(self, v):
         """حفظ إعدادات الاتصال من شاشة «السيرفر مش متاح» (من غير نقل داتا)."""
@@ -2725,7 +2725,7 @@ class Api:
 
 # ---------- الربط مع الواجهة ----------
 from concurrent.futures import ThreadPoolExecutor
-_WORKER = ThreadPoolExecutor(max_workers=1, thread_name_prefix="zalat-api")   # thread واحد = اتصال واحد بالسيرفر بيتعاد استخدامه
+_WORKER = ThreadPoolExecutor(max_workers=1, thread_name_prefix="kz-api")   # thread واحد = اتصال واحد بالسيرفر بيتعاد استخدامه
 
 
 class Ctx:
@@ -3010,7 +3010,7 @@ def start_web(port):
     from http.server import ThreadingHTTPServer
     if _WEB["srv"]: return _WEB["port"]
     srv = ThreadingHTTPServer(("0.0.0.0", int(port)), make_handler(False))
-    threading.Thread(target=srv.serve_forever, daemon=True, name="zalat-web").start()
+    threading.Thread(target=srv.serve_forever, daemon=True, name="kz-web").start()
     _WEB.update(srv=srv, port=int(port))
     return int(port)
 
@@ -3035,7 +3035,7 @@ def main():
     except Exception: W.write_error_log("web: " + traceback.format_exc())
     try:
         import webview
-        win = webview.create_window("شركة زلط", os.path.join(UI_DIR, "index.html"), js_api=Bridge(), width=1366, height=840,
+        win = webview.create_window("مخبز خير زمان", os.path.join(UI_DIR, "index.html"), js_api=Bridge(), width=1366, height=840,
                                     min_size=(1000, 640), background_color="#eef2f7", text_select=True)
         def _on_closing():                     # آخر تغييرات قبل ما البرنامج يتقفل → على الدرايف
             try: W.cloud_backup()
