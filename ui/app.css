@@ -489,7 +489,7 @@ html.standalone .shell{background:var(--ground);min-height:100dvh}
 .prod-tile .pt-h b{font-size:18px;color:var(--navy)}
 .prod-tile .pt-h small{color:var(--muted);font-size:12.5px;font-weight:600}
 .prod-tile .prod-in{font-size:24px;font-weight:800;text-align:center;min-height:48px}
-.prod-tile .prod-in::placeholder{color:#d8c7a8;font-weight:600}
+.prod-tile .prod-in::placeholder{color:#d8c7a8;font-weight:600;font-size:16px}
 .prod-tile>small.hint{margin-top:-4px;text-align:center}
 .prod-out{font-size:13px;color:var(--muted);text-align:center;min-height:20px}
 .prod-out b{color:var(--navy)}
