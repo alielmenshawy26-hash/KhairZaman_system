@@ -28,7 +28,7 @@ ALL_SCREENS = ["home", "inv:مبيعات", "inv:مشتريات", "inv:مرتجع
                "acc:statement", "acc:balances", "acc:cash", "acc:subcash", "par:list", "itm:list", "itm:stock", "itm:sales", "itm:buys", "itm:damaged",
                "smp:items", "smp:out", "smp:in", "emp:list", "emp:att", "emp:attlog", "emp:attreq", "emp:repreq", "emp:veh",
                "rep:daily", "rep:monthly", "rep:profit", "rep:reps", "rep:targets", "rep:log", "req", "set:main", "acc:assets",
-               "prd:new", "prd:log", "rep:production"]
+               "prd:new", "prd:log", "rep:production", "gate:log"]
 OWNER_ONLY_SCREENS = {"rep:profit", "set:users", "acc:assets", "rep:monthly"}
 DEFAULT_SCREENS = {
     W.ROLE_ACC: [k for k in ALL_SCREENS if k not in OWNER_ONLY_SCREENS],
@@ -38,7 +38,8 @@ _INV = ["inv:مبيعات", "inv:مشتريات", "inv:مرتجع مبيعات",
 # كل أمر بيتسمح لو اليوزر عنده شاشة من الشاشات دي (الأوامر اللي مش هنا مسموحة لأي حد داخل)
 METHOD_SCREENS = {}
 for _keys, _methods in [
-    (["home"], "dashboard expected mark_called unmark_called hide_expected unhide_expected quick_setup quick_sale print_quick"),
+    (["gate:log", "log"], "gate_log"),
+    (["home"], "dashboard expected mark_called unmark_called hide_expected unhide_expected quick_setup quick_sale"),
     (_INV + ["log", "home"], "invoice_setup save_invoice invoice print_invoice invoice_for_edit delete_invoice"),
     (["log", "home"], "invoices"),
     (["vch:new", "vch:log"], "voucher_setup save_voucher voucher_preview add_expense_cat delete_expense_cat rename_expense_cat expense_cat_log vouchers voucher delete_voucher print_receipt"),
@@ -74,7 +75,7 @@ for _keys, _methods in [
     (["rep:monthly"], "monthly_report monthly_print"),
 ]:
     for _m in _methods.split(): METHOD_SCREENS[_m] = set(_keys)
-NO_REP = {"close_day", "expense_cat_log", "quick_setup", "quick_sale", "print_quick", "day_unlock", "req_decide", "inv_request_get",
+NO_REP = {"close_day", "expense_cat_log", "quick_setup", "quick_sale", "gate_log", "day_unlock", "req_decide", "inv_request_get",
           # المندوب بيبعت طلبات بس: مايحذفش فاتورة أو سند اتقبل (كان ممكن يلف على الموافقة بالحذف)،
           # ومايشوفش تقرير الشركة اليومي (مبيعات الكل والخزنة والمصروفات)، ومايغيرش بنود المصروفات
           "delete_invoice", "delete_voucher", "daily_report", "print_daily", "daily_trend",
@@ -498,6 +499,9 @@ class Api:
 
     def print_invoice(self, inv_id):
         self._need_login()
+        with W.db() as c:                          # بون البوابة بيتطبع مرة واحدة بس من الكاشير
+            i = c.execute("SELECT kind, party_id FROM invoices WHERE id=?", (inv_id,)).fetchone()
+            if i and i["kind"] == "مبيعات" and i["party_id"] == W.gate_party_id(c): raise UIError("بون البوابة مابيتطبعش تاني — بيتطبع مرة واحدة بس من الكاشير")
         os.makedirs(W.PRINT_DIR, exist_ok=True)
         path = os.path.join(W.PRINT_DIR, f"invoice_{inv_id}.html")
         with open(path, "w", encoding="utf-8") as f: f.write(W.App.invoice_html(None, inv_id))
@@ -1467,8 +1471,8 @@ class Api:
         return {"date": d, "sizes": sizes, "gate_id": gid, "recent": recent[:30], "count": len(recent),
                 "total": _r2(sum(r["net"] for r in recent)), "loaves": _r2(sum(r["loaves"] for r in recent))}
 
-    def quick_sale(self, lines, d=None, neg_pw=None):
-        """بيع سريع: فاتورة مبيعات نقدي على «البوابة» — بتتحفظ وتتطبع مع بعض (مفيش حفظ من غير بون)."""
+    def quick_sale(self, lines, d=None, neg_pw=None, do_print=True):
+        """بيع سريع: فاتورة مبيعات نقدي على «البوابة» — «طباعة وحفظ» أو «حفظ» بس. البون بيتطبع مرة واحدة بس."""
         self._need_login()
         d = W.check_date(d or _today())
         with W.db() as c:
@@ -1488,18 +1492,25 @@ class Api:
         r = self.save_invoice({"kind": "مبيعات", "party_id": gid, "date": d, "paid": 0, "pay_type": "نقدي", "notes": "بيع سريع (كاشير)", "lines": L}, neg_pw=neg_pw)
         if not r.get("ok"): return r
         with W.db() as c: W.log(c, "بيع سريع", f"بون {r['number']} — {W.fmt(r['net'])} ج")
-        self._print_receipt(r["id"], copy=False)
+        if do_print: self._print_receipt(r["id"], copy=False)
         return r
 
-    def print_quick(self, inv_id):
-        """إعادة طباعة بون — للمالك بس، وبيتكتب عليه «نسخة مكررة»."""
+    def gate_log(self, d_from=None, d_to=None):
+        """سجل البوابة: بونات الكاشير (فواتير «البوابة») في الفترة."""
         self._need_login()
-        if not W.is_owner(): raise UIError("إعادة طباعة البون للمالك بس")
+        a = W.check_date(d_from or _today()); b = W.check_date(d_to or a)
         with W.db() as c:
-            i = c.execute("SELECT kind, party_id FROM invoices WHERE id=?", (int(inv_id),)).fetchone()
-            if not i or i["kind"] != "مبيعات" or i["party_id"] != W.gate_party_id(c): raise UIError("ده مش بون بيع سريع")
-        self._print_receipt(int(inv_id), copy=True)
-        return True
+            gid = W.gate_party_id(c)
+            inv = c.execute(f"SELECT i.id, i.number, i.inv_date, i.created_at, i.printed_at, {W.NET_SQL} net FROM invoices i "
+                            "WHERE i.kind='مبيعات' AND i.party_id=? AND i.inv_date BETWEEN ? AND ? ORDER BY i.inv_date DESC, i.id DESC", (gid, a, b)).fetchall()
+            ids = [r["id"] for r in inv]; L = {}
+            for k in range(0, len(ids), 500):
+                ch = ids[k:k + 500]
+                for l in c.execute(f"SELECT invoice_id, item_name, qty FROM invoice_lines WHERE invoice_id IN ({','.join('?' * len(ch))}) ORDER BY id", ch).fetchall():
+                    L.setdefault(l["invoice_id"], []).append((l["item_name"], float(l["qty"])))
+        rows = [{"id": r["id"], "number": r["number"], "date": r["inv_date"], "time": W.fmt_time(r["created_at"]), "printed": bool(r["printed_at"]), "net": _r2(r["net"]),
+                 "loaves": _r2(sum(q for _, q in L.get(r["id"], []))), "items": "، ".join(f"{n.replace('عيش ', '')} {q:g}" for n, q in L.get(r["id"], []))} for r in inv]
+        return {"from": a, "to": b, "rows": rows}
 
     def _print_receipt(self, inv_id, copy):
         os.makedirs(W.PRINT_DIR, exist_ok=True)

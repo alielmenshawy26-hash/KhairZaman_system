@@ -306,6 +306,7 @@ const SCREENS = {
   "inv:مشتريات": { title: "فاتورة مشتريات", icon: "buy", key: "F2" },
   "inv:مرتجع مبيعات": { title: "مرتجع مبيعات", icon: "ret" },
   "inv:مرتجع مشتريات": { title: "مرتجع مشتريات", icon: "ret" },
+  "gate:log": { title: "سجل البوابة", icon: "cash" },
   log: { title: "سجل الفواتير", icon: "list", key: "F3" },
   "vch:new": { title: "سند جديد", icon: "cash", key: "F6" },
   "vch:log": { title: "سجل السندات", icon: "list", key: "F7" },
@@ -407,7 +408,7 @@ function renderLogin() {
 // الصلاحيات: المالك كله، وغيره الشاشات المسموحله بيها بس
 /* مخفية مؤقتاً في خير زمان (لحد ما نظام المناديب يتحدد) — الكود موجود بس مش ظاهر */
 const HIDDEN_SCREENS = new Set(["req", "rep:reps", "rep:targets", "emp:veh"]);
-const can = (k) => !!S.me && !HIDDEN_SCREENS.has(k) && (S.me.owner || (S.me.screens || []).includes(k));
+const can = (k) => !!S.me && !HIDDEN_SCREENS.has(k) && (S.me.owner || (S.me.screens || []).includes(k) || (k === "gate:log" && !S.me.rep && (S.me.screens || []).includes("log")));
 const firstScreen = () => (can("home") ? "home" : (S.me.screens || [])[0] || "home");
 function navBtn(key) {
   const sc = SCREENS[key];
@@ -419,7 +420,7 @@ const trustPrint = async () => { try { await api("print_trust_form"); toast("�
 function navGroups() {
   const G = [
     ["الإنتاج", "plus", ["prd:new", "prd:log", "rep:production"]],
-    ["الفواتير", "list", ["inv:مبيعات", "inv:مشتريات", "inv:مرتجع مبيعات", "inv:مرتجع مشتريات", "log"]],
+    ["الفواتير", "list", ["inv:مبيعات", "inv:مشتريات", "inv:مرتجع مبيعات", "inv:مرتجع مشتريات", "gate:log", "log"]],
     ["السندات", "cash", ["vch:new", "vch:log"]],
     ["العملاء والموردون", "users", ["par:list"]],
     ["الأصناف والمخزون", "box", ["itm:list", "itm:stock", "itm:sales", "itm:buys", "itm:damaged", ["العينات", "box", ["smp:items", "smp:out", "smp:in"]]]],
@@ -513,7 +514,7 @@ window.addEventListener("focus", rollIfNewDay);
 function resetDates(k) {
   const td = S.boot.today, ms = monthStart();
   const R = {
-    "log": () => (S.logState = null), "vch:log": () => (S.vlog = null), "acc:cash": () => (S.cashSt = null), "acc:subcash": () => (S.scSt = null),
+    "log": () => (S.logState = null), "gate:log": () => (S.gateLog = null), "vch:log": () => (S.vlog = null), "acc:cash": () => (S.cashSt = null), "acc:subcash": () => (S.scSt = null),
     "acc:statement": () => { if (S.stmt) { S.stmt.from = ms; S.stmt.to = td; } },
     "acc:assets": () => { if (S.astSt) { S.astSt.from = ms; S.astSt.to = td; } },
     "itm:damaged": () => (S.dmgSt = null), "rep:reps": () => (S.rpSt = null), "rep:log": () => (S.lgSt = null), "rep:profit": () => (S.pfSt = null),
@@ -545,6 +546,7 @@ async function go(key, force) {
   try {
     if (key === "home") await renderHome(box);
     else if (key === "log") await renderLog(box);
+    else if (key === "gate:log") await renderGateLog(box);
     else if (key === "vch:new") await renderVoucher(box);
     else if (key === "vch:log") await renderVouchers(box);
     else if (key === "acc:statement") await renderStatement(box);
@@ -614,10 +616,12 @@ async function renderCashier(box) {
   let st;
   try { st = await api("quick_setup", S.boot.today); } catch (e) { return box.replaceChildren(h("div", { class: "card empty" }, e.message)); }
   const day = new Date(S.boot.today + "T12:00:00").toLocaleDateString("ar-EG", { weekday: "long" });
-  const mTot = h("b", null, "0.00"), mBtn = h("button", { class: "btn primary", onclick: () => doSale() }, icon("print", 18), "طباعة وحفظ");
-  const mBar = h("div", { class: "qs-mbar" }, h("span", null, "الإجمالي: ", mTot), mBtn);
+  const mTot = h("b", null, "0.00"), mBtn = h("button", { class: "btn primary", onclick: () => doSale(true) }, icon("print", 18), "طباعة وحفظ");
+  const mSave = h("button", { class: "btn", onclick: () => doSale(false) }, "حفظ");
+  const mBar = h("div", { class: "qs-mbar" }, h("span", null, "الإجمالي: ", mTot), h("span", { style: { display: "flex", gap: "8px" } }, mSave, mBtn));
   const totalEl = h("b", { class: "qs-total-v" }, "0.00"), linesEl = h("div", { class: "qs-lines" }), cntEl = h("span", { class: "hint" });
-  const printBtn = h("button", { class: "btn primary big qs-print", onclick: () => doSale() }, icon("print", 22), "طباعة وحفظ");
+  const printBtn = h("button", { class: "btn primary big qs-print", onclick: () => doSale(true) }, icon("print", 22), "طباعة وحفظ");
+  const saveBtn = h("button", { class: "btn qs-save", onclick: () => doSale(false) }, icon("save", 18), "حفظ");
   const clearBtn = h("button", { class: "btn", onclick: () => clearAll() }, icon("x", 18), "مسح");
   let busy = false;
   const tiles = st.sizes.map((z) => {
@@ -643,54 +647,41 @@ async function renderCashier(box) {
       : [h("div", { class: "hint qs-empty" }, "دوس على الرغيف أو اكتب العدد")]));
     tiles.forEach(({ inp, el }) => el.classList.toggle("on", num(inp.value) > 0));
     totalEl.textContent = fmt(tot); mTot.textContent = fmt(tot) + " ج"; cntEl.textContent = loaves ? `${loaves} رغيف` : "";
-    printBtn.disabled = mBtn.disabled = !P.length;
+    printBtn.disabled = mBtn.disabled = saveBtn.disabled = mSave.disabled = !P.length;
   }
   function clearAll() { tiles.forEach((t) => (t.inp.value = "")); calc(); tiles[0] && tiles[0].inp.focus(); }
-  async function doSale() {
+  async function doSale(print) {
     if (busy) return;
     const P = picked(); if (!P.length) { toast("اختار الرغيف واكتب العدد الأول", "err"); return; }
-    busy = true; printBtn.disabled = mBtn.disabled = true;
+    busy = true; printBtn.disabled = mBtn.disabled = saveBtn.disabled = mSave.disabled = true;
     try {
-      const r = await ownerRetry((pw) => api("quick_sale", P.map(({ t, q }) => ({ item_id: t.z.item_id, qty: q })), S.boot.today, pw));
+      const r = await ownerRetry((pw) => api("quick_sale", P.map(({ t, q }) => ({ item_id: t.z.item_id, qty: q })), S.boot.today, pw, print));
       if (!r) return;
-      toast(`✔ بون رقم ${r.number} — ${fmt(r.net)} ج • البون بيتطبع ...`, "ok", 3500);
+      toast(`✔ بون رقم ${r.number} — ${fmt(r.net)} ج` + (print ? " • البون بيتطبع ..." : " • اتحفظ من غير طباعة"), "ok", 3500);
       tiles.forEach((t) => (t.inp.value = ""));
       await reload();
     } catch (e) { alertBox(e.message); }
     finally { busy = false; calc(); tiles[0] && tiles[0].inp.focus(); }
   }
-  const sumEl = h("div", { class: "home-sum" }), listBox = h("div", { class: "qs-recent" });
-  function drawRecent() {
-    sumEl.replaceChildren(h("b", null, "بيع النهارده"), h("span", null, "البونات: ", h("b", null, String(st.count))), h("span", null, "الأرغفة: ", h("b", null, fq(st.loaves))), h("span", null, "الإجمالي: ", h("b", null, fmt(st.total))));
-    listBox.replaceChildren(st.recent.length ? h("table", { class: "t" },
-      h("thead", null, h("tr", null, h("th", null, "بون"), h("th", null, "الوقت"), h("th", { class: "num" }, "أرغفة"), h("th", { class: "num" }, "المبلغ"), S.me.owner ? h("th", null, "") : null)),
-      h("tbody", null, st.recent.map((r) => h("tr", { class: "click", ondblclick: () => showInvoice(r.id), title: "ضغطتين = تفاصيل البون" },
-        h("td", null, h("b", null, r.number)), h("td", { class: "hint" }, r.time), h("td", { class: "num" }, fq(r.loaves)), h("td", { class: "num" }, h("b", null, fmt(r.net))),
-        S.me.owner ? h("td", null, h("button", { class: "btn ghost sm", title: "إعادة طباعة (نسخة مكررة)", onclick: async (e) => { e.stopPropagation();
-          try { await api("print_quick", r.id); toast("🖨 نسخة مكررة بتتطبع ...", "ok"); } catch (x) { toast(x.message, "err"); } } }, icon("print", 16))) : null)))) :
-      h("div", { class: "empty" }, "لسه مفيش بونات النهارده"));
-  }
   async function reload() {
     try { st = { ...st, ...(await api("quick_setup", S.boot.today)) }; } catch (e) { return; }
     const m = Object.fromEntries(st.sizes.map((z) => [z.item_id, z]));
     tiles.forEach((t) => { const z = m[t.z.item_id]; if (z) { t.z.stock = z.stock; const s_ = t.el.querySelector(".qs-stock"); s_.textContent = `المخزن: ${fq(z.stock)}`; s_.classList.toggle("neg", z.stock <= 0); } });
-    drawRecent();
   }
-  enterChain(tiles.map((t) => t.inp), () => doSale());
+  enterChain(tiles.map((t) => t.inp), () => doSale(true));
   box.replaceChildren(h("div", { class: "home qs-home" },
     h("section", { class: "qs-hero anim-up d1" }, h("img", { src: S.boot.logo, alt: "" }), h("b", null, S.boot.company),
       h("span", { class: "qs-date" }, `${day}  ${S.boot.today.split("-").reverse().join("-")}`)),
     h("div", { class: "qs-grid" },
       h("section", { class: "card anim-up d2" },
-        h("div", { class: "card-h" }, h("h2", null, "بيع سريع"), h("span", { class: "hint" }, "اختار الرغيف وعدده • البون بيتطبع مع الحفظ • Enter في آخر خانة = طباعة وحفظ")),
+        h("div", { class: "card-h" }, h("h2", null, "بيع سريع"), h("span", { class: "hint" }, "اختار الرغيف وعدده • «طباعة وحفظ» أو «حفظ» بس • Enter في آخر خانة = طباعة وحفظ")),
         h("div", { class: "qs-tiles" }, tiles.map((t) => t.el))),
       h("div", { class: "qs-side" },
         h("section", { class: "card anim-up d2 qs-cart" }, h("div", { class: "card-h" }, h("h2", null, "البون"), cntEl), h("div", { class: "qs-cart-in" }, linesEl,
           h("div", { class: "qs-total" }, h("span", null, "الإجمالي"), totalEl),
-          h("div", { class: "qs-foot" }, clearBtn, printBtn))),
-        h("section", { class: "card anim-up d3" }, h("div", { class: "card-h" }, h("h2", null, "بونات النهارده"), h("span", { class: "hint" }, "على «البوابة»")), sumEl, listBox))),
+          h("div", { class: "qs-foot" }, clearBtn, saveBtn, printBtn))))),
     mBar));
-  drawRecent(); calc();
+  calc();
   { const tb = $("#todaybar");                       // على الموبايل: شريط «طباعة وحفظ» فوق شريط النهارده الثابت
     if (tb && window.ResizeObserver) { const ro = new ResizeObserver(() => { if (!mBar.isConnected) return ro.disconnect();
       mBar.style.bottom = (getComputedStyle(tb).position === "fixed" ? tb.offsetHeight : 0) + "px"; }); ro.observe(tb); } }
@@ -2179,6 +2170,29 @@ async function renderProduction(box) {
   await load();
   if (S.prodEdit) { const id = S.prodEdit; S.prodEdit = null; await edit(id); } else (tin[0] || notes).focus();
 }
+/* سجل البوابة: بونات الكاشير */
+async function renderGateLog(box) {
+  const G = S.gateLog || (S.gateLog = { from: S.boot.today, to: S.boot.today });
+  const from = dateIn(G.from, "من"), to = dateIn(G.to, "إلى"), tblBox = h("div");
+  const T = selTable({ maxH: "calc(100vh - 330px)", empty: "مفيش بونات في الفترة دي",
+    cols: [{ h: "بون", num: true, fn: (r) => h("b", null, r.number) }, { h: "التاريخ", key: "date" }, { h: "الوقت", key: "time", cls: "hint" },
+      { h: "الأصناف", key: "items" }, { h: "الأرغفة", num: true, fn: (r) => fq(r.loaves) }, { h: "المبلغ", num: true, fn: (r) => h("b", null, fmt(r.net)) },
+      { h: "البون", fn: (r) => (r.printed ? h("span", { class: "pill" }, "اتطبع") : h("span", { class: "hint" }, "حفظ بس")) }],
+    onOpen: (r) => showInvoice(r.id),
+    totals: (rs, isSel) => [h("b", null, isSel ? "إجمالي المحدد" : "الإجمالي"), totItem("البونات", rs.length), totItem("الأرغفة", fq(rs.reduce((a, r) => a + r.loaves, 0))),
+      totItem("المبلغ", fmt(rs.reduce((a, r) => a + r.net, 0)), true)] });
+  tblBox.replaceChildren(T.el);
+  async function load() {
+    G.from = from.value; G.to = to.value || from.value;
+    let r; try { r = await api("gate_log", G.from, G.to); } catch (e) { return toast(e.message, "err"); }
+    T.setRows(r.rows); pinTotals();
+  }
+  [from, to].forEach((x) => x.addEventListener("change", load));
+  box.replaceChildren(h("div", { class: "page" },
+    h("section", { class: "card anim-up d1" }, h("div", { class: "form" }, h("label", { class: "fld" }, "من تاريخ", from), h("label", { class: "fld" }, "إلى تاريخ", to))),
+    h("section", { class: "card anim-up d2" }, h("div", { class: "card-h" }, h("h2", null, "بونات البوابة"), h("span", { class: "hint" }, "ضغطتين = تفاصيل البون")), tblBox)));
+  await load();
+}
 async function renderProdLog(box) {
   const L = S.prodLog || (S.prodLog = { from: S.boot.today, to: S.boot.today });
   const from = dateIn(L.from, "من"), to = dateIn(L.to, "إلى"), sheetBox = h("div"), totBox = h("div");
@@ -2946,7 +2960,7 @@ async function accessModal(u, setup) {
   const emp = h("select", { class: "in", "aria-label": "المندوب" }, h("option", { value: "" }, "— اختار المندوب —"), setup.reps.map((r) => h("option", { value: r.id }, r.name)));
   emp.value = u && u.emp_id ? String(u.emp_id) : "";
   const fEmp = h("label", { class: "fld" }, "المندوب (من الموظفين)", emp);
-  const groups = [["الرئيسية", ["home"]], ["الفواتير", ["inv:مبيعات", "inv:مشتريات", "inv:مرتجع مبيعات", "inv:مرتجع مشتريات", "log"]], ["السندات", ["vch:new", "vch:log"]],
+  const groups = [["الرئيسية", ["home"]], ["الفواتير", ["inv:مبيعات", "inv:مشتريات", "inv:مرتجع مبيعات", "inv:مرتجع مشتريات", "gate:log", "log"]], ["السندات", ["vch:new", "vch:log"]],
     ["العملاء والموردون", ["par:list"]], ["الإنتاج", ["prd:new", "prd:log", "rep:production"]], ["الأصناف والمخزون", ["itm:list", "itm:stock", "itm:sales", "itm:buys", "itm:damaged", "smp:items", "smp:out", "smp:in"]],
     ["الموظفون", ["emp:list", "emp:att", "emp:attlog"]], ["الحسابات", ["acc:statement", "acc:balances", "acc:cash", "acc:subcash"]],
     ["التقارير", ["rep:daily", "rep:log"]], ["الإعدادات", ["set:main"]]];
