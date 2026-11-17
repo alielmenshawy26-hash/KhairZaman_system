@@ -838,6 +838,7 @@ def init_db():
             for n in ("شيال", "أجور", "جاز", "إيجار عربية", "كهربا"):
                 c.execute("INSERT OR IGNORE INTO expense_cats(name) VALUES(?)", (n,))
         c.execute("INSERT OR IGNORE INTO expense_cats(name) VALUES('مصروفات أخرى')")
+        init_production(c)
         c.execute("UPDATE settings SET company=?, tagline=? WHERE id=1", (LICENSED_COMPANY, LICENSED_TAGLINE))   # الاسم ثابت حتى لو اتعدّل في قاعدة البيانات
     migrate_daily_numbering()
     with db() as c:
@@ -1219,7 +1220,7 @@ def import_plan(what, path, asof):
     in_file = {p["id"] for p in plan if p["id"] is not None}
     with db() as c:
         if what == "items":
-            others = c.execute("SELECT id,name,(SELECT COUNT(*) FROM invoice_lines WHERE item_id=items.id)+(SELECT COUNT(*) FROM damaged WHERE item_id=items.id) used FROM items").fetchall()
+            others = c.execute("SELECT id,name,(SELECT COUNT(*) FROM invoice_lines WHERE item_id=items.id)+(SELECT COUNT(*) FROM damaged WHERE item_id=items.id)+(SELECT COUNT(*) FROM production_lines WHERE item_id=items.id)+(SELECT COUNT(*) FROM production WHERE flour_item_id=items.id)+(SELECT COUNT(*) FROM bread_sizes WHERE item_id=items.id) used FROM items").fetchall()
         else:
             others = c.execute("SELECT id,name,(SELECT COUNT(*) FROM invoices WHERE party_id=parties.id)+(SELECT COUNT(*) FROM payments WHERE party_id=parties.id) used FROM parties").fetchall()
     others = [r for r in others if r["id"] not in in_file and not (sp and r["id"] in sp["drop"])]
@@ -1661,9 +1662,64 @@ def _avgcost_bulk(c, upto):
 # مثال: اشتريت 100 بـ1000 وبعت 80 (تكلفتهم 1000)، اشتريت 100 بـ1020 وبعت 80 → 20 بـ1000 + 60 بـ1020.
 _FIFO = {"sig": None, "res": None}
 
+# ======================================================================
+# الإنتاج (مخبز خير زمان): كل شيكارة دقيق ← طاولات من كل مقاس عيش
+#   الشيكارة بتتخصم من مخزون الدقيق، والأرغفة بتدخل مخزون العيش، وبيع العيش بيخصم منه (فواتير المبيعات العادية).
+# ======================================================================
+CAT_FLOUR, CAT_BREAD, CAT_SUPPLY = "دقيق", "عيش", "مستلزمات"
+ITEM_CATS = (CAT_FLOUR, CAT_BREAD, CAT_SUPPLY)
+# المقاسات الافتراضية: (الاسم، أرغفة في الطاولة، سعر الرغيف)
+DEFAULT_BREAD_SIZES = (("صغير", 20, 1.5), ("كبير", 12, 2.5), ("وسط", 15, 2.0), ("ساندوتش", 18, 1.75), ("حبة كاملة", 15, 2.5))
+# حركات المخزون من الإنتاج: الدقيق خارج (بالسالب) والعيش داخل
+PROD_MOVES_SQL = ("SELECT p.p_date m_date, p.flour_item_id item_id, -COALESCE(p.flour_qty,1) qty FROM production p WHERE p.flour_item_id IS NOT NULL "
+                  "UNION ALL SELECT p.p_date m_date, l.item_id item_id, l.loaves qty FROM production_lines l JOIN production p ON p.id=l.production_id WHERE l.item_id IS NOT NULL")
+
+def item_cat_guess(name):
+    n = name or ""
+    if "دقيق" in n: return CAT_FLOUR
+    if "عيش" in n or "خبز" in n: return CAT_BREAD
+    return CAT_SUPPLY
+
+def init_production(c):
+    c.execute("""CREATE TABLE IF NOT EXISTS bread_sizes(id INTEGER PRIMARY KEY, name TEXT NOT NULL, per_table REAL NOT NULL DEFAULT 0, price REAL NOT NULL DEFAULT 0,
+                 item_id INTEGER, sort INTEGER DEFAULT 0, active INTEGER DEFAULT 1)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS production(id INTEGER PRIMARY KEY, p_date TEXT NOT NULL, created_at TEXT, sack_no INTEGER NOT NULL DEFAULT 1,
+                 flour_item_id INTEGER, flour_qty REAL DEFAULT 1, notes TEXT DEFAULT '', username TEXT DEFAULT '')""")
+    c.execute("""CREATE TABLE IF NOT EXISTS production_lines(id INTEGER PRIMARY KEY, production_id INTEGER NOT NULL, size_id INTEGER, size_name TEXT NOT NULL,
+                 item_id INTEGER, tables REAL NOT NULL DEFAULT 0, per_table REAL NOT NULL DEFAULT 0, price REAL NOT NULL DEFAULT 0, loaves REAL NOT NULL DEFAULT 0)""")
+    for name, sql in (("ix_prod_date", "production(p_date)"), ("ix_prodl_prod", "production_lines(production_id)"), ("ix_prodl_item", "production_lines(item_id)")):
+        c.execute(f"CREATE INDEX IF NOT EXISTS {name} ON {sql}")
+    if add_col(c, "items", "category", "TEXT DEFAULT ''"):
+        for r in c.execute("SELECT id, name FROM items").fetchall():
+            c.execute("UPDATE items SET category=? WHERE id=?", (item_cat_guess(r[1]), r[0]))
+    # صنف الدقيق (لو مفيش)
+    if not c.execute("SELECT 1 FROM items WHERE category=?", (CAT_FLOUR,)).fetchone():
+        c.execute("INSERT INTO items(name,unit,buy_price,sell_price,category) VALUES(?,?,?,?,?)", ("دقيق", "شيكارة", 0, 0, CAT_FLOUR))
+    # مقاسات العيش: كل مقاس ليه صنف في المخزن (الوحدة رغيف) علشان يتباع في فواتير المبيعات
+    if not c.execute("SELECT COUNT(*) FROM bread_sizes").fetchone()[0]:
+        for i, (nm, per, price) in enumerate(DEFAULT_BREAD_SIZES):
+            c.execute("INSERT INTO bread_sizes(name,per_table,price,sort) VALUES(?,?,?,?)", (nm, per, price, i + 1))
+    for r in c.execute("SELECT id, name, price, item_id FROM bread_sizes").fetchall():
+        if r[3] and c.execute("SELECT 1 FROM items WHERE id=?", (r[3],)).fetchone(): continue
+        iname = "عيش " + r[1]
+        ex = c.execute("SELECT id FROM items WHERE name=?", (iname,)).fetchone()
+        iid = ex[0] if ex else c.execute("INSERT INTO items(name,unit,buy_price,sell_price,category) VALUES(?,?,?,?,?)", (iname, "رغيف", 0, float(r[2] or 0), CAT_BREAD)).lastrowid
+        c.execute("UPDATE items SET category=? WHERE id=?", (CAT_BREAD, iid))
+        c.execute("UPDATE bread_sizes SET item_id=? WHERE id=?", (iid, r[0]))
+
+def bread_sizes(c, active_only=True):
+    return [dict(id=r["id"], name=r["name"], per_table=float(r["per_table"] or 0), price=float(r["price"] or 0), item_id=r["item_id"], active=int(r["active"] or 0))
+            for r in c.execute("SELECT * FROM bread_sizes" + (" WHERE COALESCE(active,1)=1" if active_only else "") + " ORDER BY sort, id").fetchall()]
+
+def prod_used(c, item_id):
+    """عدد مرات استخدام الصنف في الإنتاج (دقيق أو عيش) — علشان مايتحذفش."""
+    return c.execute("SELECT (SELECT COUNT(*) FROM production WHERE flour_item_id=?)+(SELECT COUNT(*) FROM production_lines WHERE item_id=?)+(SELECT COUNT(*) FROM bread_sizes WHERE item_id=?)",
+                     (item_id, item_id, item_id)).fetchone()[0]
+
 def _fifo_sig(c):
     r = c.execute("SELECT (SELECT COUNT(*) FROM invoice_lines), (SELECT COALESCE(MAX(id),0) FROM invoice_lines), (SELECT COALESCE(SUM(qty*price),0) FROM invoice_lines), "
                   "(SELECT COUNT(*) FROM damaged), (SELECT COALESCE(SUM(qty),0) FROM damaged), "
+                  "(SELECT COUNT(*) FROM production), (SELECT COALESCE(MAX(id),0) FROM production), (SELECT COALESCE(SUM(loaves*(1+price)),0) FROM production_lines), (SELECT COALESCE(SUM(COALESCE(flour_qty,1)*(1+COALESCE(flour_item_id,0))),0) FROM production), "
                   "(SELECT COALESCE(SUM(COALESCE(opening_qty,0)*(1+COALESCE(buy_price,0))),0) FROM items), (SELECT COALESCE(MAX(id),0) FROM audit_log), (SELECT COUNT(*) FROM items)").fetchone()
     return (DB_CFG.get("mode"), DB_CFG.get("host"), DB_CFG.get("dbname"), DB_PATH) + tuple(float(x or 0) for x in r)
 
@@ -1685,8 +1741,14 @@ def fifo_engine(c):
         ev.append((r[6] or "", r[7] or "", rank, r[8], r[0], "L", r[1], float(r[2] or 0), float(r[3] or 0), r[4], r[5]))
     for r in c.execute("SELECT id, item_id, qty, d_date, COALESCE(created_at,'') FROM damaged").fetchall():
         ev.append((r[3] or "", r[4] or "", 3, 0, r[0], "D", r[1], float(r[2] or 0), 0.0, 0, "هالك"))
+    # الإنتاج: حدث واحد لكل شيكارة (الدقيق بيطلع والعيش بيدخل بتكلفة الدقيق موزعة على قيمة الأرغفة)
+    plines = {}
+    for r in c.execute("SELECT production_id, item_id, loaves, price FROM production_lines WHERE item_id IS NOT NULL").fetchall():
+        plines.setdefault(r[0], []).append((r[1], float(r[2] or 0), float(r[3] or 0)))
+    for r in c.execute("SELECT id, p_date, COALESCE(created_at,''), flour_item_id, COALESCE(flour_qty,1) FROM production").fetchall():
+        ev.append((r[1] or "", r[2] or "", 1, 0, r[0], "P", r[3], float(r[4] or 0), 0.0, 0, plines.get(r[0], [])))
     ev.sort(key=lambda e: e[:5])
-    line, dmg, snap = {}, {}, None
+    line, dmg, prod, snap = {}, {}, {}, None
     deficit = {}   # كمية اتباعت والرصيد صفر (بالسالب): أول بضاعة تدخل بعد كده بتغطيها الأول
 
     def put(iid, q, price, front=False):
@@ -1714,6 +1776,16 @@ def fifo_engine(c):
     for e in ev:
         d, _, _, _, rid, typ, iid, q, price, damaged, kind = e
         if snap is None and d > today: snap = {k: [list(x) for x in v] for k, v in layers.items()}
+        if typ == "P":                                                    # شيكارة إنتاج
+            cost = take(iid, q) if (iid and q > 1e-9) else 0.0
+            prod[rid] = cost
+            tot_v = sum(lq * lp for _, lq, lp in kind); tot_q = sum(lq for _, lq, _ in kind)
+            for bid, lq, lp in kind:
+                if lq <= 1e-9: continue
+                share = (lq * lp / tot_v) if tot_v > 1e-9 else (lq / tot_q if tot_q > 1e-9 else 0)
+                u = cost * share / lq
+                put(bid, lq, u); last_in[bid] = u
+            continue
         if q <= 0: continue
         L = layers.setdefault(iid, deque())
         if typ == "D":
@@ -1735,7 +1807,7 @@ def fifo_engine(c):
             u = last_out.get(iid, L[0][1] if L else last_in.get(iid, 0.0)); line[rid] = u
             if not damaged: put(iid, q, u, front=True)
     if snap is None: snap = {k: [list(x) for x in v] for k, v in layers.items()}
-    res = {"line": line, "dmg": dmg, "today": snap, "last_in": last_in}
+    res = {"line": line, "dmg": dmg, "prod": prod, "today": snap, "last_in": last_in}
     _FIFO["sig"], _FIFO["res"] = sig, res
     return res
 
@@ -1791,8 +1863,10 @@ def stock_of(c, item_id, upto="today"):
     inv = c.execute(f"SELECT COALESCE(SUM({STOCK_CASE}),0) FROM invoice_lines l JOIN invoices i ON i.id=l.invoice_id WHERE l.item_id=?{cond}", args).fetchone()[0]
     dcond = " AND d_date<=?" if upto else ""
     dmg = c.execute(f"SELECT COALESCE(SUM(qty),0) FROM damaged WHERE item_id=?{dcond}", args).fetchone()[0]
+    pcond = " AND m_date<=?" if upto else ""
+    prd = c.execute(f"SELECT COALESCE(SUM(qty),0) FROM ({PROD_MOVES_SQL}) pm WHERE item_id=?{pcond}", args).fetchone()[0]
     op = c.execute("SELECT COALESCE(opening_qty,0) FROM items WHERE id=?", (item_id,)).fetchone()
-    return (float(op[0]) if op else 0.0) + inv - dmg
+    return (float(op[0]) if op else 0.0) + inv - dmg + float(prd or 0)
 
 def reserved_of(c, item_id):
     """كميات في فواتير استحقاقها بعد اليوم (صادر − وارد)."""
@@ -6025,7 +6099,7 @@ class App(tk.Tk):
             inv_val = fifo_stock_value(c)
         recv = sum(d[3] for d in data if d[3] > 0); pay = -sum(d[3] for d in data if d[3] < 0)
         cards = tk.Frame(self.body, bg=BG); cards.pack(fill="x", pady=(0, 8))
-        for title, val, color in [("على العملاء (لنا)", recv, "#1c7c4d"), ("علينا للموردين", pay, "#b91c1c"), ("الخزنة", cash, NAVY),
+        for title, val, color in [("خوارج", recv, "#1c7c4d"), ("علينا للموردين", pay, "#b91c1c"), ("الخزنة", cash, NAVY),
                                   ("صافي الأملاك (خزنة + مخزون بسعر الشراء + عملاء − موردين)", cash + inv_val + recv - pay, "#6d28d9"), ("قيمة المخزون (بسعر الشراء)", inv_val, "#b45309")] + \
                                  [("قيمة المخزون (بسعر البيع)", sale_val, "#0f766e")]:
             light = "#%02x%02x%02x" % tuple(int(int(color[i:i + 2], 16) * 0.10 + 255 * 0.90) for i in (1, 3, 5))
@@ -6071,7 +6145,7 @@ class App(tk.Tk):
                        f"<td>{fmt(-d[3]) if d[3] < -0.005 else ''}</td><td>{d[4] or ''}</td><td>{d[5] or ''}</td><td>{d[6] or ''}</td></tr>" for n, d in enumerate(rows, 1))
         cards = "" if (q or only_sel) else (
             "<div class='cards'>" + "".join(f"<div><b>{t}</b><span>{fmt(v)}</span></div>" for t, v in (
-                ("على العملاء (لنا)", tot["recv"]), ("علينا للموردين", tot["pay"]), ("الخزنة", tot["cash"]), ("قيمة المخزون (بسعر الشراء)", tot["inv"]),
+                ("خوارج", tot["recv"]), ("علينا للموردين", tot["pay"]), ("الخزنة", tot["cash"]), ("قيمة المخزون (بسعر الشراء)", tot["inv"]),
                 ("صافي الأملاك", tot["cash"] + tot["inv"] + tot["recv"] - tot["pay"]))) + "</div>")
         sub = f"بتاريخ {date.today().isoformat()}" + (f"  •  بحث: {esc(q)}" if q else "") + ("  •  الحسابات المحددة بس" if only_sel else "")
         html = f"""<!doctype html><html lang="ar" dir="rtl"><meta charset="utf-8"><title>أرصدة الحسابات</title><style>
@@ -7899,6 +7973,8 @@ def stock_map(c, upto=None):
         if r[0] in st: st[r[0]] += float(r[1])
     for r in c.execute("SELECT item_id, COALESCE(SUM(qty),0) FROM damaged WHERE d_date<=? GROUP BY item_id", (upto,)).fetchall():
         if r[0] in st: st[r[0]] -= float(r[1])
+    for r in c.execute(f"SELECT item_id, COALESCE(SUM(qty),0) FROM ({PROD_MOVES_SQL}) pm WHERE m_date<=? GROUP BY item_id", (upto,)).fetchall():
+        if r[0] in st: st[r[0]] += float(r[1])
     return st
 
 def low_stock_items(c):
