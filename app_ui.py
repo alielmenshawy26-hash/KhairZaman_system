@@ -2,8 +2,8 @@
 """
 مخبز خير زمان — البرنامج (نسخة من سيستم زلط).
 نفس قاعدة البيانات ونفس الحسابات بتاعة Warehouse_app.py — الشكل بس اللي جديد (HTML/CSS/JS جوه نافذة WebView2).
-التشغيل:  python zalat_ui.py            → نافذة البرنامج
-          python zalat_ui.py --serve 8765 → للتجربة من المتصفح (http://127.0.0.1:8765)
+التشغيل:  python app_ui.py            → نافذة البرنامج
+          python app_ui.py --serve 8765 → للتجربة من المتصفح (http://127.0.0.1:8765)
 """
 import os, sys, json, threading, traceback, subprocess, time
 from datetime import date, timedelta
@@ -101,7 +101,7 @@ DRAWER = "درج"
 
 def owners_list(c):
     r = c.execute("SELECT COALESCE(owners_list,'') FROM settings WHERE id=1").fetchone()
-    raw = (r[0] if r else "") or "الحج محمود،الحج حسين"
+    raw = (r[0] if r else "") or "المالك"
     return [x.strip() for x in raw.replace(",", "،").split("،") if x.strip()]
 
 
@@ -2490,7 +2490,7 @@ class Api:
         with W.db() as c:
             st = c.execute("SELECT * FROM settings WHERE id=1").fetchone()
             g = lambda k: (st[k] if k in st.keys() else "") or ""
-            return {"company": g("company") or W.DEFAULT_COMPANY, "tagline": g("tagline"), "english": g("english"), "address": g("address"), "phone": g("phone"), "taxno": g("taxno"), "owners_list": g("owners_list") or "الحج محمود،الحج حسين",
+            return {"company": g("company") or W.DEFAULT_COMPANY, "tagline": g("tagline"), "english": g("english"), "address": g("address"), "phone": g("phone"), "taxno": g("taxno"), "owners_list": g("owners_list") or "المالك",
                     "trust_from": g("trust_from"), "trust_to": g("trust_to"), "trust_to_addr": g("trust_to_addr"),
                     "lock_until": g("lock_until"), "lock_auto": bool(st["lock_auto"]) if "lock_auto" in st.keys() else False, "lock_now": W.lock_date(c),
                     "backup_dir": W.backup_dir(), "server": W.server_label(), "version": W.version_text(), "owner": W.is_owner(),
@@ -3192,7 +3192,7 @@ def make_handler(dev=False):
 
         def do_GET(self):
             if self.path.split("?")[0] == "/web.js":          # علامة إن ده الموقع (مش البرنامج على الجهاز)
-                b = b"window.ZALAT_WEB=1;"
+                b = b"window.KZ_WEB=1;"
                 self.send_response(200); self.send_header("Content-Type", "application/javascript"); self.send_header("Cache-Control", "no-store")
                 self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b); return
             if self.path.split("?")[0] in ("/", ""): self.path = "/index.html"

@@ -649,9 +649,14 @@ def import_sqlite_to_pg(sqlite_path, progress=None):
         pg.close(); s.close()
     return report
 
+# الأصناف اللي المستخدم ضافها بنفسه (من غير الدقيق والعيش اللي البرنامج بيعملهم أول مرة)
+SEED_FREE_ITEMS_SQL = ("SELECT COUNT(*) FROM items WHERE id NOT IN (SELECT item_id FROM bread_sizes WHERE item_id IS NOT NULL) "
+                       "AND NOT (name='دقيق' AND COALESCE(code,'')='' AND COALESCE(opening_qty,0)=0)")
+
 def pg_is_empty():
     with db() as c:
-        n = sum(c.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] for t in ("invoices", "items", "parties", "payments", "employees"))
+        n = sum(c.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] for t in ("invoices", "parties", "payments", "employees", "production", "users"))
+        n += c.execute(SEED_FREE_ITEMS_SQL).fetchone()[0]       # أصناف الدقيق والعيش اللي البرنامج بيعملها لوحده مش بتتحسب داتا
     return n == 0
 
 def now_ts():
@@ -816,7 +821,7 @@ def init_db():
         add_col(c, "payments", "holder", "TEXT DEFAULT ''")
         add_col(c, "payments", "method", "TEXT DEFAULT ''")
         add_col(c, "rep_requests", "method", "TEXT DEFAULT ''")
-        add_col(c, "settings", "owners_list", "TEXT DEFAULT 'الحج محمود،الحج حسين'")
+        add_col(c, "settings", "owners_list", "TEXT DEFAULT 'المالك'")
         add_col(c, "parties", "asset_type", "TEXT DEFAULT ''")   # حسابات الأصول: «مسحوبات مالك» أو «أصل» (تريسكل، كمبيوتر ...)
         add_col(c, "parties", "resale", "REAL DEFAULT 0")        # الأصل: يتباع بكام لو الشركة اتصفّت
         c.execute("""CREATE TABLE IF NOT EXISTS cash_transfers(id INTEGER PRIMARY KEY, t_date TEXT NOT NULL, created_at TEXT, by_user TEXT DEFAULT '',
@@ -8791,7 +8796,11 @@ def _local_data_counts(path=None):
         con = sqlite3.connect(path)
         try:
             names = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-            return {t: (con.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] if t in names else 0) for t in ("invoices", "items", "parties", "users")}
+            out = {t: (con.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] if t in names else 0) for t in ("invoices", "items", "parties", "users")}
+            if "bread_sizes" in names and "items" in names:
+                try: out["items"] = con.execute(SEED_FREE_ITEMS_SQL).fetchone()[0]     # من غير الأصناف اللي البرنامج عملها لوحده
+                except Exception: pass
+            return out
         finally: con.close()
     except Exception: return None
 

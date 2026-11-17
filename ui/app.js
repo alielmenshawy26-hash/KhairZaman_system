@@ -5,7 +5,7 @@
 function pyReady() {
   return new Promise((res) => {
     if (window.pywebview && window.pywebview.api) return res(true);
-    if (window.ZALAT_WEB) return res(false);                                   // الموقع (من المتصفح أو الموبايل)
+    if (window.KZ_WEB) return res(false);                                   // الموقع (من المتصفح أو الموبايل)
     // البرنامج على الجهاز كمان بيفتح من http://127.0.0.1 (سيرفر pywebview) — فنستنى الـ api بدل ما نفتكره موقع
     window.addEventListener("pywebviewready", () => res(true), { once: true });
     const t0 = Date.now(), poll = setInterval(() => {
@@ -769,7 +769,7 @@ async function cashCountModal() {
         h("button", { class: "btn ghost icon-btn", type: "button", "aria-label": "حذف التحويل", onclick: async () => {
           if (!(await confirmBox(`تمسح تحويل ${fmt(t.amount)} من «${t.from_who}» لـ «${t.to_who}»؟`))) return;
           try { await api("cash_transfer_delete", t.id); closeModals(); cashCountModal(); } catch (e) { alertBox(e.message); } } }, icon("x", 16)))))
-        : h("div", { class: "hint" }, "مفيش — مثلًا: سحبت من فودافون كاش بتاع مصطفى للدرج، أو الحج حسين خد من الدرج للبيت")),
+        : h("div", { class: "hint" }, "مفيش — مثلًا: سحبت من فودافون كاش بتاع مصطفى للدرج، أو المالك خد من الدرج للبيت")),
     h("label", { class: "fld" }, "ملاحظات", h("input", { class: "in", id: "cc-notes" })), sumEl,
     st.last ? h("div", { class: "hint" }, `آخر جرد: ${st.last.date} ${st.last.at ? st.last.at.slice(11, 16) : ""}`) : null);
   st.lines.forEach((l) => addRow(l.group, l)); if (!rows.rep.length) addRow("rep"); recalc();
@@ -798,7 +798,7 @@ async function cashTransferModal(st) {
       h("label", { class: "fld" }, "من", fw), h("label", { class: "fld" }, "طريقة (من)", fm),
       h("label", { class: "fld" }, "إلى", tw), h("label", { class: "fld" }, "طريقة (إلى)", tm),
       h("label", { class: "fld" }, "المبلغ", amt), h("label", { class: "fld" }, "ملاحظات", notes),
-      h("div", { class: "hint span2" }, "أمثلة: من «مصطفى — فودافون كاش» إلى «الدرج» لما تسحب فلوسه • من «الدرج» إلى «الحج حسين — كاش» لما ياخد فلوس للبيت")),
+      h("div", { class: "hint span2" }, "أمثلة: من «مصطفى — فودافون كاش» إلى «الدرج» لما تسحب فلوسه • من «الدرج» إلى «المالك — كاش» لما ياخد فلوس للبيت")),
     actions: [{ label: "حفظ التحويل", cls: "primary", icon: "save", value: async () => {
       try { await api("cash_transfer_add", { from_who: fw.value, from_method: fm.value, to_who: tw.value, to_method: tm.value, amount: amt.value, notes: notes.value }); return true; }
       catch (e) { alertBox(e.message); return false; } } }, { label: "إلغاء", value: () => null }] });
