@@ -751,10 +751,11 @@ async function renderCashier(box) {
   }
   enterChain(tiles.map((t) => t.inp), () => doSale(true));
   box.replaceChildren(h("div", { class: "home qs-home" },
-    h("section", { class: "qs-hero anim-up d1" }, h("img", { src: S.boot.logo, alt: "" }), h("b", null, S.boot.company),
-      h("span", { class: "qs-date" }, `${day}  ${S.boot.today.split("-").reverse().join("-")}`)),
+    h("section", { class: "hero anim-up d1" },                        // زي زلط: اسم الفرن واللوجو فوق (ثلث)، والكاشير تحت (ثلثين)
+      h("div", { class: "hero-in" }, h("img", { src: S.boot.logo, alt: "" }), h("div", { class: "hero-t" }, h("b", null, S.boot.company))),
+      h("div", { class: "hero-date" }, `${day}  ${S.boot.today.split("-").reverse().join("-")}`)),
     h("div", { class: "qs-grid" },
-      h("section", { class: "card anim-up d2" },
+      h("section", { class: "card anim-up d2 qs-sell" },
         h("div", { class: "card-h" }, h("h2", null, "بيع سريع"), h("span", { class: "hint" }, "اختار الرغيف وعدده • «طباعة وحفظ» أو «حفظ» بس • Enter في آخر خانة = طباعة وحفظ")),
         h("div", { class: "qs-tiles" }, tiles.map((t) => t.el))),
       h("div", { class: "qs-side" },

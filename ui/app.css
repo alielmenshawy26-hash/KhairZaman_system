@@ -521,8 +521,16 @@ html.standalone .shell{background:var(--ground);min-height:100dvh}
 .in:disabled{background:#f3ece0;color:var(--muted);cursor:not-allowed}
 
 /* ===== البيع السريع (الكاشير) ===== */
-.qs-home{height:auto;min-height:calc(100vh - 100px)}
-.qs-home>.qs-grid{margin:auto;width:100%;max-width:1180px}           /* الكاشير في نص الشاشة (طول وعرض) */
+.qs-home{height:calc(100vh - 100px);min-height:600px}
+.qs-home>.hero{flex:1 1 0;min-height:150px}
+.qs-home .hero-in{gap:clamp(18px,3vw,40px)}
+.qs-home .hero-in img{width:auto;height:clamp(90px,19vh,220px)}
+.qs-home .hero-t b{font-size:clamp(40px,min(6vw,9vh),92px)}
+.qs-home>.qs-grid{flex:2 1 0;min-height:0;align-items:stretch}             /* الكاشير ثلثين الشاشة */
+.qs-sell,.qs-cart{display:flex;flex-direction:column;min-height:0;overflow:auto}
+.qs-sell .qs-tiles{flex:1;align-content:center}
+.qs-side>.qs-cart{flex:1}
+.qs-cart .qs-cart-in{flex:1;display:flex;flex-direction:column;justify-content:center}
 .qs-home .card:focus-within{z-index:1}
 .qs-hero{display:flex;align-items:center;gap:16px;padding:10px 18px;border-radius:16px;background:linear-gradient(160deg,#fff 0%,#faf6ef 55%,#f5eddd 100%);border:1px solid var(--line)}
 .qs-hero img{width:56px;height:56px;object-fit:contain;background:#fff;border-radius:12px;padding:3px;border:2px solid #e8decb}
@@ -562,7 +570,8 @@ html.standalone .shell{background:var(--ground);min-height:100dvh}
 .btn.sm{min-height:30px;padding:2px 8px}
 .qs-mbar{display:none}
 @media (max-width:900px){
-  .qs-home{min-height:0}.qs-home>.qs-grid{margin:0}
+  .qs-home{height:auto;min-height:0}.qs-home>.hero{flex:none;min-height:0;padding:8px 0}.qs-home>.qs-grid{flex:none}
+  .qs-home .hero-in{flex-direction:row;padding:8px}.qs-home .hero-in img{height:64px;padding:4px}.qs-home .hero-t b{font-size:30px}.qs-home .hero-date{margin:0 0 4px}
   .qs-grid{grid-template-columns:1fr}
   .qs-hero b{font-size:20px}.qs-hero img{width:42px;height:42px}.qs-date{font-size:13px}
   .qs-tiles{grid-template-columns:repeat(2,minmax(0,1fr));padding:6px 10px 10px;gap:8px}
