@@ -3547,6 +3547,7 @@ def main():
         import webview
         win = webview.create_window("مخبز خير زمان", os.path.join(UI_DIR, "index.html"), js_api=Bridge(), width=1366, height=840,
                                     min_size=(1000, 640), background_color="#eef2f7", text_select=True)
+        W.UI_PRINT = lambda html: win.evaluate_js("printHtml(%s, true)" % json.dumps(html))   # طباعة احتياطية من جوه الشباك
         def _on_closing():                     # آخر تغييرات قبل ما البرنامج يتقفل → على الدرايف
             try: W.cloud_backup()
             except Exception: pass

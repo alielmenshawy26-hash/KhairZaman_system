@@ -932,6 +932,15 @@ def _pdf_workdir():
     return _long_path(tempfile.mkdtemp(prefix="whpdf"))
 
 _PDF_OK_EXE = None
+UI_PRINT = None          # البرنامج الجديد بيحط هنا دالة بتطبع الصفحة من جوه شباك البرنامج (لو الـ PDF أو SumatraPDF مانفعوش)
+
+def _fallback_print(path):
+    """بدل ما نفتح الفاتورة في المتصفح (وماتتطبعش): نطبعها من شباك البرنامج نفسه (شاشة الطباعة على طول)."""
+    if UI_PRINT:
+        try:
+            with open(path, encoding="utf-8") as f: UI_PRINT(f.read()); return "ui"
+        except Exception as e: write_error_log("print ui: " + repr(e))
+    open_file(path); return "html"
 
 def _kill_tree(pr):
     """بيقفل المتصفح وكل اللي فتحه (لو فتح شباك ظاهر)."""
@@ -965,7 +974,8 @@ def html_to_pdf(html_path, pdf_path):
             prof = os.path.join(work, "prof_" + ("edge" if "edge" in exe.lower() else "chrome"))   # بروفايل ثابت لكل متصفح (أسرع وميطلعش رسايل)
             # «--headless» الأول: بيشتغل على النسخ القديمة والجديدة. «--headless=new» على كروم قديم كان بيفتح شباك عادي
             # فيه الصفحة (الفاتورتين تحت بعض) ويفضل مستني لحد ما تقفله — وده اللي كان بيظهر قبل الفاتورة السليمة
-            for mode in ("--headless", "--headless=new"):
+            # لو البروفايل الثابت مقفول (متصفح معلّق من طباعة قبلها) بنجرب ببروفايل جديد
+            for mode, prof in (("--headless", prof), ("--headless=new", prof), ("--headless", prof + "_" + tag)):
                 try:
                     if os.path.exists(out): os.remove(out)
                     args = [exe, mode, "--disable-gpu", "--no-first-run", "--no-default-browser-check", "--disable-extensions",
@@ -1035,10 +1045,10 @@ def print_page(html_path, on_done=None):
                 if sp:
                     subprocess.Popen([sp, "-print-dialog", "-exit-when-done", "-appdata", PRINT_DIR, pdf],
                                      creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)); how = "dialog"
-                else: open_file(pdf); how = "pdf"
-            else: open_file(html_path)
+                else: write_error_log("print: SumatraPDF مش موجود"); how = _fallback_print(html_path)
+            else: how = _fallback_print(html_path)
         except Exception as e:
-            write_error_log("print: " + repr(e)); open_file(html_path)
+            write_error_log("print: " + repr(e)); how = _fallback_print(html_path)
         if on_done:
             try: on_done(how)
             except Exception: pass

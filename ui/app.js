@@ -40,7 +40,15 @@ async function api(name, ...args) {
   if (/^(save_invoice|save_voucher|req_decide|rep_checkin)$/.test(name) && S.me && !S.me.rep) setTimeout(loadReqCount, 200);
   return r ? r.result : null;
 }
-function printHtml(html) {                     // من الموقع: الطباعة من المتصفح نفسه
+function printHtml(html, inApp) {              // من الموقع (أو احتياطي من البرنامج): شاشة الطباعة على طول من غير ما الفاتورة تتفتح في صفحة
+  if (inApp || !isPhone()) {                   // كمبيوتر: إطار مخفي → شاشة الطباعة بس
+    const old = document.getElementById("print-frame"); if (old) old.remove();
+    const f = h("iframe", { id: "print-frame", "aria-hidden": "true", style: { position: "fixed", width: "0", height: "0", border: "0", left: "-9999px", bottom: "0" } });
+    f.srcdoc = html;                           // قبل ما يتحط في الصفحة (وإلا onload بيشتغل مرتين وتطلع شاشتين طباعة)
+    f.onload = () => setTimeout(() => { try { f.contentWindow.focus(); f.contentWindow.print(); } catch (e) { toast("الطباعة مانفعتش: " + e.message, "err"); } }, 250);
+    document.body.appendChild(f);
+    return;
+  }
   const w = window.open("", "_blank");
   if (!w) return toast("المتصفح منع فتح صفحة الطباعة — اسمح بالنوافذ المنبثقة", "err", 5000);
   w.document.open(); w.document.write(html); w.document.close();
