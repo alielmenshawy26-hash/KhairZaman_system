@@ -398,6 +398,12 @@ class Api:
         if not who: raise UIError("كلمة سر المالك غير صحيحة")
         return who
 
+    def verify_neg(self, password):
+        """فاتورة من غير رصيد صنف: باسوورد المحاسب أو المالك."""
+        who = W.verify_day_password(password)
+        if not who: raise UIError("باسوورد المحاسب أو المالك غير صحيح")
+        return who
+
     def save_invoice(self, p, credit_pw=None, neg_pw=None, do_print=False):
         """p = {kind, party_id, number, date, due, discount, paid, pay_type, notes, rep_id, lines:[{item_id,name,unit,qty,price,damaged}]}"""
         self._need_login()
@@ -428,8 +434,8 @@ class Api:
             if not override: return {"ok": False, "error": "كلمة سر المالك غير صحيحة", "need": "credit"}
         neg_who = None
         if neg_pw:
-            neg_who = W.verify_owner_password(neg_pw)
-            if not neg_who: return {"ok": False, "error": "كلمة سر المالك غير صحيحة", "need": "neg"}
+            neg_who = W.verify_day_password(neg_pw)          # المحاسب أو المالك
+            if not neg_who: return {"ok": False, "error": "باسوورد المحاسب أو المالك غير صحيح", "need": "neg"}
         try:
             W._TLS.allow_neg = neg_who
             inv_id, number = W.persist_invoice(d, override=override, auto_no=(not p.get("edit_id")) and (p.get("auto_no", True) or not str(p.get("number") or "").strip()))
@@ -437,13 +443,15 @@ class Api:
             return {"ok": False, "need": "credit", "error": f"العميل «{e.name}» هيعدّي الحد الائتماني.\nالحد: {W.fmt(e.limit)} — الرصيد بعد الفاتورة: {W.fmt(e.after)}\n"
                                                             f"الزيادة عن الحد: {W.fmt(e.after - e.limit)}"}
         except W.NegativeStock as e:
-            return {"ok": False, "need": "neg", "error": str(e) + "\nالرصيد هيبقى بالسالب — مسموح بس بكلمة سر المالك."}
+            return {"ok": False, "need": "neg", "error": str(e) + "\nالرصيد هيبقى بالسالب — مسموح بباسوورد المحاسب أو المالك."}
         except W.DBIntegrityError:
             return {"ok": False, "error": "رقم الفاتورة ده موجود بالفعل في نفس اليوم؛ غيّر الرقم"}
         except ValueError as e:
             return {"ok": False, "error": str(e)}
         finally:
             W._TLS.allow_neg = None
+        if neg_who:                                  # مين سمح بالسالب يبان في سجل النشاط
+            with W.db() as c: W.log(c, "فاتورة من غير رصيد", f"{p['kind']} رقم {number} — اتسمحت بباسوورد {neg_who}")
         if p["kind"] == "مبيعات":                    # التوصيل: العربية أو استلام مكتب
             try: vid = int(p.get("vehicle_id") or 0) or None
             except (TypeError, ValueError): vid = None
@@ -536,13 +544,13 @@ class Api:
         self._day(o[0])
         who = None
         if neg_pw:
-            who = W.verify_owner_password(neg_pw)
-            if not who: return {"ok": False, "need": "neg", "error": "كلمة سر المالك غير صحيحة"}
+            who = W.verify_day_password(neg_pw)              # المحاسب أو المالك
+            if not who: return {"ok": False, "need": "neg", "error": "باسوورد المحاسب أو المالك غير صحيح"}
         try:
             W._TLS.allow_neg = who
             W.App._delete_invoice_id(None, inv_id)
         except W.NegativeStock as e:
-            return {"ok": False, "need": "neg", "error": str(e) + "\nالرصيد هيبقى بالسالب — مسموح بس بكلمة سر المالك."}
+            return {"ok": False, "need": "neg", "error": str(e) + "\nالرصيد هيبقى بالسالب — مسموح بباسوورد المحاسب أو المالك."}
         finally:
             W._TLS.allow_neg = None
         return {"ok": True}

@@ -15,6 +15,7 @@ function pyReady() {
   });
 }
 let IN_APP = false;
+let DATA_V = 0;
 async function api(name, ...args) {
   let r;
   if (IN_APP) r = await window.pywebview.api.call(name, args);
@@ -35,6 +36,7 @@ async function api(name, ...args) {
     throw new Error(msg === "unknown" ? "أمر مش معروف: " + name : msg);
   }
   if (/^(save_|delete_|add_|close_day|pay_)/.test(name)) setTimeout(loadTodayBar, 150);
+  if (/^(save_|delete_|add_|close_day|pay_|req_decide|toggle_|update_|set_|clear_)/.test(name)) DATA_V++;   // زرار الرجوع: يعرف إن فيه حاجة اتغيرت
   if (/^(save_invoice|save_voucher|req_decide|rep_checkin)$/.test(name) && S.me && !S.me.rep) setTimeout(loadReqCount, 200);
   return r ? r.result : null;
 }
@@ -134,6 +136,7 @@ const kindClass = (k) => (k.startsWith("مرتجع") ? "k-مرتجع" : "k-" + k
 /* ===================== أيقونات ===================== */
 const ICONS = {
   home: "M3 11 12 3l9 8M5 10v10h5v-6h4v6h5V10",
+  back: "M4 12h15M13 6l6 6-6 6",
   sale: "M7 17 17 7M9 7h8v8",
   buy: "M17 7 7 17M15 17H7V9",
   ret: "M9 14 4 9l5-5M4 9h11a5 5 0 0 1 0 10h-3",
@@ -218,6 +221,15 @@ async function askOwner(msg) {
     const pw = await promptBox(msg + "\n\nاكتب كلمة سر المالك علشان تكمّل:", "مقفول — كلمة سر المالك", { password: true });
     if (pw === null) return null;
     try { await api("verify_owner", pw); return pw; } catch (e) { toast(e.message, "err"); }
+  }
+}
+
+// فاتورة من غير رصيد صنف: باسوورد المحاسب أو المالك
+async function askNeg(msg) {
+  while (true) {
+    const pw = await promptBox(msg + "\n\nاكتب باسوورد المحاسب أو المالك علشان تكمّل:", "مفيش رصيد — باسوورد المحاسب أو المالك", { password: true });
+    if (pw === null) return null;
+    try { await api("verify_neg", pw); return pw; } catch (e) { toast(e.message, "err"); }
   }
 }
 
@@ -462,6 +474,7 @@ function renderShell() {
     h("div", { class: "sig", title: S.boot.version || "" }, h("span", { dir: "ltr", class: "sig-v" }, S.boot.build ? `V1.0.${S.boot.build}` : "dev"), h("span", { dir: "ltr", class: "sig-n" }, "by Ali ElMenshawy")));
   const top = h("header", { class: "top" },
     h("button", { class: "btn icon-btn m-menu", "aria-label": "القايمة", onclick: () => toggleMobileNav() }, icon("menu", 22)),
+    h("button", { class: "btn back-btn", id: "back-btn", title: "رجوع للشاشة اللي قبلها (Alt + ←)", "aria-label": "رجوع", onclick: () => navBack() }, icon("back", 20), h("span", { class: "lbl" }, "رجوع")),
     h("div", { class: "grow" }, h("h1", { id: "top-title" }, ""), h("div", { class: "sub", id: "top-sub" }, "")),
     h("span", { class: "last-up", id: "last-up" }, "آخر تحديث: ", h("b", null, "—")),
     h("button", { class: "btn gold icon-btn", id: "refresh-all", title: "تحديث الشاشة", "aria-label": "تحديث", onclick: refreshAll }, icon("refresh", 22)),
@@ -470,7 +483,7 @@ function renderShell() {
     null);
   const main = h("div", { class: "main" }, top, h("div", { id: "screen" }), h("footer", { class: "todaybar", id: "todaybar", "aria-label": "ملخص النهارده" }), h("footer", { class: "pagebar", id: "pagebar", hidden: true, "aria-label": "إجمالي الجدول" }));
   $("#app").replaceChildren(h("div", { class: "shell" }, side, main), h("div", { class: "shade", id: "shade", onclick: closeDrawer }), h("aside", { class: "drawer", id: "drawer", "aria-label": "العملاء المتوقعين" }));
-  go(S.screen, true); REQ_LAST = -1; loadReqCount();
+  S.hist = []; go(S.screen, true); REQ_LAST = -1; loadReqCount();
   loadExpected();
   setInterval(loadExpected, 5 * 60 * 1000);
   loadTodayBar(); setInterval(loadTodayBar, 60 * 1000);
@@ -528,18 +541,15 @@ function resetDates(k) {
   };
   try { R[k] && R[k](); } catch (_) {}
 }
-async function go(key, force) {
+async function go(key, force, fromBack) {
   syncToday();
   if (!can(key)) { if (S.me) toast("مش مسموحلك بالشاشة دي", "err"); if (S.screen && can(S.screen)) return; key = firstScreen(); }
   if (!force && key === S.screen) return;
   if (!force && S.dirty && (S.screen.startsWith("inv:") || S.screen === "vch:new") && !(await confirmBox("الفاتورة اللي مفتوحة فيها أصناف ولسه ماتحفظتش. تسيبها وتفتح الشاشة التانية؟\n(هتلاقيها زي ما هي لما ترجع)"))) return;
+  if (!fromBack && S.screen && S.screen !== key) pushHist();          // زرار الرجوع: الشاشة اللي سايبها بتتحفظ زي ما هي
   if (S.screen && S.screen !== key) resetDates(S.screen);           // الشاشة اللي سبتها: ترجع لتواريخها الافتراضية لما ترجعلها
   S.screen = key;
-  document.querySelectorAll(".nav[data-screen]").forEach((b) => b.classList.toggle("on", b.dataset.screen === key));
-  document.querySelectorAll(".grp").forEach((g) => { const has = g.dataset.keys.split("|").includes(key); g.classList.toggle("has", has); if (has) g.classList.add("open"); });
-  const ed = key.startsWith("inv:") && S.drafts[key.slice(4)] && S.drafts[key.slice(4)].edit_id;
-  $("#top-title").textContent = ed ? `تعديل ${SCREENS[key].title} رقم ${S.drafts[key.slice(4)].number}` : (key === "vch:new" && S.voucherEdit ? "تعديل سند" : SCREENS[key].title);
-  $("#top-sub").textContent = `${S.me.username} (${S.me.role}) • ${new Date().toLocaleDateString("ar-EG", { weekday: "long", year: "numeric", month: "long", day: "numeric" })}`;
+  markScreen(key);
   const box = $("#screen");
   if ($("#pagebar")) $("#pagebar").replaceChildren();
   box.replaceChildren(h("div", { class: "page" }, h("div", { class: "empty" }, "بيحمّل ...")));
@@ -585,6 +595,61 @@ async function go(key, force) {
   } catch (e) { box.replaceChildren(h("div", { class: "page" }, h("div", { class: "card empty" }, e.message))); }
   pinTotals();
 }
+
+function markScreen(key) {
+  document.querySelectorAll(".nav[data-screen]").forEach((b) => b.classList.toggle("on", b.dataset.screen === key));
+  document.querySelectorAll(".grp").forEach((g) => { const has = g.dataset.keys.split("|").includes(key); g.classList.toggle("has", has); if (has) g.classList.add("open"); });
+  const ed = key.startsWith("inv:") && S.drafts[key.slice(4)] && S.drafts[key.slice(4)].edit_id;
+  $("#top-title").textContent = ed ? `تعديل ${SCREENS[key].title} رقم ${S.drafts[key.slice(4)].number}` : (key === "vch:new" && S.voucherEdit ? "تعديل سند" : SCREENS[key].title);
+  $("#top-sub").textContent = `${S.me.username} (${S.me.role}) • ${new Date().toLocaleDateString("ar-EG", { weekday: "long", year: "numeric", month: "long", day: "numeric" })}`;
+}
+
+/* ===================== زرار الرجوع =====================
+   كل ما تفتح شاشة، الشاشة اللي كنت فيها بتتحفظ زي ما هي (البحث، التحديد، مكان السكرول) من غير ما تتحمّل تاني.
+   «رجوع» (أو Alt+← أو زرار الرجوع في الموبايل) بيرجّعها بالظبط. */
+const NAV_STATE = ["logState", "vlog", "cashSt", "scSt", "stmt", "astSt", "dmgSt", "rpSt", "lgSt", "pfSt", "dailyDay", "trSt", "monSt", "attDay", "alSt", "vehSt", "tgMonth",
+  "flowمبيعات", "flowمشتريات", "smpعينات مبيعات", "smpعينات مشتريات", "prodLog", "prodRep", "gateLog"];
+let HIST_OK = false;
+const isForm = (k) => k.startsWith("inv:") || k === "vch:new";
+function pushHist() {
+  const box = $("#screen"); if (!box || !box.firstChild || !S.screen) return;
+  const scrolls = [];
+  [document.scrollingElement, document.body, $(".main"), box, ...box.querySelectorAll("*")].forEach((el) => { if (el && (el.scrollTop || el.scrollLeft)) scrolls.push([el, el.scrollTop, el.scrollLeft]); });
+  const st = NAV_STATE.map((k) => [k, S[k], S[k] && typeof S[k] === "object" ? { ...S[k] } : null]);
+  const pb = $("#pagebar");
+  S.hist = S.hist || [];
+  S.hist.push({ key: S.screen, nodes: [...box.childNodes], pb: pb ? [...pb.childNodes] : [], save: box._save, scrolls, st, v: DATA_V });
+  if (S.hist.length > 25) S.hist.shift();
+  try { history.pushState({ zs: S.hist.length }, ""); HIST_OK = true; } catch (_) { HIST_OK = false; }
+  updateBack();
+}
+function updateBack() { const b = $("#back-btn"); if (b) b.classList.toggle("on", !!(S.hist && S.hist.length)); }
+function navBack() { if (!S.hist || !S.hist.length) return; if (HIST_OK) history.back(); else goBack(); }
+async function goBack() {
+  const sn = S.hist && S.hist.pop(); updateBack();
+  if (!sn) return true;
+  if (!can(sn.key)) return goBack();
+  if (S.dirty && isForm(S.screen) && !(await confirmBox("الفاتورة اللي مفتوحة فيها أصناف ولسه ماتحفظتش. ترجع للشاشة اللي قبلها؟\n(هتلاقيها زي ما هي لما ترجع)"))) { S.hist.push(sn); updateBack(); return false; }
+  if (isForm(sn.key)) { await go(sn.key, true, true); return true; }       // الفاتورة/السند: بيترسموا من المسودة المحفوظة
+  if (S.screen && S.screen !== sn.key) resetDates(S.screen);
+  S.screen = sn.key;
+  sn.st.forEach(([k, o, c]) => { S[k] = o; if (o && c) Object.assign(o, c); });
+  markScreen(sn.key);
+  const box = $("#screen"), pb = $("#pagebar");
+  box.replaceChildren(...sn.nodes); box._save = sn.save;
+  if (pb) pb.replaceChildren(...sn.pb);
+  pinTotals();
+  sn.scrolls.forEach(([el, t, l]) => { el.scrollTop = t; el.scrollLeft = l; });
+  if (DATA_V !== sn.v) toast("رجعت لنفس المكان • فيه حاجات اتغيرت من ساعتها — اضغط 🔄 لو عايز آخر الأرقام", "", 4500);
+  return true;
+}
+window.addEventListener("popstate", async () => {          // زرار الرجوع في المتصفح/الموبايل أو زرار الماوس
+  if (!S.me) return;
+  if (MODALS) { closeModals(); try { history.pushState({ zs: 1 }, ""); } catch (_) {} return; }
+  if (document.body.classList.contains("m-nav")) { toggleMobileNav(false); try { history.pushState({ zs: 1 }, ""); } catch (_) {} return; }
+  if (!S.hist || !S.hist.length) return;
+  if (!(await goBack())) { try { history.pushState({ zs: 1 }, ""); } catch (_) {} }
+});
 
 /* ===================== الرئيسية ===================== */
 async function renderHome(box) {
@@ -974,7 +1039,7 @@ async function deleteInvoice(id, label) {
   while (true) {
     let r; try { r = await api("delete_invoice", id, pw); } catch (e) { alertBox(e.message, "مش هينفع تتحذف"); return false; }
     if (r.ok) { toast("✔ الفاتورة اتحذفت", "ok"); return true; }
-    if (r.need === "neg") { pw = await askOwner(r.error); if (!pw) return false; continue; }
+    if (r.need === "neg") { pw = await askNeg(r.error); if (!pw) return false; continue; }
     alertBox(r.error); return false;
   }
 }
@@ -1102,7 +1167,7 @@ async function renderInvoice(box, kind) {
     const used = D.lines.reduce((s, l, i) => s + (l.item_id === it.id && i !== exceptIdx ? l.qty : 0), 0);
     const avail = info.available - used;
     if (qty <= avail + 1e-9) return true;
-    const pw = await askOwner(`الرصيد المتاح من «${it.name}» هو ${fq(avail)} بس، وانت كاتب ${fq(qty)}.\nالرصيد هيبقى بالسالب — مسموح بس بكلمة سر المالك.`);
+    const pw = await askNeg(`الرصيد المتاح من «${it.name}» هو ${fq(avail)} بس، وانت كاتب ${fq(qty)}.\nالرصيد هيبقى بالسالب — مسموح بباسوورد المحاسب أو المالك.`);
     if (!pw) return false;
     D.negPw = pw; return true;
   }
@@ -1160,7 +1225,7 @@ async function renderInvoice(box, kind) {
           return go(wasEdit ? "log" : S.screen, true);
         }
         if (r.need === "credit") { creditPw = await askOwner(r.error); if (!creditPw) return; continue; }
-        if (r.need === "neg") { D.negPw = await askOwner(r.error); if (!D.negPw) return; continue; }
+        if (r.need === "neg") { D.negPw = await askNeg(r.error); if (!D.negPw) return; continue; }
         return alertBox(r.error, r.title || "مش هينفع تتحفظ");
       }
     } catch (e) { alertBox(e.message, "خطأ"); }
@@ -3141,6 +3206,7 @@ document.addEventListener("keydown", (e) => {
   else if (k === "F7") { e.preventDefault(); go("vch:log"); }
   else if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && (e.code === "KeyB")) { e.preventDefault(); go("acc:balances"); }
   else if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && (e.code === "KeyI")) { e.preventDefault(); go("itm:stock"); }
+  else if (e.altKey && !e.ctrlKey && (k === "ArrowLeft" || k === "ArrowRight")) { e.preventDefault(); navBack(); }
   else if (k === "Escape" && $("#drawer") && $("#drawer").classList.contains("on")) closeDrawer();
   else if ((e.ctrlKey || e.metaKey) && (k === "s" || k === "س") && (S.screen.startsWith("inv:") || S.screen === "vch:new")) { e.preventDefault(); const b = $("#screen"); if (b._save) b._save(false); }
 });

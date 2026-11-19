@@ -78,6 +78,9 @@ button{cursor:pointer}
 .last-up{font-size:13px;color:#e5dcca;margin-inline-end:6px;white-space:nowrap}
 .last-up b{color:var(--gold-2);font-weight:800}
 .top .grow{flex:1}
+.top .back-btn{display:none;background:transparent;border-color:rgba(255,255,255,.4);color:#fff;padding:0 12px;min-height:40px}
+.top .back-btn.on{display:inline-flex}
+.top .back-btn:hover{background:rgba(255,255,255,.12);border-color:#fff}
 .page{padding:22px 26px 40px;display:flex;flex-direction:column;gap:18px;animation:up .45s var(--ease) both}
 
 /* ---------- عناصر عامة ---------- */
@@ -381,6 +384,9 @@ table.t th.asc,table.t th.desc{color:var(--navy)}
   /* الموبايل: اسم الشاشة في سطر لوحده كامل، والزراير الصفرا في السطر اللي تحته */
   .top{padding:10px 12px 10px 12px;gap:8px 8px;padding-top:max(10px, env(safe-area-inset-top))}
   .top .m-menu{order:0}
+  .top .back-btn{order:0;width:46px;height:46px;padding:0}
+  .top .back-btn .lbl{display:none}
+  .top:has(.back-btn.on) .grow{flex-basis:calc(100% - 114px)}
   .top .grow{min-width:0;flex:1 1 calc(100% - 60px);order:1}
   .top h1{font-size:20px;white-space:normal;overflow:visible;line-height:1.35}
   .top > .btn.gold{order:2}
