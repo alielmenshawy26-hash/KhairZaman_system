@@ -670,6 +670,12 @@ def fmt_time(ts):
     return t.strftime("%I:%M ") + ("ص" if t.hour < 12 else "م")
 
 EMP_KINDS = ("موظف", "عامل", "مندوب")
+# خير زمان: وظايف الفرن الثابتة (بتتخزن في «الصفة»، والنوع «عامل»). الفران والخراط بالشيكارة، والباقي باليومية
+BAKERY_ROLES = ("فران", "خراط", "تستنجي", "سحلجي", "مبيع", "ديليفري")
+PER_SACK_ROLES = ("فران", "خراط")
+WORKER_BREAD = 50.0
+KZ_EXPENSE_CATS = ("مياه", "كهربا", "مشروبات", "أكياس", "أنابيب", "خميرة", "مصروفات أخرى")
+KZ_SUPPLIES = (("ردة", "شيكارة"), ("خميرة", "كيلو"), ("أنابيب", "أنبوبة"), ("أكياس", "كيلو"))          # عيش العامل آخر اليوم (بالجنيه، بسعر البيع)
 EMP_LEFT = "اللي سابوا الشغل"
 OFFICE = "مكتب"
 DEFAULT_COMPANY = "مخبز خير زمان"
@@ -840,7 +846,7 @@ def init_db():
             FOREIGN KEY(sample_item_id) REFERENCES sample_items(id), FOREIGN KEY(party_id) REFERENCES parties(id));
         """)
         if c.execute("SELECT COUNT(*) FROM expense_cats").fetchone()[0] == 0:
-            for n in ("شيال", "أجور", "جاز", "إيجار عربية", "كهربا"):
+            for n in KZ_EXPENSE_CATS:
                 c.execute("INSERT OR IGNORE INTO expense_cats(name) VALUES(?)", (n,))
         c.execute("INSERT OR IGNORE INTO expense_cats(name) VALUES('مصروفات أخرى')")
         init_production(c)
@@ -1716,6 +1722,19 @@ def init_production(c):
         iid = ex[0] if ex else c.execute("INSERT INTO items(name,unit,buy_price,sell_price,category) VALUES(?,?,?,?,?)", (iname, "رغيف", 0, float(r[2] or 0), CAT_BREAD)).lastrowid
         c.execute("UPDATE items SET category=? WHERE id=?", (CAT_BREAD, iid))
         c.execute("UPDATE bread_sizes SET item_id=? WHERE id=?", (iid, r[0]))
+    add_col(c, "employees", "sack_rate", "REAL DEFAULT 0")        # الفران/الخراط: حسابه على الشيكارة
+    add_col(c, "damaged", "employee_id", "INTEGER")               # صرف عيش العمال (بيتسجل خروج من المخزن على العامل)
+    add_col(c, "damaged", "period", "TEXT")                       # استهلاك المستلزمات: «يوم» / «أسبوع» / «شهر» (مش هالك)
+    # بنود مصروفات خير زمان + أصناف المستلزمات (مرة واحدة)
+    if add_col(c, "settings", "kz_setup_v", "INTEGER DEFAULT 0") or not (c.execute("SELECT kz_setup_v FROM settings WHERE id=1").fetchone() or [0])[0]:
+        for r in c.execute("SELECT name FROM expense_cats").fetchall():
+            if r[0] not in KZ_EXPENSE_CATS and not c.execute("SELECT 1 FROM expenses WHERE category=?", (r[0],)).fetchone():
+                c.execute("DELETE FROM expense_cats WHERE name=?", (r[0],))
+        for n in KZ_EXPENSE_CATS: c.execute("INSERT OR IGNORE INTO expense_cats(name) VALUES(?)", (n,))
+        for nm, unit in KZ_SUPPLIES:
+            if not c.execute("SELECT 1 FROM items WHERE name=?", (nm,)).fetchone():
+                c.execute("INSERT INTO items(name,unit,buy_price,sell_price,category) VALUES(?,?,?,?,?)", (nm, unit, 0, 0, CAT_SUPPLY))
+        c.execute("UPDATE settings SET kz_setup_v=1 WHERE id=1")
 
 GATE_PARTY = "البوابة"
 
@@ -1755,13 +1774,23 @@ td {{ padding: 1.2mm 0; text-align: center; border-bottom: 1px dashed #999; font
 <div class="c co">{esc(LICENSED_COMPANY)}</div>
 <div class="c no">بون رقم {esc(i['number'])}</div>
 <div class="meta"><span>{esc(i['inv_date'])}</span><span>{esc(fmt_time(i['created_at']))}</span></div>
-{f'<div class="meta"><span>الكاشير: {esc(by)}</span><span>نقدي</span></div>' if by else ''}
+{f'<div class="meta"><span>الكاشير: {esc(by)}</span><span>{"زيادة" if "زيادة" in (i["notes"] or "") else "نقدي"}</span></div>' if by else ''}
 <table><thead><tr><th class="n">الصنف</th><th>العدد</th><th>السعر</th><th>الإجمالي</th></tr></thead><tbody>{rows}</tbody></table>
 <div class="meta" style="margin-top:2mm"><span>عدد الأرغفة</span><b>{q(loaves)}</b></div>
 <div class="tot"><span>الإجمالي</span><span>{fmt(total)} ج</span></div>
+{'<div class="c copy">زيادة — من غير فلوس</div>' if 'زيادة' in (i['notes'] or '') else ''}
 {'<div class="c copy">نسخة مكررة</div>' if copy else ''}
 <div class="c ft">شكرًا لزيارتكم 🌾</div>
 </body></html>"""
+
+def sack_wage_rate(c):
+    """مجموع سعر الشيكارة للفرانين والخراطين الشغالين."""
+    return float(c.execute("SELECT COALESCE(SUM(sack_rate),0) FROM employees WHERE COALESCE(active,1)=1 AND job IN (%s)" % ",".join("?" * len(PER_SACK_ROLES)), PER_SACK_ROLES).fetchone()[0] or 0)
+
+def sacks_paid(n):
+    """الشكاير اللي بيتحاسب عليها في اليوم: اللي اتعملت + واحدة زيادة إكرامية (لو اشتغل)."""
+    n = float(n or 0)
+    return n + 1 if n > 0 else 0.0
 
 def bread_sizes(c, active_only=True):
     return [dict(id=r["id"], name=r["name"], per_table=float(r["per_table"] or 0), price=float(r["price"] or 0), item_id=r["item_id"], active=int(r["active"] or 0))
@@ -1814,6 +1843,7 @@ def fifo_engine(c):
         ev.append((r[1] or "", r[2] or "", 1, 0, r[0], "P", r[3], float(r[4] or 0), 0.0, psup.get(r[0], []), plines.get(r[0], [])))
     ev.sort(key=lambda e: e[:5])
     line, dmg, prod, snap = {}, {}, {}, None
+    prod_flour = {}
     deficit = {}   # كمية اتباعت والرصيد صفر (بالسالب): أول بضاعة تدخل بعد كده بتغطيها الأول
 
     def put(iid, q, price, front=False):
@@ -1843,6 +1873,7 @@ def fifo_engine(c):
         if snap is None and d > today: snap = {k: [list(x) for x in v] for k, v in layers.items()}
         if typ == "P":                                                    # شيكارة إنتاج
             cost = take(iid, q) if (iid and q > 1e-9) else 0.0
+            prod_flour[rid] = cost                                        # تكلفة الدقيق لوحده (لربح الشيكارة)
             for sid, sq in (damaged or []):                               # المستلزمات الثابتة (خميرة ...) تكلفتها بتدخل على العيش
                 if sid and sq > 1e-9: cost += take(sid, sq)
             prod[rid] = cost
@@ -1874,7 +1905,7 @@ def fifo_engine(c):
             u = last_out.get(iid, L[0][1] if L else last_in.get(iid, 0.0)); line[rid] = u
             if not damaged: put(iid, q, u, front=True)
     if snap is None: snap = {k: [list(x) for x in v] for k, v in layers.items()}
-    res = {"line": line, "dmg": dmg, "prod": prod, "today": snap, "last_in": last_in}
+    res = {"line": line, "dmg": dmg, "prod": prod, "prod_flour": prod_flour, "today": snap, "last_in": last_in}
     _FIFO["sig"], _FIFO["res"] = sig, res
     return res
 
@@ -2067,7 +2098,13 @@ def profit_summary(start, end):
             else:
                 k[1] += v
                 if r[4]: k[2] += v
-        dmg_direct = sum(float(r[1] or 0) * f["dmg"].get(r[0], float(r[2] or 0)) for r in c.execute("SELECT id, qty, unit_cost FROM damaged WHERE d_date BETWEEN ? AND ?", (start, end)).fetchall())
+        dmg_direct = wbread = 0.0
+        consume = 0.0
+        for r in c.execute("SELECT id, qty, unit_cost, employee_id, period FROM damaged WHERE d_date BETWEEN ? AND ?", (start, end)).fetchall():
+            v = float(r[1] or 0) * f["dmg"].get(r[0], float(r[2] or 0))
+            if r[3]: wbread += v
+            elif r[4]: consume += v
+            else: dmg_direct += v
         commission = float(c.execute(f"SELECT COALESCE(SUM({COMM_AMT_SQL}),0) FROM invoices i WHERE i.kind='مبيعات' AND i.rep_id IS NOT NULL AND COALESCE(NULLIF(i.due_date,''), i.inv_date) BETWEEN ? AND ?", (start, end)).fetchone()[0])
     rows = []; rev = ret = cost = rcost = dmg_ret_val = 0.0
     for it in items:
@@ -2088,13 +2125,13 @@ def profit_summary(start, end):
     damaged = dmg_ret_val + dmg_direct
     return {"rows": rows, "rev": rev, "ret": ret, "cost": cost, "rcost": rcost, "ds": ds, "dr": dr, "gross": gross,
             "general": general, "salary": salary, "adv": adv, "by_cat": by_cat, "exp_total": exp_total,
-            "damaged": damaged, "commission": commission, "actual": gross - exp_total - damaged - commission}
+            "damaged": damaged, "worker_bread": wbread, "consume": consume, "commission": commission, "actual": gross - exp_total - damaged - wbread - consume - commission}
 
 def metric_rows(ps):
     return [("المبيعات", ps["rev"]), ("المرتجعات", ps["ret"]), ("صافي التكلفة", ps["cost"] - ps["rcost"]),
             ("الخصومات (صافي)", ps["ds"] - ps["dr"]), ("إجمالي الربح (Total)", ps["gross"]),
-            ("المصروفات العامة", ps["general"]), ("المرتبات", ps["salary"]), ("السلف", ps["adv"]),
-            ("إجمالي المصروفات", ps["exp_total"]), ("الهالك والتالف (بالتكلفة)", ps["damaged"]), ("عمولات المناديب", ps["commission"]),
+            ("المصروفات العامة", ps["general"]), ("اليوميات وحساب الشكاير", ps["salary"]), ("السلف", ps["adv"]),
+            ("إجمالي المصروفات", ps["exp_total"]), ("الهالك والتالف (بالتكلفة)", ps["damaged"]), ("عيش العمال (بالتكلفة)", ps.get("worker_bread", 0.0)), ("استهلاك المستلزمات (بالتكلفة)", ps.get("consume", 0.0)), ("عمولات المناديب", ps["commission"]),
             ("صافي الربح", ps["actual"])]
 
 # ---------------- التقرير اليومي ----------------

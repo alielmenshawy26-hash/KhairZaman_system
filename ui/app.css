@@ -571,3 +571,14 @@ html.standalone .shell{background:var(--ground);min-height:100dvh}
   .qs-mbar .btn:disabled{opacity:.55}
   .qs-recent{max-height:none}
 }
+
+/* نقدي / زيادة في الكاشير */
+.qs-mode{margin-top:10px}.qs-mode button{min-height:42px;font-size:16px}
+.qs-mode button.on[data-v="نقدي"]{background:var(--navy);color:#fff;border-color:var(--navy)}
+.qs-mode button.on[data-v="زيادة"]{background:#9c3d1c;color:#fff;border-color:#9c3d1c}
+.qs-total-v.free{color:#9c3d1c;font-size:24px}
+/* صرف العيش للعمال */
+.bg-list{display:flex;flex-direction:column;gap:6px;padding:4px 18px 10px}
+.bg-row{display:grid;grid-template-columns:auto minmax(110px,1fr) minmax(0,1.2fr) 170px 110px 80px;gap:10px;align-items:center;padding:8px 10px;border:1px solid var(--line);border-radius:12px;background:#fffaf0}
+.bg-row .in{min-width:0}
+@media (max-width:900px){.bg-row{grid-template-columns:auto 1fr 1fr;padding:8px}.bg-r{grid-column:2/4}.bg-row select{grid-column:1/3}.bg-list{padding:4px 10px 10px}}

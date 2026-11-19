@@ -28,7 +28,7 @@ ALL_SCREENS = ["home", "inv:مبيعات", "inv:مشتريات", "inv:مرتجع
                "acc:statement", "acc:balances", "acc:cash", "acc:subcash", "par:list", "itm:list", "itm:stock", "itm:sales", "itm:buys", "itm:damaged",
                "smp:items", "smp:out", "smp:in", "emp:list", "emp:att", "emp:attlog", "emp:attreq", "emp:repreq", "emp:veh",
                "rep:daily", "rep:monthly", "rep:profit", "rep:reps", "rep:targets", "rep:log", "req", "set:main", "acc:assets",
-               "prd:new", "prd:log", "rep:production", "gate:log"]
+               "prd:new", "prd:log", "rep:production", "gate:log", "emp:bread", "itm:use"]
 OWNER_ONLY_SCREENS = {"rep:profit", "set:users", "acc:assets", "rep:monthly"}
 DEFAULT_SCREENS = {
     W.ROLE_ACC: [k for k in ALL_SCREENS if k not in OWNER_ONLY_SCREENS],
@@ -39,6 +39,8 @@ _INV = ["inv:مبيعات", "inv:مشتريات", "inv:مرتجع مبيعات",
 METHOD_SCREENS = {}
 for _keys, _methods in [
     (["gate:log", "log"], "gate_log"),
+    (["itm:use"], "consume_setup save_consume consumes delete_consume"),
+    (["emp:bread"], "bread_give_setup bread_give bread_gives delete_bread_give"),
     (["home"], "dashboard expected mark_called unmark_called hide_expected unhide_expected quick_setup quick_sale"),
     (_INV + ["log", "home"], "invoice_setup save_invoice invoice print_invoice invoice_for_edit delete_invoice"),
     (["log", "home"], "invoices"),
@@ -75,7 +77,7 @@ for _keys, _methods in [
     (["rep:monthly"], "monthly_report monthly_print"),
 ]:
     for _m in _methods.split(): METHOD_SCREENS[_m] = set(_keys)
-NO_REP = {"close_day", "expense_cat_log", "quick_setup", "quick_sale", "gate_log", "day_unlock", "req_decide", "inv_request_get",
+NO_REP = {"close_day", "expense_cat_log", "quick_setup", "quick_sale", "gate_log", "bread_give_setup", "bread_give", "bread_gives", "delete_bread_give", "consume_setup", "save_consume", "consumes", "delete_consume", "day_unlock", "req_decide", "inv_request_get",
           # المندوب بيبعت طلبات بس: مايحذفش فاتورة أو سند اتقبل (كان ممكن يلف على الموافقة بالحذف)،
           # ومايشوفش تقرير الشركة اليومي (مبيعات الكل والخزنة والمصروفات)، ومايغيرش بنود المصروفات
           "delete_invoice", "delete_voucher", "daily_report", "print_daily", "daily_trend",
@@ -1387,7 +1389,7 @@ class Api:
         a = W.check_date(d_from); b = W.check_date(d_to); rows = []
         with W.db() as c:
             eng = W.fifo_engine(c)
-            for r in c.execute("SELECT d.*,it.name iname,it.unit FROM damaged d JOIN items it ON it.id=d.item_id WHERE d.d_date BETWEEN ? AND ?", (a, b)):
+            for r in c.execute("SELECT d.*,it.name iname,it.unit FROM damaged d JOIN items it ON it.id=d.item_id WHERE d.employee_id IS NULL AND COALESCE(d.period,'')='' AND d.d_date BETWEEN ? AND ?", (a, b)):
                 cost = eng["dmg"].get(r["id"], float(r["unit_cost"] or 0))
                 rows.append({"key": f"d-{r['id']}", "date": r["d_date"], "created": r["created_at"] or "", "time": W.fmt_time(r["created_at"]), "item": r["iname"],
                              "qty": _r2(r["qty"]), "cost": _r2(cost), "value": _r2(float(r["qty"]) * cost), "src": "هالك من المخزن", "notes": r["notes"] or "", "invoice_id": None})
@@ -1461,9 +1463,12 @@ class Api:
             rows.append({"id": r["id"], "date": r["p_date"], "sack_no": r["sack_no"], "time": W.fmt_time(r["created_at"]), "flour": r["fname"] or "",
                          "flour_qty": _r2(r["flour_qty"] if r["flour_qty"] is not None else 1), "cells": cells, "loaves": _r2(loaves), "value": _r2(value),
                          "cost": _r2(eng.get("prod", {}).get(r["id"], 0.0)), "notes": r["notes"] or "", "user": r["username"] or ""})
+            rows[-1]["flour_cost"] = _r2(eng.get("prod_flour", {}).get(r["id"], 0.0))      # ربح الشيكارة = قيمة العيش - سعر الدقيق بس (الباقي في تقرير الأرباح)
+            rows[-1]["profit"] = _r2(rows[-1]["value"] - rows[-1]["flour_cost"])
         totals = {nm: {k: _r2(v) for k, v in tot.get(nm, {"tables": 0, "loaves": 0, "value": 0}).items()} for nm in order}
         return {"sizes": order, "rows": rows, "totals": totals, "sacks": _r2(sum(r["flour_qty"] for r in rows)),
-                "loaves": _r2(sum(r["loaves"] for r in rows)), "value": _r2(sum(r["value"] for r in rows)), "cost": _r2(sum(r["cost"] for r in rows))}
+                "loaves": _r2(sum(r["loaves"] for r in rows)), "value": _r2(sum(r["value"] for r in rows)), "cost": _r2(sum(r["cost"] for r in rows)),
+                "flour_cost": _r2(sum(r["flour_cost"] for r in rows)), "profit": _r2(sum(r["profit"] for r in rows))}
 
     # ---------- البيع السريع (الكاشير) في الرئيسية ----------
     def quick_setup(self, d=None):
@@ -1479,7 +1484,7 @@ class Api:
         return {"date": d, "sizes": sizes, "gate_id": gid, "recent": recent[:30], "count": len(recent),
                 "total": _r2(sum(r["net"] for r in recent)), "loaves": _r2(sum(r["loaves"] for r in recent))}
 
-    def quick_sale(self, lines, d=None, neg_pw=None, do_print=True):
+    def quick_sale(self, lines, d=None, neg_pw=None, do_print=True, mode="نقدي"):
         """بيع سريع: فاتورة مبيعات نقدي على «البوابة» — «طباعة وحفظ» أو «حفظ» بس. البون بيتطبع مرة واحدة بس."""
         self._need_login()
         d = W.check_date(d or _today())
@@ -1487,6 +1492,7 @@ class Api:
             gid = W.gate_party_id(c)
             sizes = {z["item_id"]: z for z in W.bread_sizes(c)}
             units = {r[0]: r[1] for r in c.execute("SELECT id, unit FROM items").fetchall()}
+        free = mode == "زيادة"                      # الزيادة: بتطلع لله أو لقريب — من غير فلوس، وتكلفتها على المالك
         L = []
         for l in (lines or []):
             try: iid = int(l.get("item_id")); qty = float(l.get("qty") or 0)
@@ -1495,11 +1501,11 @@ class Api:
             if qty != int(qty): raise UIError("عدد الأرغفة لازم رقم صحيح")
             z = sizes.get(iid)
             if not z: raise UIError("المقاس ده مش موجود — حدّث الشاشة")
-            L.append({"item_id": iid, "name": "عيش " + z["name"], "unit": units.get(iid) or "رغيف", "qty": qty, "price": float(z["price"])})
+            L.append({"item_id": iid, "name": "عيش " + z["name"], "unit": units.get(iid) or "رغيف", "qty": qty, "price": 0.0 if free else float(z["price"])})
         if not L: raise UIError("اختار الرغيف واكتب العدد الأول")
-        r = self.save_invoice({"kind": "مبيعات", "party_id": gid, "date": d, "paid": 0, "pay_type": "نقدي", "notes": "بيع سريع (كاشير)", "lines": L}, neg_pw=neg_pw)
+        r = self.save_invoice({"kind": "مبيعات", "party_id": gid, "date": d, "paid": 0, "pay_type": "نقدي", "notes": "بيع سريع — زيادة (من غير فلوس)" if free else "بيع سريع (كاشير)", "lines": L}, neg_pw=neg_pw)
         if not r.get("ok"): return r
-        with W.db() as c: W.log(c, "بيع سريع", f"بون {r['number']} — {W.fmt(r['net'])} ج")
+        with W.db() as c: W.log(c, "بيع سريع", f"بون {r['number']} — " + (f"زيادة من غير فلوس ({sum(l['qty'] for l in L):g} رغيف)" if free else f"{W.fmt(r['net'])} ج"))
         if do_print: self._print_receipt(r["id"], copy=False)
         return r
 
@@ -1509,7 +1515,7 @@ class Api:
         a = W.check_date(d_from or _today()); b = W.check_date(d_to or a)
         with W.db() as c:
             gid = W.gate_party_id(c)
-            inv = c.execute(f"SELECT i.id, i.number, i.inv_date, i.created_at, i.printed_at, {W.NET_SQL} net FROM invoices i "
+            inv = c.execute(f"SELECT i.id, i.number, i.inv_date, i.created_at, i.printed_at, i.notes, {W.NET_SQL} net FROM invoices i "
                             "WHERE i.kind='مبيعات' AND i.party_id=? AND i.inv_date BETWEEN ? AND ? ORDER BY i.inv_date DESC, i.id DESC", (gid, a, b)).fetchall()
             ids = [r["id"] for r in inv]; L = {}
             for k in range(0, len(ids), 500):
@@ -1517,8 +1523,129 @@ class Api:
                 for l in c.execute(f"SELECT invoice_id, item_name, qty FROM invoice_lines WHERE invoice_id IN ({','.join('?' * len(ch))}) ORDER BY id", ch).fetchall():
                     L.setdefault(l["invoice_id"], []).append((l["item_name"], float(l["qty"])))
         rows = [{"id": r["id"], "number": r["number"], "date": r["inv_date"], "time": W.fmt_time(r["created_at"]), "printed": bool(r["printed_at"]), "net": _r2(r["net"]),
+                 "type": "زيادة" if "زيادة" in (r["notes"] or "") else "نقدي",
                  "loaves": _r2(sum(q for _, q in L.get(r["id"], []))), "items": "، ".join(f"{n.replace('عيش ', '')} {q:g}" for n, q in L.get(r["id"], []))} for r in inv]
         return {"from": a, "to": b, "rows": rows}
+
+    # ---------- استهلاك المستلزمات (ردة، خميرة، أنابيب، أكياس ...) ----------
+    def consume_setup(self):
+        self._need_login()
+        with W.db() as c:
+            st = W.stock_map(c)
+            items = [{"id": r["id"], "name": r["name"], "unit": r["unit"] or "", "stock": _r2(st.get(r["id"], 0.0))}
+                     for r in c.execute("SELECT id,name,unit FROM items WHERE COALESCE(category,'') NOT IN (?,?) ORDER BY name", (W.CAT_FLOUR, W.CAT_BREAD)).fetchall()]
+        return {"items": items, "periods": ["يوم", "أسبوع", "شهر"]}
+
+    def save_consume(self, item_id, d, qty, period, notes="", neg_pw=None):
+        """استهلاك مستلزم عن يوم أو أسبوع أو شهر — بيتخصم من المخزن وتكلفته بتدخل في تقرير الأرباح."""
+        self._need_login()
+        try: qty = W._f(qty); d = W.check_date(d); iid = int(item_id)
+        except (TypeError, ValueError): raise UIError("راجع الصنف والتاريخ والكمية")
+        if qty <= 0: raise UIError("الكمية لازم أكبر من صفر")
+        if period not in ("يوم", "أسبوع", "شهر"): raise UIError("اختار الاستهلاك عن يوم ولا أسبوع ولا شهر")
+        msg = W.check_locked(d)
+        if msg: raise UIError(msg)
+        who = W.verify_day_password(neg_pw) if neg_pw else None
+        if neg_pw and not who: return {"ok": False, "need": "neg", "error": "باسوورد المحاسب أو المالك غير صحيح"}
+        try:
+            W._TLS.allow_neg = who
+            with W.db() as c:
+                it = c.execute("SELECT name, category FROM items WHERE id=?", (iid,)).fetchone()
+                if not it or it["category"] in (W.CAT_FLOUR, W.CAT_BREAD): raise UIError("اختار مستلزم (مش دقيق ولا عيش)")
+                cost = W.fifo_preview(c, [(iid, qty)])[0]
+                c.execute("INSERT INTO damaged(d_date,created_at,item_id,qty,unit_cost,notes,period) VALUES(?,?,?,?,?,?,?)", (d, W.now_ts(), iid, qty, cost, (notes or "").strip(), period))
+                W.check_stock(c, [iid])
+                W.log(c, "استهلاك مستلزمات", f"{it['name']}: {W.fmt(qty)} عن {period} ({d})" + (f" — رصيد بالسالب بباسوورد {who}" if who else ""))
+        except W.NegativeStock as e: return {"ok": False, "need": "neg", "error": str(e) + "\nالرصيد هيبقى بالسالب — مسموح بباسوورد المحاسب أو المالك."}
+        finally: W._TLS.allow_neg = None
+        return {"ok": True}
+
+    def consumes(self, d_from, d_to):
+        self._need_login(); a = W.check_date(d_from); b = W.check_date(d_to or d_from)
+        with W.db() as c:
+            eng = W.fifo_engine(c)
+            rows = c.execute("SELECT d.*, it.name iname, it.unit FROM damaged d JOIN items it ON it.id=d.item_id WHERE COALESCE(d.period,'')<>'' AND d.d_date BETWEEN ? AND ? ORDER BY d.d_date DESC, d.id DESC", (a, b)).fetchall()
+        return [{"id": r["id"], "date": r["d_date"], "time": W.fmt_time(r["created_at"]), "item": r["iname"], "unit": r["unit"] or "", "qty": _r2(r["qty"]), "period": r["period"],
+                 "cost": _r2(float(r["qty"]) * eng["dmg"].get(r["id"], float(r["unit_cost"] or 0))), "notes": r["notes"] or ""} for r in rows]
+
+    def delete_consume(self, rid):
+        self._need_login()
+        with W.db() as c:
+            r = c.execute("SELECT d.*, it.name iname FROM damaged d JOIN items it ON it.id=d.item_id WHERE d.id=? AND COALESCE(d.period,'')<>''", (int(rid),)).fetchone()
+            if not r: raise UIError("السطر مش موجود")
+            msg = W.check_locked(r["d_date"])
+            if msg: raise UIError(msg)
+            c.execute("DELETE FROM damaged WHERE id=?", (r["id"],))
+            W.log(c, "حذف استهلاك مستلزمات", f"{r['iname']}: {W.fmt(r['qty'])} عن {r['period']} ({r['d_date']})")
+        return True
+
+    # ---------- صرف عيش العمال (آخر اليوم) ----------
+    def bread_give_setup(self, d=None):
+        self._need_login(); d = W.check_date(d or _today())
+        with W.db() as c:
+            st = W.stock_map(c)
+            sizes = [{"item_id": z["item_id"], "name": z["name"], "price": z["price"], "stock": _r2(st.get(z["item_id"], 0.0))} for z in W.bread_sizes(c)]
+            given = {}
+            for r in c.execute("SELECT employee_id, COALESCE(SUM(qty),0) FROM damaged WHERE employee_id IS NOT NULL AND d_date=? GROUP BY employee_id", (d,)).fetchall(): given[r[0]] = float(r[1])
+            ws = [{"id": r["id"], "name": r["name"], "role": r["job"] or "", "given": _r2(given.get(r["id"], 0))}
+                  for r in c.execute("SELECT id, name, job FROM employees WHERE COALESCE(active,1)=1 ORDER BY name").fetchall()]
+        return {"date": d, "sizes": sizes, "workers": ws, "amount": W.WORKER_BREAD}
+
+    def bread_give(self, d, rows, neg_pw=None):
+        """rows = [[employee_id, item_id, amount_egp], ...] — كل عامل بياخد عيش بالمبلغ ده (بسعر البيع)، وبيتخصم من المخزن على حساب المالك."""
+        self._need_login(); d = W.check_date(d)
+        msg = W.check_locked(d)
+        if msg: raise UIError(msg)
+        who = W.verify_day_password(neg_pw) if neg_pw else None
+        if neg_pw and not who: return {"ok": False, "need": "neg", "error": "باسوورد المحاسب أو المالك غير صحيح"}
+        out = []
+        try:
+            W._TLS.allow_neg = who
+            with W.db() as c:
+                sizes = {z["item_id"]: z for z in W.bread_sizes(c)}
+                for eid, iid, amt in rows or []:
+                    eid = int(eid); iid = int(iid); amt = W._f(amt)
+                    if amt <= 0: continue
+                    z = sizes.get(iid)
+                    if not z or z["price"] <= 0: raise UIError("اختار نوع العيش")
+                    qty = float(int(amt / z["price"] + 1e-9))
+                    if qty <= 0: raise UIError(f"المبلغ {W.fmt(amt)} أقل من سعر رغيف «{z['name']}»")
+                    e = c.execute("SELECT name FROM employees WHERE id=?", (eid,)).fetchone()
+                    if not e: raise UIError("العامل مش موجود")
+                    cost = W.fifo_preview(c, [(iid, qty)])[0]
+                    c.execute("INSERT INTO damaged(d_date,created_at,item_id,qty,unit_cost,notes,employee_id) VALUES(?,?,?,?,?,?,?)",
+                              (d, W.now_ts(), iid, qty, cost, f"عيش العامل {e['name']} ({W.fmt(amt)} ج)", eid))
+                    out.append(f"{e['name']}: {qty:g} {z['name']}")
+                if not out: raise UIError("علّم العمال واكتب المبلغ")
+                W.check_stock(c, list({int(r[1]) for r in rows}))
+                W.log(c, "صرف عيش العمال", f"{d}: " + "، ".join(out) + (f" (رصيد بالسالب بباسوورد {who})" if who else ""))
+        except W.NegativeStock as e: return {"ok": False, "need": "neg", "error": str(e) + "\nالرصيد هيبقى بالسالب — مسموح بباسوورد المحاسب أو المالك."}
+        finally: W._TLS.allow_neg = None
+        return {"ok": True, "n": len(out)}
+
+    def bread_gives(self, d_from, d_to):
+        self._need_login(); a = W.check_date(d_from); b = W.check_date(d_to or d_from)
+        with W.db() as c:
+            eng = W.fifo_engine(c); sp = {z["item_id"]: z for z in W.bread_sizes(c, active_only=False)}
+            rows = c.execute("SELECT d.*, e.name ename, e.job FROM damaged d JOIN employees e ON e.id=d.employee_id WHERE d.d_date BETWEEN ? AND ? ORDER BY d.d_date DESC, d.id DESC", (a, b)).fetchall()
+        out = []
+        for r in rows:
+            z = sp.get(r["item_id"]) or {"name": "", "price": 0}
+            cost = eng["dmg"].get(r["id"], float(r["unit_cost"] or 0))
+            out.append({"id": r["id"], "date": r["d_date"], "time": W.fmt_time(r["created_at"]), "name": r["ename"], "role": r["job"] or "", "bread": z["name"],
+                        "qty": _r2(r["qty"]), "value": _r2(float(r["qty"]) * float(z["price"] or 0)), "cost": _r2(float(r["qty"]) * cost)})
+        return out
+
+    def delete_bread_give(self, rid):
+        self._need_login()
+        with W.db() as c:
+            r = c.execute("SELECT d.*, e.name ename FROM damaged d JOIN employees e ON e.id=d.employee_id WHERE d.id=?", (int(rid),)).fetchone()
+            if not r: raise UIError("السطر مش موجود")
+            msg = W.check_locked(r["d_date"])
+            if msg: raise UIError(msg)
+            c.execute("DELETE FROM damaged WHERE id=?", (r["id"],))
+            W.log(c, "حذف صرف عيش", f"{r['ename']}: {W.fmt(r['qty'])} رغيف يوم {r['d_date']}")
+        return True
 
     def _print_receipt(self, inv_id, copy):
         os.makedirs(W.PRINT_DIR, exist_ok=True)
@@ -2120,25 +2247,35 @@ class Api:
             ds, dg = self._att_times(c)
             for r in c.execute("SELECT * FROM employees ORDER BY name").fetchall():
                 left = not (r["active"] if r["active"] is not None else 1)
+                role = (r["job"] or "") if (r["job"] or "") in W.BAKERY_ROLES else (r["kind"] or "موظف")
                 if f == W.EMP_LEFT:
                     if not left: continue
-                elif left or (f not in ("الكل", "", None) and (r["kind"] or "موظف") != f): continue
+                elif left or (f not in ("الكل", "", None) and role != f): continue
                 earned, paid = W.rep_commission(c, r["id"])
-                out.append({"id": r["id"], "name": r["name"], "kind": r["kind"] or "موظف", "job": r["job"] or "", "phone": r["phone"] or "", "salary": _r2(r["salary"]), "pay_period": pay_period_of(r),
+                out.append({"id": r["id"], "name": r["name"], "kind": role, "role": role, "per_sack": role in W.PER_SACK_ROLES, "sack_rate": _r2(r["sack_rate"]), "job": r["job"] or "", "phone": r["phone"] or "", "salary": _r2(r["salary"]), "pay_period": pay_period_of(r),
                             "adv": _r2(self._adv(c, r["id"])), "commission": _r2(r["commission"]), "comm_unit": r["comm_unit"] or "شيكارة",
                             "is_rep": bool(r["kind"] == "مندوب" or earned or paid), "due": _r2(earned - paid), "left": left, "left_date": r["left_date"] or "",
                             "loader": W.is_loader(r["kind"], r["job"]), "att_start": W.time12(r["att_start"]) if r["att_start"] else "",
                             "att_grace": W.time12(r["att_grace"]) if r["att_grace"] else "", "t_start": r["att_start"] or ds, "t_grace": r["att_grace"] or dg})
-        return {"rows": out, "kinds": list(W.EMP_KINDS), "left_label": W.EMP_LEFT, "default_start": ds, "default_grace": dg}
+        return {"rows": out, "kinds": list(W.BAKERY_ROLES), "per_sack_roles": list(W.PER_SACK_ROLES), "left_label": W.EMP_LEFT, "default_start": ds, "default_grace": dg}
 
     def save_employee(self, p):
         self._need_login()
         name = (p.get("name") or "").strip()
         if not name: raise UIError("الاسم مطلوب")
-        kind = p.get("kind")
-        if kind not in W.EMP_KINDS: raise UIError("اختر النوع: " + " / ".join(W.EMP_KINDS))
-        try: sal = W._f(p.get("salary")); comm = W._f(p.get("commission"))
-        except ValueError: raise UIError("المرتب والعمولة يجب أن يكونا أرقامًا")
+        role = p.get("kind")
+        if role not in W.BAKERY_ROLES: raise UIError("اختار الوظيفة: " + " / ".join(W.BAKERY_ROLES))
+        kind = "عامل"; p = {**p, "job": role, "pay_period": "يومي", "commission": 0}       # كل عمال الفرن باليومية (مفيش مرتبات)
+        try: sal = W._f(p.get("salary")); comm = 0.0; rate = W._f(p.get("sack_rate"))
+        except ValueError: raise UIError("اليومية وسعر الشيكارة لازم أرقام")
+        if sal < 0 or rate < 0: raise UIError("مفيش أرقام بالسالب")
+        if role in W.PER_SACK_ROLES:
+            sal = 0.0
+            if rate <= 0: raise UIError(f"اكتب سعر الشيكارة لـ«{role}»")
+        else: rate = 0.0
+        if not p.get("t_start") or not p.get("t_grace"):
+            with W.db() as c: ds_, dg_ = self._att_times(c)
+            p["t_start"] = p.get("t_start") or ds_; p["t_grace"] = p.get("t_grace") or dg_
         if comm < 0: raise UIError("العمولة لا تكون بالسالب")
         cunit = p.get("comm_unit") if p.get("comm_unit") in W.COMM_UNITS else "شيكارة"
         t_start, t_grace = W.parse_time(p.get("t_start") or ""), W.parse_time(p.get("t_grace") or "")
@@ -2146,17 +2283,17 @@ class Api:
         if W.minutes_of(t_grace) < W.minutes_of(t_start): raise UIError("«آخر ميعاد من غير تأخير» لازم يكون بعد ميعاد الحضور أو زيه")
         job = (p.get("job") or "").strip(); phone = (p.get("phone") or "").strip(); edit = p.get("id")
         period = p.get("pay_period") if p.get("pay_period") in PAY_PERIODS else ("يومي" if kind == "عامل" else "شهري")
-        ctxt = f"، عمولة {W.fmt(comm)}/{cunit}" if kind == "مندوب" else ""
+        ctxt = f"، {W.fmt(rate)} على الشيكارة" if role in W.PER_SACK_ROLES else ""
         with W.db() as c:
             if edit:
                 old = c.execute("SELECT commission, comm_unit FROM employees WHERE id=?", (edit,)).fetchone()
                 if abs(float(old["commission"] or 0) - comm) > 1e-9 or (old["comm_unit"] or "شيكارة") != cunit:
                     ctxt += f" (العمولة {W.fmt(old['commission'] or 0)}/{old['comm_unit'] or 'شيكارة'}←{W.fmt(comm)}/{cunit} — على الفواتير الجديدة فقط)"
-                c.execute("UPDATE employees SET name=?,kind=?,job=?,phone=?,salary=?,commission=?,comm_unit=?,att_start=?,att_grace=?,pay_period=? WHERE id=?", (name, kind, job, phone, sal, comm, cunit, t_start, t_grace, period, edit))
-                W.log(c, "تعديل موظف", f"{name} ({kind}{' - ' + job if job else ''}، مرتب {W.fmt(sal)} — قبض {period}{ctxt})")
+                c.execute("UPDATE employees SET name=?,kind=?,job=?,phone=?,salary=?,commission=?,comm_unit=?,att_start=?,att_grace=?,pay_period=?,sack_rate=? WHERE id=?", (name, kind, job, phone, sal, comm, cunit, t_start, t_grace, period, rate, edit))
+                W.log(c, "تعديل عامل", f"{name} ({role}{'، يومية ' + W.fmt(sal) if role not in W.PER_SACK_ROLES else ''}{ctxt})")
             else:
-                c.execute("INSERT INTO employees(name,kind,job,phone,salary,commission,comm_unit,att_start,att_grace,pay_period) VALUES(?,?,?,?,?,?,?,?,?,?)", (name, kind, job, phone, sal, comm, cunit, t_start, t_grace, period))
-                W.log(c, "إضافة موظف", f"{name} ({kind}{' - ' + job if job else ''}، مرتب {W.fmt(sal)} — قبض {period}{ctxt})")
+                c.execute("INSERT INTO employees(name,kind,job,phone,salary,commission,comm_unit,att_start,att_grace,pay_period,sack_rate) VALUES(?,?,?,?,?,?,?,?,?,?,?)", (name, kind, job, phone, sal, comm, cunit, t_start, t_grace, period, rate))
+                W.log(c, "إضافة عامل", f"{name} ({role}{'، يومية ' + W.fmt(sal) if role not in W.PER_SACK_ROLES else ''}{ctxt})")
         return True
 
     def toggle_employee(self, eid):
@@ -2184,6 +2321,9 @@ class Api:
         from datetime import date as _d, timedelta as _td
         with W.db() as c:
             e = c.execute("SELECT * FROM employees WHERE id=?", (eid,)).fetchone()
+            if (e["job"] or "") in W.PER_SACK_ROLES:
+                n = c.execute("SELECT COUNT(*) FROM production WHERE p_date=?", (d,)).fetchone()[0]; pn = W.sacks_paid(n); rate = float(e["sack_rate"] or 0)
+                return {"period": "يومي", "label": f"حساب {d}: {n:g} شيكارة + 1 إكرامية = {pn:g} × {W.fmt(rate)}" if n else f"حساب {d}: مفيش شكاير", "amount": _r2(pn * rate)}
             per = pay_period_of(e); sal = float(e["salary"] or 0)
             if per in PERIOD_DAYS:
                 start = (_d.fromisoformat(d) - _td(days=PERIOD_DAYS[per] - 1)).isoformat()
@@ -2243,7 +2383,8 @@ class Api:
         """العمال الشغالين لصرف اليوميات (mode=daily) أو الشيالين لصرف/إضافة التشوين (mode=load_pay / load_add)."""
         self._need_login(); d = W.check_date(d)
         with W.db() as c:
-            ws = c.execute("SELECT id,name,salary,job,kind,pay_period FROM employees WHERE kind='عامل' AND COALESCE(active,1)=1 ORDER BY name").fetchall()
+            ws = c.execute("SELECT id,name,salary,job,kind,pay_period,sack_rate FROM employees WHERE kind='عامل' AND COALESCE(active,1)=1 ORDER BY name").fetchall()
+            nsack = c.execute("SELECT COUNT(*) FROM production WHERE p_date=?", (d,)).fetchone()[0]
             if mode == "daily": ws = [r for r in ws if pay_period_of(r) == "يومي"]      # اللي بيقبض أسبوعي/كل أسبوعين بيتصرفله من «صرف مرتب»
             if mode != "daily": ws = [r for r in ws if W.is_loader(r["kind"], r["job"])]
             out = []
@@ -2251,8 +2392,11 @@ class Api:
                 att = {r[0]: r[1] for r in c.execute("SELECT employee_id, present FROM attendance WHERE a_date=?", (d,)).fetchall()}
                 paid = {r[0] for r in c.execute("SELECT employee_id FROM expenses WHERE kind='مرتب' AND category='يوميات' AND exp_date=?", (d,)).fetchall()}
                 for r in ws:
-                    notes = (["✔ اتصرفله يومية اليوم ده"] if r["id"] in paid else []) + (["غايب"] if att and not att.get(r["id"]) else [])
-                    out.append({"id": r["id"], "name": r["name"], "amount": _r2(r["salary"]), "checked": not (r["id"] in paid or (att and not att.get(r["id"]))), "info": " • ".join(notes)})
+                    ps_ = (r["job"] or "") in W.PER_SACK_ROLES
+                    amt = W.sacks_paid(nsack) * float(r["sack_rate"] or 0) if ps_ else float(r["salary"] or 0)
+                    notes = ([f"{r['job']}: {nsack:g} شيكارة + 1 = {W.sacks_paid(nsack):g} × {W.fmt(r['sack_rate'] or 0)}" if nsack else f"{r['job']}: مفيش شكاير النهارده"] if ps_ else [r["job"] or ""]) \
+                        + (["✔ اتصرفله يومية اليوم ده"] if r["id"] in paid else []) + (["غايب"] if att and not att.get(r["id"]) else [])
+                    out.append({"id": r["id"], "name": r["name"], "amount": _r2(amt), "checked": not (r["id"] in paid or (att and not att.get(r["id"]))), "info": " • ".join(notes)})
             elif mode == "load_pay":
                 acc = {r[0]: (r[1], float(r[2]), float(r[3])) for r in c.execute("SELECT employee_id, COUNT(*), COALESCE(SUM(amount),0), COALESCE(SUM(tons*1.0/crew),0) FROM loading_logs WHERE l_date=? AND expense_id IS NULL GROUP BY employee_id", (d,)).fetchall()}
                 paid = {r[0] for r in c.execute("SELECT DISTINCT employee_id FROM loading_logs WHERE l_date=? AND expense_id IS NOT NULL", (d,)).fetchall()}
@@ -2277,7 +2421,12 @@ class Api:
         with W.db() as c:
             for eid, a in picked:
                 if mode == "daily":
-                    c.execute("INSERT INTO expenses(exp_date,kind,category,amount,notes,employee_id,deducted,created_at) VALUES(?,?,?,?,?,?,0,?)", (d, "مرتب", "يوميات", a, f"يومية يوم {d}", eid, W.now_ts()))
+                    job = (c.execute("SELECT job FROM employees WHERE id=?", (eid,)).fetchone() or [""])[0] or ""
+                    if job in W.PER_SACK_ROLES:
+                        n = c.execute("SELECT COUNT(*) FROM production WHERE p_date=?", (d,)).fetchone()[0]
+                        note = f"حساب الشكاير يوم {d}: {n:g} + 1 إكرامية"
+                    else: note = f"يومية يوم {d}"
+                    c.execute("INSERT INTO expenses(exp_date,kind,category,amount,notes,employee_id,deducted,created_at) VALUES(?,?,?,?,?,?,0,?)", (d, "مرتب", "يوميات", a, note, eid, W.now_ts()))
                 else:
                     logs = c.execute("SELECT id, tons, crew FROM loading_logs WHERE l_date=? AND employee_id=? AND expense_id IS NULL", (d, eid)).fetchall()
                     t = sum(float(x["tons"]) / max(int(x["crew"] or 1), 1) for x in logs)

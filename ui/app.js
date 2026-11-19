@@ -330,6 +330,7 @@ const SCREENS = {
   "itm:stock": { title: "المخزون", icon: "box", key: "Ctrl+I" },
   "itm:sales": { title: "المبيعات (لكل صنف)", icon: "sale" },
   "itm:buys": { title: "المشتريات (لكل صنف)", icon: "buy" },
+  "itm:use": { title: "استهلاك المستلزمات", icon: "box" },
   "itm:damaged": { title: "الهالك والتالف", icon: "trash" },
   "prd:new": { title: "الإنتاج (شيكارة جديدة)", icon: "plus", key: "F4" },
   "prd:log": { title: "سجل الإنتاج", icon: "list" },
@@ -345,7 +346,8 @@ const SCREENS = {
   "rep:reps": { title: "تقرير المناديب", icon: "users" },
   "rep:targets": { title: "تارجت المناديب", icon: "chart" },
   "rep:log": { title: "سجل النشاط", icon: "list" },
-  "emp:list": { title: "الموظفون", icon: "users" },
+  "emp:list": { title: "العمال", icon: "users" },
+  "emp:bread": { title: "صرف العيش للعمال", icon: "cash" },
   "emp:att": { title: "الحضور والغياب", icon: "check" },
   "emp:attlog": { title: "سجل الحضور", icon: "list" },
   "emp:attreq": { title: "حضور المناديب بالموقع", icon: "phone" },
@@ -419,7 +421,7 @@ function renderLogin() {
 /* ===================== الهيكل: القايمة الجانبية + الشريط اللي فوق ===================== */
 // الصلاحيات: المالك كله، وغيره الشاشات المسموحله بيها بس
 /* مخفية مؤقتاً في خير زمان (لحد ما نظام المناديب يتحدد) — الكود موجود بس مش ظاهر */
-const HIDDEN_SCREENS = new Set(["req", "rep:reps", "rep:targets", "emp:veh"]);
+const HIDDEN_SCREENS = new Set(["req", "rep:reps", "rep:targets", "emp:veh", "smp:items", "smp:out", "smp:in", "emp:att", "emp:attlog", "acc:subcash", "acc:assets"]);
 const can = (k) => !!S.me && !HIDDEN_SCREENS.has(k) && (S.me.owner || (S.me.screens || []).includes(k) || (k === "gate:log" && !S.me.rep && (S.me.screens || []).includes("log")));
 const firstScreen = () => (can("home") ? "home" : (S.me.screens || [])[0] || "home");
 function navBtn(key) {
@@ -435,8 +437,8 @@ function navGroups() {
     ["الفواتير", "list", ["inv:مبيعات", "inv:مشتريات", "inv:مرتجع مبيعات", "inv:مرتجع مشتريات", "gate:log", "log"]],
     ["السندات", "cash", ["vch:new", "vch:log"]],
     ["العملاء والموردون", "users", ["par:list"]],
-    ["الأصناف والمخزون", "box", ["itm:list", "itm:stock", "itm:sales", "itm:buys", "itm:damaged", ["العينات", "box", ["smp:items", "smp:out", "smp:in"]]]],
-    ["الموظفون", "users", ["emp:list", "emp:att", "emp:attlog"]],
+    ["الأصناف والمخزون", "box", ["itm:list", "itm:stock", "itm:use", "itm:sales", "itm:buys", "itm:damaged", ["العينات", "box", ["smp:items", "smp:out", "smp:in"]]]],
+    ["العمال", "users", ["emp:list", "emp:bread", "emp:att", "emp:attlog"]],
     ["الحسابات", "calc", ["acc:statement", "acc:balances", "acc:cash", "acc:subcash", "acc:assets"]],
     ["التقارير", "chart", ["rep:daily", "rep:production", S.me.owner ? "rep:monthly" : null, S.me.owner ? "rep:profit" : null, "rep:log"]],
     ["الإعدادات", "edit", ["set:main", S.me.owner ? "set:users" : null], [["إصدار نسخة احتياطية", "save", backupNow], ...(S.me.owner && S.boot && !S.boot.web ? [["استرجاع نسخة احتياطية", "upload", restoreBackup]] : [])]],
@@ -527,10 +529,10 @@ window.addEventListener("focus", rollIfNewDay);
 function resetDates(k) {
   const td = S.boot.today, ms = monthStart();
   const R = {
-    "log": () => (S.logState = null), "gate:log": () => (S.gateLog = null), "vch:log": () => (S.vlog = null), "acc:cash": () => (S.cashSt = null), "acc:subcash": () => (S.scSt = null),
+    "log": () => (S.logState = null), "gate:log": () => (S.gateLog = null), "emp:bread": () => (S.bgSt = null), "vch:log": () => (S.vlog = null), "acc:cash": () => (S.cashSt = null), "acc:subcash": () => (S.scSt = null),
     "acc:statement": () => { if (S.stmt) { S.stmt.from = ms; S.stmt.to = td; } },
     "acc:assets": () => { if (S.astSt) { S.astSt.from = ms; S.astSt.to = td; } },
-    "itm:damaged": () => (S.dmgSt = null), "rep:reps": () => (S.rpSt = null), "rep:log": () => (S.lgSt = null), "rep:profit": () => (S.pfSt = null),
+    "itm:damaged": () => (S.dmgSt = null), "itm:use": () => (S.useSt = null), "rep:reps": () => (S.rpSt = null), "rep:log": () => (S.lgSt = null), "rep:profit": () => (S.pfSt = null),
     "rep:daily": () => { S.dailyDay = null; S.trSt = null; }, "rep:monthly": () => (S.monSt = null),
     "emp:att": () => (S.attDay = null), "emp:attlog": () => (S.alSt = null),
     "emp:veh": () => { if (S.vehSt) S.vehSt = { from: td, to: td, sel: S.vehSt.sel }; },
@@ -568,6 +570,7 @@ async function go(key, force, fromBack) {
     else if (key === "itm:sales") await renderFlow(box, "مبيعات");
     else if (key === "itm:buys") await renderFlow(box, "مشتريات");
     else if (key === "itm:damaged") await renderDamaged(box);
+    else if (key === "itm:use") await renderConsume(box);
     else if (key === "prd:new") await renderProduction(box);
     else if (key === "prd:log") await renderProdLog(box);
     else if (key === "rep:production") await renderProdReport(box);
@@ -583,6 +586,7 @@ async function go(key, force, fromBack) {
     else if (key === "rep:targets") await renderTargets(box);
     else if (key === "rep:log") await renderActivity(box);
     else if (key === "emp:list") await renderEmployees(box);
+    else if (key === "emp:bread") await renderBreadGive(box);
     else if (key === "emp:att") await renderAttendance(box);
     else if (key === "emp:attlog") await renderAttLog(box);
     else if (key === "emp:attreq") await renderRequests(box, "att");
@@ -687,6 +691,9 @@ async function renderCashier(box) {
   const totalEl = h("b", { class: "qs-total-v" }, "0.00"), linesEl = h("div", { class: "qs-lines" }), cntEl = h("span", { class: "hint" });
   const printBtn = h("button", { class: "btn primary big qs-print", onclick: () => doSale(true) }, icon("print", 22), "طباعة وحفظ");
   const saveBtn = h("button", { class: "btn qs-save", onclick: () => doSale(false) }, icon("save", 18), "حفظ");
+  let payMode = "نقدي";
+  const modeSeg = h("div", { class: "seg qs-mode" }, ["نقدي", "زيادة"].map((m) => h("button", { type: "button", "data-v": m, class: m === payMode ? "on" : "", title: m === "زيادة" ? "بيطلع من غير فلوس (لله أو لقريب) — تكلفته على المالك" : "مدفوع في ساعتها",
+    onclick: () => { payMode = m; modeSeg.querySelectorAll("button").forEach((b) => b.classList.toggle("on", b.dataset.v === m)); calc(); } }, m)));
   const clearBtn = h("button", { class: "btn", onclick: () => clearAll() }, icon("x", 18), "مسح");
   let busy = false;
   const tiles = st.sizes.map((z) => {
@@ -706,12 +713,13 @@ async function renderCashier(box) {
   });
   function picked() { return tiles.map((t) => ({ t, q: Math.round(num(t.inp.value)) })).filter((x) => x.q > 0); }
   function calc() {
-    const P = picked(); let tot = 0, loaves = 0;
+    const P = picked(), free = payMode === "زيادة"; let tot = 0, loaves = 0;
     linesEl.replaceChildren(...(P.length ? P.map(({ t, q }) => { const v = q * t.z.price; tot += v; loaves += q;
-      return h("div", { class: "qs-line" }, h("span", null, t.z.name), h("span", { class: "hint" }, `${q} × ${fmt(t.z.price)}`), h("b", null, fmt(v))); })
+      return h("div", { class: "qs-line" }, h("span", null, t.z.name), h("span", { class: "hint" }, `${q} × ${fmt(free ? 0 : t.z.price)}`), h("b", null, fmt(free ? 0 : v))); })
       : [h("div", { class: "hint qs-empty" }, "دوس على الرغيف أو اكتب العدد")]));
     tiles.forEach(({ inp, el }) => el.classList.toggle("on", num(inp.value) > 0));
-    totalEl.textContent = fmt(tot); mTot.textContent = fmt(tot) + " ج"; cntEl.textContent = loaves ? `${loaves} رغيف` : "";
+    if (free) tot = 0;
+    totalEl.textContent = free ? "0.00 (زيادة)" : fmt(tot); mTot.textContent = free ? "زيادة" : fmt(tot) + " ج"; totalEl.classList.toggle("free", free); cntEl.textContent = loaves ? `${loaves} رغيف` : "";
     printBtn.disabled = mBtn.disabled = saveBtn.disabled = mSave.disabled = !P.length;
   }
   function clearAll() { tiles.forEach((t) => (t.inp.value = "")); calc(); tiles[0] && tiles[0].inp.focus(); }
@@ -720,10 +728,10 @@ async function renderCashier(box) {
     const P = picked(); if (!P.length) { toast("اختار الرغيف واكتب العدد الأول", "err"); return; }
     busy = true; printBtn.disabled = mBtn.disabled = saveBtn.disabled = mSave.disabled = true;
     try {
-      const r = await ownerRetry((pw) => api("quick_sale", P.map(({ t, q }) => ({ item_id: t.z.item_id, qty: q })), S.boot.today, pw, print));
+      const r = await ownerRetry((pw) => api("quick_sale", P.map(({ t, q }) => ({ item_id: t.z.item_id, qty: q })), S.boot.today, pw, print, payMode));
       if (!r) return;
-      toast(`✔ بون رقم ${r.number} — ${fmt(r.net)} ج` + (print ? " • البون بيتطبع ..." : " • اتحفظ من غير طباعة"), "ok", 3500);
-      tiles.forEach((t) => (t.inp.value = ""));
+      toast(`✔ بون رقم ${r.number} — ` + (payMode === "زيادة" ? "زيادة من غير فلوس" : `${fmt(r.net)} ج`) + (print ? " • البون بيتطبع ..." : " • اتحفظ من غير طباعة"), "ok", 3500);
+      tiles.forEach((t) => (t.inp.value = "")); payMode = "نقدي"; modeSeg.querySelectorAll("button").forEach((b) => b.classList.toggle("on", b.dataset.v === "نقدي"));
       await reload();
     } catch (e) { alertBox(e.message); }
     finally { busy = false; calc(); tiles[0] && tiles[0].inp.focus(); }
@@ -743,7 +751,7 @@ async function renderCashier(box) {
         h("div", { class: "qs-tiles" }, tiles.map((t) => t.el))),
       h("div", { class: "qs-side" },
         h("section", { class: "card anim-up d2 qs-cart" }, h("div", { class: "card-h" }, h("h2", null, "البون"), cntEl), h("div", { class: "qs-cart-in" }, linesEl,
-          h("div", { class: "qs-total" }, h("span", null, "الإجمالي"), totalEl),
+          modeSeg, h("div", { class: "qs-total" }, h("span", null, "الإجمالي"), totalEl),
           h("div", { class: "qs-foot" }, clearBtn, saveBtn, printBtn))))),
     mBar));
   calc();
@@ -2115,10 +2123,13 @@ function prodSheetTable(sizes, { onOpen, onKey, maxH, showDate } = {}) {
     cols: [showDate ? { h: "التاريخ", key: "date" } : null, { h: "الشيكارة", num: true, fn: (r) => h("b", null, String(r.sack_no)) },
       ...sizes.map((n) => ({ h: n, num: true, fn: (r) => (r.cells[n] ? fq(r.cells[n]) : h("span", { class: "hint" }, "—")) })),
       { h: "الأرغفة", num: true, fn: (r) => h("b", null, fq(r.loaves)) }, { h: "القيمة", num: true, fn: (r) => h("b", null, fmt(r.value)) },
+      S.me.owner && showDate ? { h: "سعر الدقيق", num: true, fn: (r) => fmt(r.flour_cost || 0) } : null,
+      S.me.owner && showDate ? { h: "ربح الشيكارة", num: true, sort: (r) => r.profit, fn: (r) => h("b", { style: { color: (r.profit || 0) < 0 ? "var(--red)" : "var(--green)" } }, fmt(r.profit || 0)) } : null,
       { h: "الدقيق", fn: (r) => h("span", { class: "hint" }, `${fq(r.flour_qty)} ${r.flour}`) }, { h: "الوقت", key: "time", cls: "hint" }, { h: "ملاحظات", key: "notes", cls: "hint" }].filter(Boolean),
     onOpen, onKey,
     totals: (rs, isSel) => [h("b", null, isSel ? "إجمالي المحدد" : "الإجمالي"), totItem("الشكاير", fq(rs.reduce((a, r) => a + r.flour_qty, 0))),
-      totItem("الأرغفة", fq(rs.reduce((a, r) => a + r.loaves, 0))), totItem("القيمة", fmt(rs.reduce((a, r) => a + r.value, 0)), true)] });
+      totItem("الأرغفة", fq(rs.reduce((a, r) => a + r.loaves, 0))), totItem("القيمة", fmt(rs.reduce((a, r) => a + r.value, 0)), true),
+      S.me.owner && showDate ? totItem("الربح", fmt(rs.reduce((a, r) => a + (r.profit || 0), 0)), true) : null].filter(Boolean) });
 }
 /* إجماليات كل مقاس تحت السجل (زي آخر الورقة): طاولات • أرغفة • جنيه */
 function prodTotals(sh) {
@@ -2241,10 +2252,10 @@ async function renderGateLog(box) {
   const from = dateIn(G.from, "من"), to = dateIn(G.to, "إلى"), tblBox = h("div");
   const T = selTable({ maxH: "calc(100vh - 330px)", empty: "مفيش بونات في الفترة دي",
     cols: [{ h: "بون", num: true, fn: (r) => h("b", null, r.number) }, { h: "التاريخ", key: "date" }, { h: "الوقت", key: "time", cls: "hint" },
-      { h: "الأصناف", key: "items" }, { h: "الأرغفة", num: true, fn: (r) => fq(r.loaves) }, { h: "المبلغ", num: true, fn: (r) => h("b", null, fmt(r.net)) },
+      { h: "النوع", fn: (r) => (r.type === "زيادة" ? h("span", { class: "pill k-مرتجع" }, "زيادة") : "نقدي") }, { h: "الأصناف", key: "items" }, { h: "الأرغفة", num: true, fn: (r) => fq(r.loaves) }, { h: "المبلغ", num: true, fn: (r) => h("b", null, fmt(r.net)) },
       { h: "البون", fn: (r) => (r.printed ? h("span", { class: "pill" }, "اتطبع") : h("span", { class: "hint" }, "حفظ بس")) }],
     onOpen: (r) => showInvoice(r.id),
-    totals: (rs, isSel) => [h("b", null, isSel ? "إجمالي المحدد" : "الإجمالي"), totItem("البونات", rs.length), totItem("الأرغفة", fq(rs.reduce((a, r) => a + r.loaves, 0))),
+    totals: (rs, isSel) => [h("b", null, isSel ? "إجمالي المحدد" : "الإجمالي"), totItem("البونات", rs.length), totItem("الأرغفة", fq(rs.reduce((a, r) => a + r.loaves, 0))), totItem("أرغفة الزيادة", fq(rs.filter((r) => r.type === "زيادة").reduce((a, r) => a + r.loaves, 0))),
       totItem("المبلغ", fmt(rs.reduce((a, r) => a + r.net, 0)), true)] });
   tblBox.replaceChildren(T.el);
   async function load() {
@@ -2693,29 +2704,28 @@ async function renderSubcash(box) {
 /* ===================== الموظفون ===================== */
 async function renderEmployees(box) {
   const E = S.empSt || (S.empSt = { f: "الكل" });
-  let meta = { kinds: ["موظف", "عامل", "مندوب"], left_label: "اللي سابوا الشغل", default_start: "09:00", default_grace: "09:30" };
+  let meta = { kinds: ["فران", "خراط", "تستنجي", "سحلجي", "مبيع", "ديليفري"], per_sack_roles: ["فران", "خراط"], left_label: "اللي سابوا الشغل", default_start: "09:00", default_grace: "09:30" };
   const seg = h("div", { class: "seg wrap" });
   const T = selTable({
-    cols: [{ h: "ID", key: "id", cls: "hint" }, { h: "الاسم", fn: (r) => h("b", null, r.name) }, { h: "النوع", fn: (r) => r.kind + (r.left ? ` — ساب ${r.left_date}` : "") }, { h: "الصفة", key: "job", cls: "hint" },
-      { h: "الهاتف", key: "phone" }, { h: "المرتب / اليومية", num: true, sort: (r) => r.salary, fn: (r) => [fmt(r.salary), h("span", { class: "hint", style: { marginInlineStart: "6px" } }, r.pay_period)] }, { h: "رصيد السلف", num: true, fn: (r) => (r.adv ? h("b", { style: { color: "var(--orange)" } }, fmt(r.adv)) : fmt(0)) },
-      { h: "العمولة", fn: (r) => (r.is_rep ? "حسب الصنف" : "") }, { h: "عمولة باقية له", num: true, fn: (r) => (r.is_rep ? fmt(r.due) : "") }, { h: "ميعاد الحضور", fn: (r) => (r.att_start ? `${r.att_start} – ${r.att_grace}` : ""), cls: "hint" }],
+    cols: [{ h: "ID", key: "id", cls: "hint" }, { h: "الاسم", fn: (r) => h("b", null, r.name) }, { h: "الوظيفة", fn: (r) => r.role + (r.left ? ` — ساب ${r.left_date}` : "") },
+      { h: "الهاتف", key: "phone" }, { h: "الحساب", num: true, sort: (r) => (r.per_sack ? r.sack_rate : r.salary), fn: (r) => (r.per_sack ? [fmt(r.sack_rate), h("span", { class: "hint", style: { marginInlineStart: "6px" } }, "على الشيكارة")] : [fmt(r.salary), h("span", { class: "hint", style: { marginInlineStart: "6px" } }, "يومية")]) },
+      { h: "رصيد السلف", num: true, fn: (r) => (r.adv ? h("b", { style: { color: "var(--orange)" } }, fmt(r.adv)) : fmt(0)) }, { h: "ميعاد الحضور", fn: (r) => (r.att_start ? `${r.att_start} – ${r.att_grace}` : ""), cls: "hint" }],
     onOpen: (r) => statement(r), onKey: (e) => { if (e.key === "Delete") del(); },
     menu: (r) => [{ label: "👁 عرض (كشف الموظف)", fn: () => statement(r) }, { label: "🗑 حذف", danger: true, fn: () => del() }, { label: "✏️ تعديل", fn: () => form(r) }],
-    totals: (rs) => { acts(); return [totItem("العدد", rs.length), totItem("المرتبات (بالشهر)", fmt(rs.filter((r) => r.kind !== "عامل").reduce((a, r) => a + r.salary * ({ "أسبوعي": 52 / 12, "كل أسبوعين": 26 / 12, "يومي": 26 }[r.pay_period] || 1), 0))),
-      totItem("يوميات العمال", fmt(rs.filter((r) => r.kind === "عامل").reduce((a, r) => a + r.salary, 0))), totItem("رصيد السلف", fmt(rs.reduce((a, r) => a + r.adv, 0))), totItem("عمولات باقية", fmt(rs.reduce((a, r) => a + (r.is_rep ? r.due : 0), 0)))]; } });
+    totals: (rs) => { acts(); return [totItem("العدد", rs.length), totItem("اليوميات", fmt(rs.filter((r) => !r.per_sack).reduce((a, r) => a + r.salary, 0))),
+      totItem("على الشيكارة", fmt(rs.filter((r) => r.per_sack).reduce((a, r) => a + r.sack_rate, 0))), totItem("رصيد السلف", fmt(rs.reduce((a, r) => a + r.adv, 0)))]; } });
   async function load() { let r; try { r = await api("employees", E.f); } catch (e) { return toast(e.message, "err"); } meta = r;
     if (!seg.children.length) ["الكل", ...r.kinds, r.left_label].forEach((k) => seg.appendChild(h("button", { "data-v": k, class: E.f === k ? "on" : "", onclick: () => { E.f = k; seg.querySelectorAll("button").forEach((b) => b.classList.toggle("on", b.dataset.v === k)); load(); } }, k)));
     T.setRows(r.rows); acts(); }
   const sel = () => T.selected()[0];
-  const one = (fn) => () => { const r = sel(); if (!r) return toast("حدد موظف الأول"); fn(r); };
+  const one = (fn) => () => { const r = sel(); if (!r) return toast("حدد عامل الأول"); fn(r); };
   async function form(r) {
-    r = r || { id: null, name: "", kind: "موظف", job: "", phone: "", salary: 0, commission: 0, comm_unit: "شيكارة", t_start: meta.default_start, t_grace: meta.default_grace, pay_period: "" };
+    r = r || { id: null, name: "", role: meta.kinds[0], phone: "", salary: 0, sack_rate: 0, t_start: meta.default_start, t_grace: meta.default_grace };
     let ok = false;
-    await formModal(r.id ? `تعديل «${r.name}»` : "موظف جديد", [{ key: "name", label: "الاسم", value: r.name, wide: true }, { key: "kind", label: "النوع", value: r.kind, options: meta.kinds },
-      { key: "job", label: "الصفة (سواق، محاسب، شيال...)", value: r.job }, { key: "phone", label: "الهاتف", value: r.phone }, { key: "salary", label: "المرتب (للعامل: اليومية)", value: r.salary, num: true },
-      { key: "pay_period", label: "بيقبض", value: r.pay_period || (r.kind === "عامل" ? "يومي" : "شهري"), options: ["يومي", "أسبوعي", "كل أسبوعين", "شهري"],
-        hint: "العامل الأسبوعي: المرتب هنا = اليومية، والصرف بيحسب اليومية × أيام حضوره في الأسبوع" },
-      { key: "commission", label: "عمولة المندوب (للفواتير القديمة بس)", value: r.commission, num: true, hint: "الفواتير الجديدة بتتحسب بعمولة كل صنف (من شاشة الأصناف)" }, { key: "comm_unit", label: "العمولة القديمة على كل", value: r.comm_unit, options: ["شيكارة", "طن"] },
+    await formModal(r.id ? `تعديل «${r.name}»` : "عامل جديد", [{ key: "name", label: "الاسم", value: r.name, wide: true },
+      { key: "kind", label: "الوظيفة", value: meta.kinds.includes(r.role) ? r.role : meta.kinds[0], options: meta.kinds }, { key: "phone", label: "الهاتف", value: r.phone },
+      { key: "salary", label: "اليومية (للتستنجي والسحلجي والمبيع والديليفري)", value: r.salary, num: true },
+      { key: "sack_rate", label: "سعر الشيكارة (للفران والخراط)", value: r.sack_rate, num: true, hint: "الفران والخراط بياخدوا حساب شكاير اليوم + شيكارة زيادة إكرامية" },
       { key: "t_start", label: "ميعاد الحضور", value: r.t_start, type: "time" }, { key: "t_grace", label: "آخر ميعاد من غير تأخير", value: r.t_grace, type: "time" }],
       { onSave: async (v) => { await api("save_employee", { ...v, id: r.id }); ok = true; toast(`✔ اتحفظ «${v.name}»`, "ok"); } });
     if (ok) load();
@@ -2726,7 +2736,7 @@ async function renderEmployees(box) {
   }
   const paySalary = one(async (r) => {
     let sg; try { sg = await api("salary_suggest", r.id, S.boot.today); } catch (e) { return toast(e.message, "err"); }
-    const what = sg.period === "يومي" ? "يومية" : sg.period === "شهري" ? "مرتب" : `مرتب ${sg.period}`;
+    const what = r.per_sack ? "حساب الشكاير" : "يومية";
     money(`صرف ${what}: ${r.name} — رصيد السلف ${fmt(r.adv)}`, null,
       [{ key: "amount", label: "المبلغ", value: sg.amount, num: true }, { key: "deduct", label: `خصم من السلفة (عليه ${fmt(r.adv)})`, value: 0, num: true },
         { key: "label", label: "عن", value: sg.label, wide: true }, { key: "date", label: "التاريخ", value: S.boot.today, type: "date" }],
@@ -2766,7 +2776,7 @@ async function renderEmployees(box) {
       recalc();
     }
     bags.addEventListener("input", () => { const b = num(bags.value); tons.value = b ? (b / 20).toString() : ""; recalc(); }); [tons, price].forEach((x) => x.addEventListener("input", recalc)); d.addEventListener("change", fill);
-    const title = { daily: "صرف يوميات العمال", load_pay: "صرف تشوين اليوم", load_add: "إضافة تشوين (نقلة)" }[mode];
+    const title = { daily: "صرف يوميات العمال (والفران والخراط بالشيكارة)", load_pay: "صرف تشوين اليوم", load_add: "إضافة تشوين (نقلة)" }[mode];
     const extra = mode === "load_add" ? h("div", { class: "form", style: { padding: 0 } }, h("label", { class: "fld" }, "عدد الأطنان", tons), h("label", { class: "fld" }, "أو عدد الشكاير", bags), h("label", { class: "fld" }, "سعر الطن", price), h("label", { class: "fld span2" }, "ملاحظات (العربية / المورد …)", notes)) : null;
     fill();
     const ok = await modal({ title, wide: true, enter: false, body: [h("label", { class: "fld", style: { maxWidth: "220px" } }, "التاريخ", d), extra,
@@ -2804,24 +2814,102 @@ async function renderEmployees(box) {
         try { await api("delete_loading", x.id); fill(); } catch (e) { alertBox(e.message); } return false; } }, { label: "قفل", ret: true }] });
     fill();
   }
-  async function del() { const r = sel(); if (!r) return toast("حدد موظف الأول"); const pw = await askDelPw(`حذف «${r.name}»؟`); if (!pw) return; try { await api("delete_employee", r.id, pw); toast("✔ اتحذف", "ok"); load(); } catch (e) { alertBox(e.message, "مينفعش يتحذف"); } }
-  async function toggle() { const r = sel(); if (!r) return toast("حدد موظف الأول");
+  async function del() { const r = sel(); if (!r) return toast("حدد عامل الأول"); const pw = await askDelPw(`حذف «${r.name}»؟`); if (!pw) return; try { await api("delete_employee", r.id, pw); toast("✔ اتحذف", "ok"); load(); } catch (e) { alertBox(e.message, "مينفعش يتحذف"); } }
+  async function toggle() { const r = sel(); if (!r) return toast("حدد عامل الأول");
     const msg = r.left ? `«${r.name}» رجع الشغل تاني؟` : `«${r.name}» ساب الشغل؟\nهيختفي من الحضور والمناديب، وسجله كله هيفضل زي ما هو.` + (r.adv ? `\n• عليه سلف لسه: ${fmt(r.adv)}` : "") + (r.is_rep && r.due ? `\n• ليه عمولة لسه: ${fmt(r.due)}` : "");
     if (!(await confirmBox(msg))) return; await api("toggle_employee", r.id); load(); }
   const bar = h("div", { class: "card-h" });
   function acts() {
     const r = sel();
-    bar.replaceChildren(h("h2", null, "الموظفون"), h("button", { class: "btn primary", onclick: () => form(null) }, icon("plus", 18), "إضافة"),
-      h("button", { class: "btn", onclick: one(form) }, icon("edit", 18), "تعديل"), h("button", { class: "btn gold", onclick: paySalary }, icon("cash", 18), r && r.kind === "عامل" ? "صرف يومية" : "صرف مرتب"),
-      h("button", { class: "btn", onclick: payAdv }, "صرف سلفة"), !r || r.is_rep ? h("button", { class: "btn", onclick: payComm }, "صرف عمولة") : null,
-      h("button", { class: "btn", onclick: () => wk("daily") }, "صرف يوميات العمال"),
-      !r || r.loader ? [h("button", { class: "btn", onclick: () => wk("load_add") }, "➕ تشوين"), h("button", { class: "btn", onclick: () => wk("load_pay") }, "صرف تشوين اليوم"), h("button", { class: "btn", onclick: loadLog }, "سجل التشوين")] : null,
-      h("button", { class: "btn", onclick: one(statement) }, icon("list", 18), "كشف الموظف"), h("button", { class: "btn", onclick: toggle }, r && r.left ? "رجع الشغل" : "ساب الشغل"),
+    bar.replaceChildren(h("h2", null, "العمال"), h("button", { class: "btn primary", onclick: () => form(null) }, icon("plus", 18), "إضافة"),
+      h("button", { class: "btn", onclick: one(form) }, icon("edit", 18), "تعديل"), h("button", { class: "btn gold", onclick: () => wk("daily") }, icon("cash", 18), "صرف يوميات العمال"),
+      h("button", { class: "btn", onclick: paySalary }, r && r.per_sack ? "صرف حساب الشكاير" : "صرف يومية"), h("button", { class: "btn", onclick: payAdv }, "صرف سلفة"),
+      can("emp:bread") ? h("button", { class: "btn", onclick: () => go("emp:bread") }, "صرف العيش") : null,
+      h("button", { class: "btn", onclick: one(statement) }, icon("list", 18), "كشف العامل"), h("button", { class: "btn", onclick: toggle }, r && r.left ? "رجع الشغل" : "ساب الشغل"),
       h("button", { class: "btn danger", onclick: del }, icon("trash", 18), "حذف"));
   }
   acts();
   box.replaceChildren(h("div", { class: "page" }, h("section", { class: "card anim-up d1", style: { padding: "12px 18px" } }, seg), h("section", { class: "card anim-up d2" }, bar, T.el)));
   await load();
+}
+
+/* ===================== استهلاك المستلزمات (ردة، خميرة، أنابيب، أكياس ...) =====================
+   بتدخل الاستهلاك بنفسك عن يوم أو أسبوع أو شهر — بيتخصم من المخزن وتكلفته بتدخل في تقرير الأرباح */
+async function renderConsume(box) {
+  const U = S.useSt || (S.useSt = { from: S.boot.today.slice(0, 8) + "01", to: S.boot.today });
+  let st; try { st = await api("consume_setup"); } catch (e) { return box.replaceChildren(h("div", { class: "card empty" }, e.message)); }
+  const item = h("select", { class: "in", "aria-label": "المستلزم" }, h("option", { value: "" }, "— اختار —"), st.items.map((i) => h("option", { value: i.id }, `${i.name} (الرصيد ${fq(i.stock)} ${i.unit})`)));
+  const qty = h("input", { class: "in num", inputmode: "decimal", "aria-label": "الكمية" }), dDate = dateIn(S.boot.today, "التاريخ"), notes = h("input", { class: "in", "aria-label": "ملاحظات" });
+  let period = "يوم";
+  const seg = h("div", { class: "seg" }, st.periods.map((p) => h("button", { type: "button", "data-v": p, class: p === period ? "on" : "", onclick: () => { period = p; seg.querySelectorAll("button").forEach((b) => b.classList.toggle("on", b.dataset.v === p)); } }, p)));
+  const from = dateIn(U.from, "من"), to = dateIn(U.to, "إلى");
+  const T = selTable({ maxH: "calc(100vh - 520px)", empty: "مفيش استهلاك متسجل في الفترة دي",
+    cols: [{ h: "التاريخ", key: "date" }, { h: "الصنف", fn: (x) => h("b", null, x.item) }, { h: "الكمية", num: true, fn: (x) => `${fq(x.qty)} ${x.unit}` }, { h: "عن", fn: (x) => h("span", { class: "pill" }, x.period) },
+      S.me.owner ? { h: "التكلفة", num: true, fn: (x) => fmt(x.cost) } : null, { h: "ملاحظات", key: "notes", cls: "hint" }, { h: "الوقت", key: "time", cls: "hint" }].filter(Boolean),
+    onKey: (e) => { if (e.key === "Delete") del(); }, menu: (x) => [{ label: "🗑 حذف", danger: true, fn: () => del(x) }],
+    totals: (rs, isSel) => [h("b", null, isSel ? "إجمالي المحدد" : "الإجمالي"), totItem("السطور", rs.length), S.me.owner ? totItem("التكلفة", fmt(rs.reduce((a, x) => a + x.cost, 0)), true) : null].filter(Boolean) });
+  async function load() { U.from = from.value; U.to = to.value || from.value; try { T.setRows(await api("consumes", U.from, U.to)); pinTotals(); } catch (e) { toast(e.message, "err"); } }
+  async function save() {
+    if (!item.value) { item.focus(); return toast("اختار المستلزم", "err"); }
+    if (!(num(qty.value) > 0)) { qty.focus(); return toast("اكتب الكمية", "err"); }
+    try { const r = await ownerRetry((pw) => api("save_consume", +item.value, dDate.value, qty.value, period, notes.value, pw)); if (!r) return;
+      toast("✔ اتسجل الاستهلاك", "ok"); qty.value = ""; notes.value = ""; go("itm:use", true); } catch (e) { alertBox(e.message); }
+  }
+  async function del(x) { x = x || T.selected()[0]; if (!x) return toast("حدد سطر الأول"); if (!(await confirmBox(`تحذف استهلاك «${x.item}» (${fq(x.qty)} عن ${x.period})؟\nالكمية هترجع للمخزن.`, "حذف", "احذف"))) return;
+    try { await api("delete_consume", x.id); toast("✔ اتحذف", "ok"); go("itm:use", true); } catch (e) { alertBox(e.message); } }
+  enterChain([item, qty, notes], save);
+  [from, to].forEach((x) => x.addEventListener("change", load));
+  box.replaceChildren(h("div", { class: "page" },
+    h("section", { class: "card anim-up d1" }, h("div", { class: "card-h" }, h("h2", null, "تسجيل استهلاك"), h("span", { class: "hint" }, "اكتب اللي اتصرف من المستلزمات عن يوم أو أسبوع أو شهر — بيتخصم من المخزن")),
+      h("div", { class: "form" }, h("label", { class: "fld" }, "المستلزم", item), h("label", { class: "fld" }, "الكمية", qty), h("div", { class: "fld" }, h("span", null, "الاستهلاك عن"), seg),
+        h("label", { class: "fld" }, "التاريخ", dDate), h("label", { class: "fld span2" }, "ملاحظات", notes)),
+      h("div", { class: "prod-foot" }, h("span", { style: { flex: 1 } }), h("button", { class: "btn primary big", onclick: save }, icon("save", 18), "حفظ الاستهلاك"))),
+    h("section", { class: "card anim-up d2" }, h("div", { class: "card-h" }, h("h2", null, "سجل الاستهلاك"), h("span", { style: { display: "flex", gap: "8px", alignItems: "center", flexWrap: "wrap" } }, from, to,
+      h("button", { class: "btn danger", onclick: () => del() }, icon("trash", 18), "حذف"))), T.el)));
+  await load();
+}
+
+/* ===================== صرف العيش للعمال (آخر اليوم) =====================
+   كل عامل بياخد عيش بمبلغ (50 ج) بسعر البيع — بيتخصم من المخزن ويتحسب مصروف على المالك */
+async function renderBreadGive(box) {
+  const B = S.bgSt || (S.bgSt = { date: S.boot.today, from: S.boot.today, to: S.boot.today });
+  const day = dateIn(B.date, "التاريخ"), list = h("div", { class: "bg-list" }), totEl = h("b"), from = dateIn(B.from, "من"), to = dateIn(B.to, "إلى"), logBox = h("div");
+  let st, rows = [];
+  const L = selTable({ maxH: "45vh", empty: "مفيش عيش اتصرف في الفترة دي",
+    cols: [{ h: "التاريخ", key: "date" }, { h: "الوقت", key: "time", cls: "hint" }, { h: "العامل", fn: (x) => h("b", null, x.name) }, { h: "الوظيفة", key: "role", cls: "hint" },
+      { h: "العيش", key: "bread" }, { h: "الأرغفة", num: true, fn: (x) => fq(x.qty) }, { h: "القيمة (بسعر البيع)", num: true, fn: (x) => fmt(x.value) }, S.me.owner ? { h: "التكلفة", num: true, fn: (x) => fmt(x.cost) } : null].filter(Boolean),
+    onKey: (e) => { if (e.key === "Delete") del(); },
+    menu: (x) => [{ label: "🗑 حذف", danger: true, fn: () => del(x) }],
+    totals: (rs, isSel) => [h("b", null, isSel ? "إجمالي المحدد" : "الإجمالي"), totItem("الأرغفة", fq(rs.reduce((a, x) => a + x.qty, 0))), totItem("القيمة", fmt(rs.reduce((a, x) => a + x.value, 0)), true),
+      S.me.owner ? totItem("التكلفة", fmt(rs.reduce((a, x) => a + x.cost, 0))) : null].filter(Boolean) });
+  logBox.replaceChildren(L.el);
+  const recalc = () => { let v = 0; rows.forEach((r) => { if (!r.chk.checked) return; const z = st.sizes.find((x) => String(x.item_id) === r.sel.value); const q = z && z.price > 0 ? Math.floor(num(r.amt.value) / z.price + 1e-9) : 0;
+    r.out.textContent = q ? `${q} رغيف` : "—"; v += num(r.amt.value); }); totEl.textContent = fmt(v) + " ج"; };
+  async function fill() {
+    B.date = day.value || S.boot.today;
+    try { st = await api("bread_give_setup", B.date); } catch (e) { return toast(e.message, "err"); }
+    rows = st.workers.map((w) => { const sel = h("select", { class: "in", "aria-label": "نوع العيش", onchange: recalc }, st.sizes.map((z) => h("option", { value: z.item_id }, `${z.name} (${fmt(z.price)})`)));
+      return { w, sel, chk: h("input", { type: "checkbox", checked: w.given ? null : true, onchange: recalc }), amt: h("input", { class: "in num", value: st.amount, inputmode: "decimal", "aria-label": "المبلغ", oninput: recalc }), out: h("span", { class: "hint" }) }; });
+    list.replaceChildren(...(rows.length ? rows.map((r) => h("label", { class: "bg-row" }, r.chk, h("b", { class: "bg-n" }, r.w.name), h("span", { class: "hint bg-r" }, r.w.role + (r.w.given ? ` • ✔ خد ${fq(r.w.given)} رغيف النهارده` : "")), r.sel, r.amt, r.out))
+      : [h("div", { class: "empty" }, "مفيش عمال — ضيفهم من شاشة العمال")]));
+    recalc();
+  }
+  async function save() {
+    const pick = rows.filter((r) => r.chk.checked && num(r.amt.value) > 0).map((r) => [r.w.id, +r.sel.value, num(r.amt.value)]);
+    if (!pick.length) return toast("علّم العمال الأول", "err");
+    try { const r = await ownerRetry((pw) => api("bread_give", day.value, pick, pw)); if (!r) return; toast(`✔ اتصرف العيش لـ ${r.n} عامل`, "ok"); await fill(); await loadLog(); } catch (e) { alertBox(e.message); }
+  }
+  async function loadLog() { B.from = from.value; B.to = to.value || from.value; try { L.setRows(await api("bread_gives", B.from, B.to)); pinTotals(); } catch (e) { toast(e.message, "err"); } }
+  async function del(x) { x = x || L.selected()[0]; if (!x) return toast("حدد سطر الأول"); if (!(await confirmBox(`تحذف عيش «${x.name}» (${fq(x.qty)} ${x.bread}) يوم ${x.date}؟\nالعيش هيرجع للمخزن.`, "حذف", "احذف"))) return;
+    try { await api("delete_bread_give", x.id); toast("✔ اتحذف", "ok"); await fill(); await loadLog(); } catch (e) { alertBox(e.message); } }
+  day.addEventListener("change", fill); [from, to].forEach((x) => x.addEventListener("change", loadLog));
+  box.replaceChildren(h("div", { class: "page" },
+    h("section", { class: "card anim-up d1" }, h("div", { class: "card-h" }, h("h2", null, "صرف العيش آخر اليوم"), h("span", { class: "hint" }, "المعلّم = هياخد • المبلغ بسعر البيع • بيتخصم من المخزن على حساب المالك")),
+      h("div", { class: "form" }, h("label", { class: "fld" }, "التاريخ", day)), list,
+      h("div", { class: "prod-foot" }, h("span", null, "الإجمالي: ", totEl), h("span", { style: { flex: 1 } }), h("button", { class: "btn primary big", onclick: save }, icon("save", 18), "صرف العيش"))),
+    h("section", { class: "card anim-up d2" }, h("div", { class: "card-h" }, h("h2", null, "سجل صرف العيش"), h("span", { style: { display: "flex", gap: "8px", alignItems: "center", flexWrap: "wrap" } }, from, to,
+      h("button", { class: "btn danger", onclick: () => del() }, icon("trash", 18), "حذف"))), logBox)));
+  await fill(); await loadLog();
 }
 
 /* ===================== الحضور ===================== */
@@ -3026,13 +3114,13 @@ async function accessModal(u, setup) {
   emp.value = u && u.emp_id ? String(u.emp_id) : "";
   const fEmp = h("label", { class: "fld" }, "المندوب (من الموظفين)", emp);
   const groups = [["الرئيسية", ["home"]], ["الفواتير", ["inv:مبيعات", "inv:مشتريات", "inv:مرتجع مبيعات", "inv:مرتجع مشتريات", "gate:log", "log"]], ["السندات", ["vch:new", "vch:log"]],
-    ["العملاء والموردون", ["par:list"]], ["الإنتاج", ["prd:new", "prd:log", "rep:production"]], ["الأصناف والمخزون", ["itm:list", "itm:stock", "itm:sales", "itm:buys", "itm:damaged", "smp:items", "smp:out", "smp:in"]],
-    ["الموظفون", ["emp:list", "emp:att", "emp:attlog"]], ["الحسابات", ["acc:statement", "acc:balances", "acc:cash", "acc:subcash"]],
+    ["العملاء والموردون", ["par:list"]], ["الإنتاج", ["prd:new", "prd:log", "rep:production"]], ["الأصناف والمخزون", ["itm:list", "itm:stock", "itm:use", "itm:sales", "itm:buys", "itm:damaged", "smp:items", "smp:out", "smp:in"]],
+    ["العمال", ["emp:list", "emp:bread", "emp:att", "emp:attlog"]], ["الحسابات", ["acc:statement", "acc:balances", "acc:cash", "acc:subcash"]],
     ["التقارير", ["rep:daily", "rep:log"]], ["الإعدادات", ["set:main"]]];
   const chk = {};
   const cur = new Set(u ? u.screens : setup.defaults["محاسب"]);
   const grid = h("div", { class: "acc-grid" }, groups.map(([g, keys]) => h("div", { class: "acc-g" }, h("b", null, g),
-    keys.map((k) => { const c = h("input", { type: "checkbox" }); c.checked = cur.has(k); chk[k] = c; return h("label", { class: "chk" }, c, SCREENS[k].title.replace(" 🔒", "")); }))));
+    keys.filter((k) => !HIDDEN_SCREENS.has(k)).map((k) => { const c = h("input", { type: "checkbox" }); c.checked = cur.has(k); chk[k] = c; return h("label", { class: "chk" }, c, SCREENS[k].title.replace(" 🔒", "")); }))));
   const preset = (r) => { const d = new Set(setup.defaults[r] || []); Object.entries(chk).forEach(([k, c]) => (c.checked = d.has(k))); };
   const lay = () => { const r = role.value; fEmp.style.display = r === "مندوب" ? "" : "none"; grid.style.display = r === "المالك" ? "none" : ""; };
   role.addEventListener("change", () => { preset(role.value); lay(); }); lay();
