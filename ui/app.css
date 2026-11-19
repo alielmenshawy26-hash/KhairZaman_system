@@ -521,7 +521,8 @@ html.standalone .shell{background:var(--ground);min-height:100dvh}
 .in:disabled{background:#f3ece0;color:var(--muted);cursor:not-allowed}
 
 /* ===== البيع السريع (الكاشير) ===== */
-.qs-home{height:auto;min-height:0}
+.qs-home{height:auto;min-height:calc(100vh - 100px)}
+.qs-home>.qs-grid{margin:auto;width:100%;max-width:1180px}           /* الكاشير في نص الشاشة (طول وعرض) */
 .qs-home .card:focus-within{z-index:1}
 .qs-hero{display:flex;align-items:center;gap:16px;padding:10px 18px;border-radius:16px;background:linear-gradient(160deg,#fff 0%,#faf6ef 55%,#f5eddd 100%);border:1px solid var(--line)}
 .qs-hero img{width:56px;height:56px;object-fit:contain;background:#fff;border-radius:12px;padding:3px;border:2px solid #e8decb}
@@ -529,7 +530,7 @@ html.standalone .shell{background:var(--ground);min-height:100dvh}
 .qs-date{margin-inline-start:auto;font-weight:800;color:var(--navy);font-size:16px}
 .qs-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(290px,370px);gap:18px;align-items:start}
 .qs-side{display:flex;flex-direction:column;gap:18px;min-width:0}
-.qs-tiles{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:12px;padding:12px 18px 16px}
+.qs-tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;padding:12px 18px 16px}
 .qs-tile{display:flex;flex-direction:column;gap:8px;padding:10px;border:2px solid var(--line-2);border-radius:16px;background:#fffaf0;transition:border-color .2s,box-shadow .2s,background-color .2s}
 .qs-tile.on{border-color:var(--gold);background:#fff4dc;box-shadow:0 6px 18px rgba(151,92,47,.16)}
 .qs-tile:focus-within{border-color:var(--blue)}
@@ -561,6 +562,7 @@ html.standalone .shell{background:var(--ground);min-height:100dvh}
 .btn.sm{min-height:30px;padding:2px 8px}
 .qs-mbar{display:none}
 @media (max-width:900px){
+  .qs-home{min-height:0}.qs-home>.qs-grid{margin:0}
   .qs-grid{grid-template-columns:1fr}
   .qs-hero b{font-size:20px}.qs-hero img{width:42px;height:42px}.qs-date{font-size:13px}
   .qs-tiles{grid-template-columns:repeat(2,minmax(0,1fr));padding:6px 10px 10px;gap:8px}

@@ -763,6 +763,7 @@ async function renderCashier(box) {
           h("div", { class: "qs-foot" }, clearBtn, saveBtn, printBtn))))),
     mBar));
   calc();
+  { const tb0 = $("#todaybar"); if (tb0) tb0.hidden = true; }      // عمر: شيل الإجمالي من تحت في الكاشير
   { const tb = $("#todaybar");                       // على الموبايل: شريط «طباعة وحفظ» فوق شريط النهارده الثابت
     if (tb && window.ResizeObserver) { const ro = new ResizeObserver(() => { if (!mBar.isConnected) return ro.disconnect();
       mBar.style.bottom = (getComputedStyle(tb).position === "fixed" ? tb.offsetHeight : 0) + "px"; }); ro.observe(tb); } }
@@ -1460,7 +1461,7 @@ function pinTotals() {
     pb.replaceChildren(...(t ? [t] : []));
   }
   const on = !!pb.firstElementChild;
-  pb.hidden = !on; tb.hidden = on || S.screen !== "home";      // شريط «اليوم» في الرئيسية بس، والشاشات اللي فيها جداول بيظهر إجماليها
+  pb.hidden = !on; tb.hidden = on || S.screen !== "home" || !!document.querySelector("#screen .qs-home");   // الكاشير: من غير شريط «اليوم»      // شريط «اليوم» في الرئيسية بس، والشاشات اللي فيها جداول بيظهر إجماليها
 }
 const totItem = (label, value, strong) => h("span", { class: "ti" + (strong ? " strong" : "") }, label + ": ", h("b", null, value));
 const money = (v) => fmt(v);
