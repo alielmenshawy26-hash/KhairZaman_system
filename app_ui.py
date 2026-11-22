@@ -1175,7 +1175,7 @@ class Api:
 
     PDF_OK = {"print_statement": "كشف حساب", "print_balances": "أرصدة الحسابات", "print_stock_count": "أرصدة الأصناف للجرد", "print_daily": "التقرير اليومي",
               "monthly_print": "التقرير الشهري", "print_invoice": "فاتورة", "print_receipt": "إيصال سند", "print_trust_form": "إيصال أمانة",
-              "print_production": "الإنتاج"}
+              "print_production": "البلاغ"}
 
     @staticmethod
     def _desktop():
@@ -1370,7 +1370,7 @@ class Api:
         with W.db() as c:
             used = c.execute("SELECT (SELECT COUNT(*) FROM invoice_lines WHERE item_id=?)+(SELECT COUNT(*) FROM damaged WHERE item_id=?)", (iid, iid)).fetchone()[0] + W.prod_used(c, iid)
             name = c.execute("SELECT name FROM items WHERE id=?", (iid,)).fetchone()["name"]
-        if used: raise UIError("الصنف مستخدم في فواتير أو هالك أو إنتاج (أو مربوط بمقاس عيش). تقدر تعدّله بس.")
+        if used: raise UIError("الصنف مستخدم في فواتير أو هالك أو بلاغ (أو مربوط بمقاس عيش). تقدر تعدّله بس.")
         with W.db() as c: c.execute("DELETE FROM items WHERE id=?", (iid,)); W.log(c, "حذف صنف", f"{name} (بباسوورد {who})")
         return True
 
@@ -1810,7 +1810,7 @@ class Api:
                     if z["item_id"]: touched.add(z["item_id"])
                     loaves_all += q; value_all += q * price; desc.append(f"{z['name']} {W.fmt(t)} طاولة")
                 W.check_stock(c, list(touched))
-                W.log(c, "تعديل إنتاج" if p.get("id") else "تسجيل إنتاج",
+                W.log(c, "تعديل بلاغ" if p.get("id") else "تسجيل بلاغ",
                       f"شيكارة {no} بتاريخ {d} ({W.fmt(fq)} {fl['name']}): " + "، ".join(desc) + f" = {W.fmt(loaves_all)} رغيف بـ {W.fmt(value_all)} ج")
         except W.NegativeStock as e: return {"ok": False, "need": "neg", "error": str(e) + "\nالرصيد هيبقى بالسالب — مسموح بس بكلمة سر المالك."}
         finally: W._TLS.allow_neg = None
@@ -1832,7 +1832,7 @@ class Api:
                 c.execute("DELETE FROM production_supplies WHERE production_id=?", (pid,))
                 c.execute("DELETE FROM production WHERE id=?", (pid,))
                 W.check_stock(c, [i for i in items if i])
-                W.log(c, "حذف إنتاج", f"شيكارة {r['sack_no']} بتاريخ {r['p_date']}")
+                W.log(c, "حذف بلاغ", f"شيكارة {r['sack_no']} بتاريخ {r['p_date']}")
         except W.NegativeStock as e: return {"ok": False, "need": "neg", "error": str(e) + "\nالعيش ده اتباع بالفعل — الحذف هيخلي رصيده بالسالب. مسموح بس بكلمة سر المالك."}
         finally: W._TLS.allow_neg = None
         return {"ok": True}
@@ -1929,11 +1929,11 @@ class Api:
         if detail:
             head = "<tr><th>التاريخ</th><th>الشيكارة</th>" + "".join(f"<th>{esc(n)}</th>" for n in sizes) + "<th>الأرغفة</th><th>القيمة</th></tr>"
             body = "".join("<tr>" + td(r["date"], "") + td(r["sack_no"]) + "".join(td(f(r["cells"][n]) if r["cells"].get(n) else "—") for n in sizes) + td(f(r["loaves"])) + td(f(r["value"])) + "</tr>" for r in sh["rows"])
-            title = "سجل الإنتاج"
+            title = "سجل البلاغ"
         else:
             head = "<tr><th>اليوم</th><th>الشكاير</th>" + "".join(f"<th>{esc(n)}</th>" for n in sizes) + "<th>الأرغفة</th><th>القيمة</th></tr>"
             body = "".join("<tr>" + td(r["date"], "") + td(f(r["sacks"])) + "".join(td(f(r["cells"][n]) if r["cells"].get(n) else "—") for n in sizes) + td(f(r["loaves"])) + td(f(r["value"])) + "</tr>" for r in rp["days"])
-            title = "تقرير الإنتاج"
+            title = "تقرير البلاغ"
         T = sh["totals"]
         foot = ("<tr class='t'><td colspan=2>إجمالي الطاولات</td>" + "".join(td(f(T[n]["tables"])) for n in sizes) + "<td colspan=2></td></tr>"
                 "<tr class='t'><td colspan=2>إجمالي الأرغفة</td>" + "".join(td(f(T[n]["loaves"])) for n in sizes) + td(f(sh["loaves"])) + "<td></td></tr>"

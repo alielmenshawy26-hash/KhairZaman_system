@@ -341,9 +341,9 @@ const SCREENS = {
   "itm:buys": { title: "المشتريات (لكل صنف)", icon: "buy" },
   "itm:use": { title: "استهلاك المستلزمات", icon: "box" },
   "itm:damaged": { title: "الهالك والتالف", icon: "trash" },
-  "prd:new": { title: "الإنتاج (شيكارة جديدة)", icon: "plus", key: "F4" },
-  "prd:log": { title: "سجل الإنتاج", icon: "list" },
-  "rep:production": { title: "تقرير الإنتاج", icon: "chart" },
+  "prd:new": { title: "البلاغ (شيكارة جديدة)", icon: "plus", key: "F4" },
+  "prd:log": { title: "سجل البلاغ", icon: "list" },
+  "rep:production": { title: "تقرير البلاغ", icon: "chart" },
   "smp:items": { title: "أصناف العينات", icon: "box" },
   "smp:out": { title: "عينات مبيعات", icon: "sale" },
   "smp:in": { title: "عينات مشتريات", icon: "buy" },
@@ -442,7 +442,7 @@ function navBtn(key) {
 const trustPrint = async () => { try { await api("print_trust_form"); toast("🖨 شاشة الطباعة هتفتح خلال ثواني ...", "ok"); } catch (e) { toast(e.message, "err"); } };
 function navGroups() {
   const G = [
-    ["الإنتاج", "plus", ["prd:new", "prd:log", "rep:production"]],
+    ["البلاغ", "plus", ["prd:new", "prd:log", "rep:production"]],
     ["الفواتير", "list", ["inv:مبيعات", "inv:مشتريات", "inv:مرتجع مبيعات", "inv:مرتجع مشتريات", "gate:log", "log"]],
     ["السندات", "cash", ["vch:new", "vch:log"]],
     ["العملاء والموردون", "users", ["par:list"]],
@@ -769,7 +769,7 @@ async function renderCashier(box) {
   { const tb = $("#todaybar");                       // على الموبايل: شريط «طباعة وحفظ» فوق شريط النهارده الثابت
     if (tb && window.ResizeObserver) { const ro = new ResizeObserver(() => { if (!mBar.isConnected) return ro.disconnect();
       mBar.style.bottom = (getComputedStyle(tb).position === "fixed" ? tb.offsetHeight : 0) + "px"; }); ro.observe(tb); } }
-  if (!st.sizes.length) toast("مفيش مقاسات عيش — ضيفها من شاشة الإنتاج", "err");
+  if (!st.sizes.length) toast("مفيش مقاسات عيش — ضيفها من شاشة البلاغ", "err");
   tiles[0] && tiles[0].inp.focus();
 }
 
@@ -2133,8 +2133,8 @@ async function renderStock(box) {
   let cur = null, curT = null;
   /* المخزون 3 أقسام: الدقيق • العيش (الإنتاج) • المستلزمات (خميرة، ملح، أكياس ...) */
   const SECS = [
-    { cat: "دقيق", title: "مخزون الدقيق", icon: "box", hint: "الشيكارة بتتخصم لوحدها مع كل شيكارة في الإنتاج", prod: { h: "صرف للإنتاج", k: "prod_out" } },
-    { cat: "عيش", title: "مخزون العيش", icon: "box", hint: "الإنتاج بيزوّده، والمبيعات بتخصم منه (بالرغيف)", prod: { h: "إنتاج", k: "prod_in" } },
+    { cat: "دقيق", title: "مخزون الدقيق", icon: "box", hint: "الشيكارة بتتخصم لوحدها مع كل شيكارة في البلاغ", prod: { h: "صرف للبلاغ", k: "prod_out" } },
+    { cat: "عيش", title: "مخزون العيش", icon: "box", hint: "البلاغ بيزوّده، والمبيعات بتخصم منه (بالرغيف)", prod: { h: "بلاغ", k: "prod_in" } },
     { cat: "مستلزمات", title: "مخزون المستلزمات", icon: "box", hint: "خميرة وملح وأكياس وغيرها — بتزيد بالمشتريات وتقل بالمبيعات أو الهالك", prod: null }];
   const mk = (S_) => {
     const cols = [{ h: "الكود", key: "code", cls: "hint" }, { h: "اسم الصنف", fn: (r) => h("b", null, r.name) }, { h: "الوحدة", key: "unit", cls: "hint" },
@@ -2186,7 +2186,7 @@ async function renderStock(box) {
 /* ===================== الإنتاج (مخبز خير زمان) ===================== */
 /* شيكارة دقيق ← طاولات من كل مقاس • الأرغفة = الطاولات × أرغفة الطاولة • القيمة = الأرغفة × سعر الرغيف */
 function prodSheetTable(sizes, { onOpen, onKey, maxH, showDate } = {}) {
-  return selTable({ maxH: maxH || "calc(100vh - 420px)", empty: "لسه مفيش إنتاج",
+  return selTable({ maxH: maxH || "calc(100vh - 420px)", empty: "لسه مفيش بلاغ",
     cols: [showDate ? { h: "التاريخ", key: "date" } : null, { h: "الشيكارة", num: true, fn: (r) => h("b", null, String(r.sack_no)) },
       ...sizes.map((n) => ({ h: n, num: true, fn: (r) => (r.cells[n] ? fq(r.cells[n]) : h("span", { class: "hint" }, "—")) })),
       { h: "الأرغفة", num: true, fn: (r) => h("b", null, fq(r.loaves)) }, { h: "القيمة", num: true, fn: (r) => h("b", null, fmt(r.value)) },
@@ -2221,7 +2221,7 @@ async function breadSizesForm() {
     price: h("input", { class: "in num", inputmode: "decimal", "aria-label": "سعر الرغيف" }), act: Object.assign(h("input", { type: "checkbox" }), { checked: true }) }; ins.push(x); tb.appendChild(tr(x)); x.name.focus(); };
   const tr = (x) => h("tr", null, h("td", null, x.name), h("td", null, x.per), h("td", null, x.price), h("td", { style: { textAlign: "center" } }, x.act));
   const tb = h("tbody", null, ins.map(tr));
-  const body = h("div", null, h("div", { class: "hint", style: { marginBottom: "8px" } }, "التعديل بيتطبق على الإنتاج الجديد بس — الشكاير القديمة فاضلة على أسعارها. سعر الرغيف بيتحط كمان سعر بيع لصنف العيش."),
+  const body = h("div", null, h("div", { class: "hint", style: { marginBottom: "8px" } }, "التعديل بيتطبق على البلاغ الجديد بس — الشكاير القديمة فاضلة على أسعارها. سعر الرغيف بيتحط كمان سعر بيع لصنف العيش."),
     h("div", { class: "tbl-wrap" }, h("table", { class: "t" }, h("thead", null, h("tr", null, h("th", null, "المقاس"), h("th", null, "أرغفة في الطاولة"), h("th", null, "سعر الرغيف"), h("th", null, "شغال"))), tb)),
     h("button", { class: "btn", style: { marginTop: "8px" }, onclick: add }, icon("plus", 18), "مقاس جديد"),
     h("h3", { style: { margin: "18px 0 4px", color: "var(--navy)" } }, "المستلزمات لكل شيكارة"),
@@ -2345,7 +2345,7 @@ async function renderProdLog(box) {
     const T = prodSheetTable(sh.sizes, { showDate: true, maxH: "calc(100vh - 470px)", onOpen: can("prd:new") ? (r) => edit(r) : null,
       onKey: (e) => { if (e.key === "Delete") del(T.selected()[0]); } });
     T.setRows(sh.rows); sheetBox.replaceChildren(T.el); sheetBox._T = T;
-    const tt = prodTotals(sh); totBox.replaceChildren(tt || h("div", { class: "hint", style: { padding: "14px 18px" } }, "مفيش إنتاج في الفترة دي")); pinTotals();
+    const tt = prodTotals(sh); totBox.replaceChildren(tt || h("div", { class: "hint", style: { padding: "14px 18px" } }, "مفيش بلاغ في الفترة دي")); pinTotals();
   }
   function edit(r) { r = r || (sheetBox._T && sheetBox._T.selected()[0]); if (!r) return toast("حدد شيكارة من الجدول الأول"); S.prodSt = { date: r.date }; S.prodEdit = r.id; go("prd:new", true); }
   async function del(r) {
@@ -2359,7 +2359,7 @@ async function renderProdLog(box) {
       h("div", { class: "fld", style: { justifyContent: "flex-end", flexDirection: "row", gap: "8px", alignItems: "flex-end" } },
         h("button", { class: "btn gold", onclick: async () => { try { await api("print_production", from.value, to.value || from.value, true); toast("🖨 شاشة الطباعة هتفتح خلال ثواني ...", "ok"); } catch (e) { toast(e.message, "err"); } } }, icon("print", 18), "طباعة"),
         pdfBtn(() => pdfExport("print_production", [from.value, to.value || from.value, true], `${from.value} - ${to.value}`))))),
-    h("section", { class: "card anim-up d2" }, h("div", { class: "card-h" }, h("h2", null, "سجل الإنتاج"), h("span", { class: "hint" }, "كل صف = شيكارة • الأرقام = عدد الطاولات" + (can("prd:new") ? " • ضغطتين = تعديل" : "")),
+    h("section", { class: "card anim-up d2" }, h("div", { class: "card-h" }, h("h2", null, "سجل البلاغ"), h("span", { class: "hint" }, "كل صف = شيكارة • الأرقام = عدد الطاولات" + (can("prd:new") ? " • ضغطتين = تعديل" : "")),
         can("prd:new") ? h("span", { style: { display: "flex", gap: "8px", marginInlineStart: "auto" } },
           h("button", { class: "btn", onclick: () => edit() }, icon("edit", 18), "تعديل"), h("button", { class: "btn danger", onclick: () => del() }, icon("trash", 18), "حذف")) : null), sheetBox),
     h("section", { class: "card anim-up d3", style: { marginTop: "18px" } }, h("div", { class: "card-h" }, h("h2", null, "إجمالي كل مقاس"), h("span", { class: "hint" }, "طاولات • أرغفة • جنيه")), totBox)));
@@ -2373,13 +2373,13 @@ async function renderProdReport(box) {
     R.from = from.value; R.to = to.value || from.value;
     let d; try { d = await api("production_report", R.from, R.to); } catch (e) { return toast(e.message, "err"); }
     kpis.replaceChildren(kpi("الشكاير", fq(d.sacks), "#f4e7cf", "#7a4b22"), kpi("الأرغفة", fq(d.loaves), "#fbf3e0", "#8a6514"),
-      kpi("قيمة الإنتاج (ج)", fmt(d.value), "#e6f4ec", "#15803d"), kpi("متوسط الأرغفة في الشيكارة", fq(d.per_sack), "#f2edff", "#6d28d9"),
+      kpi("قيمة البلاغ (ج)", fmt(d.value), "#e6f4ec", "#15803d"), kpi("متوسط الأرغفة في الشيكارة", fq(d.per_sack), "#f2edff", "#6d28d9"),
       kpi("متوسط القيمة في الشيكارة (ج)", fmt(d.value_per_sack), "#e6f6f4", "#0f766e"));
-    const TS = selTable({ maxH: "40vh", empty: "مفيش إنتاج في الفترة دي",
+    const TS = selTable({ maxH: "40vh", empty: "مفيش بلاغ في الفترة دي",
       cols: [{ h: "المقاس", fn: (r) => h("b", null, r.name) }, { h: "الطاولات", num: true, fn: (r) => fq(r.tables) }, { h: "الأرغفة", num: true, fn: (r) => fq(r.loaves) },
         { h: "القيمة", num: true, fn: (r) => h("b", null, fmt(r.value)) }, { h: "النسبة من القيمة", num: true, fn: (r) => (d.value ? Math.round(r.value / d.value * 100) + "%" : "") }] });
     TS.setRows(d.by_size); sizesBox.replaceChildren(TS.el);
-    const TD = selTable({ maxH: "50vh", empty: "مفيش إنتاج في الفترة دي",
+    const TD = selTable({ maxH: "50vh", empty: "مفيش بلاغ في الفترة دي",
       cols: [{ h: "اليوم", key: "date" }, { h: "الشكاير", num: true, fn: (r) => h("b", null, fq(r.sacks)) }, ...d.sizes.map((n) => ({ h: n, num: true, fn: (r) => (r.cells[n] ? fq(r.cells[n]) : h("span", { class: "hint" }, "—")) })),
         { h: "الأرغفة", num: true, fn: (r) => h("b", null, fq(r.loaves)) }, { h: "القيمة", num: true, fn: (r) => h("b", null, fmt(r.value)) }],
       onOpen: can("prd:new") ? (r) => { S.prodSt = { date: r.date }; go("prd:new", true); } : null,
@@ -2395,7 +2395,7 @@ async function renderProdReport(box) {
         pdfBtn(() => pdfExport("print_production", [from.value, to.value || from.value, false], `${from.value} - ${to.value}`))))),
     kpis,
     h("section", { class: "card anim-up d2" }, h("div", { class: "card-h" }, h("h2", null, "كل مقاس في الفترة")), sizesBox),
-    h("section", { class: "card anim-up d3" }, h("div", { class: "card-h" }, h("h2", null, "الإنتاج بالأيام"), h("span", { class: "hint" }, "الأرقام تحت كل مقاس = عدد الطاولات • ضغطتين على يوم = سجله")), daysBox)));
+    h("section", { class: "card anim-up d3" }, h("div", { class: "card-h" }, h("h2", null, "البلاغ بالأيام"), h("span", { class: "hint" }, "الأرقام تحت كل مقاس = عدد الطاولات • ضغطتين على يوم = سجله")), daysBox)));
   await load();
 }
 
@@ -3181,7 +3181,7 @@ async function accessModal(u, setup) {
   emp.value = u && u.emp_id ? String(u.emp_id) : "";
   const fEmp = h("label", { class: "fld" }, "المندوب (من الموظفين)", emp);
   const groups = [["الرئيسية", ["home"]], ["الفواتير", ["inv:مبيعات", "inv:مشتريات", "inv:مرتجع مبيعات", "inv:مرتجع مشتريات", "gate:log", "log"]], ["السندات", ["vch:new", "vch:log"]],
-    ["العملاء والموردون", ["par:list"]], ["الإنتاج", ["prd:new", "prd:log", "rep:production"]], ["الأصناف والمخزون", ["itm:list", "itm:stock", "itm:use", "itm:sales", "itm:buys", "itm:damaged", "smp:items", "smp:out", "smp:in"]],
+    ["العملاء والموردون", ["par:list"]], ["البلاغ", ["prd:new", "prd:log", "rep:production"]], ["الأصناف والمخزون", ["itm:list", "itm:stock", "itm:use", "itm:sales", "itm:buys", "itm:damaged", "smp:items", "smp:out", "smp:in"]],
     ["العمال", ["emp:list", "emp:bread", "emp:att", "emp:attlog"]], ["الحسابات", ["acc:statement", "acc:balances", "acc:cash", "acc:subcash"]],
     ["التقارير", ["rep:daily", "rep:log"]], ["الإعدادات", ["set:main"]]];
   const chk = {};
