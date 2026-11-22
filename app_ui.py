@@ -47,6 +47,7 @@ for _keys, _methods in [
     (["vch:new", "vch:log"], "voucher_setup save_voucher voucher_preview add_expense_cat delete_expense_cat rename_expense_cat expense_cat_log vouchers voucher delete_voucher print_receipt"),
     (["acc:statement", "acc:balances"], "parties_list statement print_statement payment_detail"),
     (["acc:balances"], "balances delete_parties print_balances"),
+    (["acc:statement", "acc:balances"], "party_transfer_preview party_transfer_save party_transfer_detail party_transfer_delete"),
     (["acc:cash"], "cash add_cash_move delete_cash_move cash_count cash_count_setup cash_count_save cash_count_print cash_count_pdf cash_transfer_add cash_transfer_delete"),
     (["acc:subcash"], "subcash save_subcash delete_subcash"),
     (["par:list"], "parties_full party_get save_party"),
@@ -82,7 +83,8 @@ NO_REP = {"close_day", "expense_cat_log", "quick_setup", "quick_sale", "gate_log
           # ومايشوفش تقرير الشركة اليومي (مبيعات الكل والخزنة والمصروفات)، ومايغيرش بنود المصروفات
           "delete_invoice", "delete_voucher", "daily_report", "print_daily", "daily_trend",
           "add_expense_cat", "rename_expense_cat", "delete_expense_cat",
-          "save_production", "delete_production", "bread_sizes_save", "prod_supplies_save"}       # المندوب مايقفلش اليوم ومايفتحش أيام مقفولة
+          "save_production", "delete_production", "bread_sizes_save", "prod_supplies_save",
+          "party_transfer_preview", "party_transfer_save", "party_transfer_delete"}  # التحويل من عميل لعميل للمحاسب أو المالك بس • المندوب مايقفلش اليوم ومايفتحش أيام مقفولة
 
 
 def user_screens(r):
@@ -822,12 +824,75 @@ class Api:
         who = self._del_pw(pw)
         with W.db() as c:
             info = [(i, c.execute("SELECT name FROM parties WHERE id=?", (i,)).fetchone()[0],
-                     c.execute("SELECT (SELECT COUNT(*) FROM invoices WHERE party_id=?)+(SELECT COUNT(*) FROM payments WHERE party_id=?)+(SELECT COUNT(*) FROM samples WHERE party_id=?)", (i, i, i)).fetchone()[0]) for i in ids]
+                     c.execute("SELECT (SELECT COUNT(*) FROM invoices WHERE party_id=?)+(SELECT COUNT(*) FROM payments WHERE party_id=?)+(SELECT COUNT(*) FROM samples WHERE party_id=?)"
+                               "+(SELECT COUNT(*) FROM party_transfers WHERE from_id=? OR to_id=?)", (i, i, i, i, i)).fetchone()[0]) for i in ids]
         used = [n for _, n, u in info if u]; free = [(i, n) for i, n, u in info if not u]
         with W.db() as c:
             for i, n in free:
                 c.execute("DELETE FROM parties WHERE id=?", (i,)); W.log(c, "حذف عميل/مورد", f"{n} (بباسوورد {who})")
         return {"deleted": [n for _, n in free], "kept": used}
+
+    # ---------- تحويل رصيد من عميل لعميل ----------
+    def party_transfer_preview(self, from_id, to_id, amount):
+        """رصيد العميلين قبل وبعد التحويل."""
+        self._need_login()
+        amt = W._f(amount)
+        with W.db() as c:
+            out = {}
+            if from_id: b = W.party_balance(c, int(from_id)); out["from"] = {"before": _r2(b), "after": _r2(b - amt)}
+            if to_id: b = W.party_balance(c, int(to_id)); out["to"] = {"before": _r2(b), "after": _r2(b + amt)}
+        return out
+
+    def party_transfer_save(self, p):
+        """p = {from_id, to_id, amount, date, notes, pw} — بينزل المبلغ من رصيد «من» ويزوّده على رصيد «إلى».
+        محتاج باسوورد المحاسب أو المالك، ومش بيأثر على الخزنة."""
+        self._need_login()
+        who = W.verify_day_password(p.get("pw"))
+        if not who: raise UIError("باسوورد المحاسب أو المالك غلط — التحويل مااتعملش" if p.get("pw") else "التحويل محتاج باسوورد المحاسب أو المالك")
+        try: fid, tid = int(p.get("from_id") or 0), int(p.get("to_id") or 0)
+        except (TypeError, ValueError): raise UIError("اختار العميلين")
+        if not fid or not tid: raise UIError("اختار العميل اللي هينزل منه والعميل اللي هيتضاف عليه")
+        if fid == tid: raise UIError("مينفعش تحوّل من عميل لنفسه")
+        try: amount = _r2(W._f(p.get("amount"), None))
+        except (TypeError, ValueError): raise UIError("المبلغ يجب أن يكون رقمًا")
+        if not amount or amount <= 0: raise UIError("المبلغ يجب أن يكون أكبر من صفر")
+        try: d = W.check_date(p.get("date") or _today())
+        except ValueError: raise UIError("صيغة التاريخ غير صحيحة")
+        msg = W.check_locked(d)
+        if msg: raise UIError(msg)                      # الفترة المقفولة: المالك بس (زي السندات) — الباسوورد بيعدّي إقفال اليوم
+        notes = (p.get("notes") or "").strip()
+        with W.db() as c:
+            a = c.execute("SELECT id,name,kind FROM parties WHERE id=?", (fid,)).fetchone()
+            b = c.execute("SELECT id,name,kind FROM parties WHERE id=?", (tid,)).fetchone()
+            if not a or not b: raise UIError("العميل مش موجود")
+            if not W.is_owner() and ASSET in ((a["kind"] or ""), (b["kind"] or "")): raise UIError("حسابات الأصول للملاك بس")
+            new_id = c.execute("INSERT INTO party_transfers(t_date,created_at,by_user,approved_by,from_id,to_id,amount,notes) VALUES(?,?,?,?,?,?,?,?)",
+                               (d, W.now_ts(), W.CURRENT_USER.get("username") or "", who, fid, tid, amount, notes)).lastrowid
+            W.log(c, "تحويل من عميل لعميل", f"تحويل رقم {new_id}: {W.fmt(amount)} من «{a['name']}» إلى «{b['name']}» بتاريخ {d} (بباسوورد {who})" + (f" — {notes}" if notes else ""))
+        return {"ok": True, "id": new_id}
+
+    def party_transfer_detail(self, tid):
+        self._need_login()
+        with W.db() as c:
+            r = c.execute("SELECT t.*, a.name fname, b.name tname FROM party_transfers t LEFT JOIN parties a ON a.id=t.from_id "
+                          "LEFT JOIN parties b ON b.id=t.to_id WHERE t.id=?", (int(tid),)).fetchone()
+        if not r: raise UIError("التحويل مش موجود")
+        return {"id": r["id"], "date": r["t_date"], "time": W.fmt_time(r["created_at"]), "from": r["fname"] or "", "to": r["tname"] or "",
+                "from_id": r["from_id"], "to_id": r["to_id"], "amount": _r2(r["amount"]), "notes": r["notes"] or "",
+                "by": r["by_user"] or "", "approved_by": r["approved_by"] or ""}
+
+    def party_transfer_delete(self, tid, pw=None):
+        self._need_login()
+        who = self._del_pw(pw)
+        with W.db() as c:
+            r = c.execute("SELECT t.*, a.name fname, b.name tname FROM party_transfers t LEFT JOIN parties a ON a.id=t.from_id "
+                          "LEFT JOIN parties b ON b.id=t.to_id WHERE t.id=?", (int(tid),)).fetchone()
+            if not r: raise UIError("التحويل مش موجود")
+            msg = W.check_locked(r["t_date"])
+            if msg: raise UIError(msg)
+            c.execute("DELETE FROM party_transfers WHERE id=?", (int(tid),))
+            W.log(c, "حذف تحويل من عميل لعميل", f"تحويل رقم {r['id']}: {W.fmt(r['amount'])} من «{r['fname']}» إلى «{r['tname']}» بتاريخ {r['t_date']} (بباسوورد {who})")
+        return {"ok": True}
 
     def print_balances(self, ids=None, q=""):
         """أرصدة الحسابات (اللي ظاهرة أو المحددة) → صفحة طباعة (ومنها PDF)."""
@@ -3342,6 +3407,9 @@ def _guard(name, args):
             raise UIError("الأمر ده للمحاسب أو المالك بس")
         elif name == "party_info":
             if args and args[0] and int(args[0]) not in mine: raise UIError("المندوب بيشوف حسابات العملاء بس")
+        elif name == "party_transfer_detail":
+            o = c.execute("SELECT from_id, to_id FROM party_transfers WHERE id=?", (args[0] if args else 0,)).fetchone()
+            if not o or (o[0] not in mine and o[1] not in mine): raise UIError("التحويل ده مش لعميل من عملاءك")
         elif name == "payment_detail":
             o = c.execute("SELECT party_id, rep_id FROM payments WHERE id=?", (args[0] if args else 0,)).fetchone()
             if not o or (o[0] not in mine and o[1] != emp): raise UIError("السند ده مش بتاعك")

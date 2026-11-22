@@ -170,6 +170,7 @@ const ICONS = {
   undo: "M9 14 4 9l5-5M4 9h11a5 5 0 0 1 0 10h-3",
   logout: "M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9",
   users: "M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8ZM22 21v-2a4 4 0 0 0-3-3.9M16 3.1a4 4 0 0 1 0 7.8",
+  swap: "M7 4 3 8l4 4M3 8h14M17 20l4-4-4-4M21 16H7",
   truck: "M3 6h11v10H3zM14 9h4l3 3v4h-7M7.5 19a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3ZM17.5 19a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3Z",
 };
 function icon(name, size = 20, cls = "") {
@@ -1728,6 +1729,7 @@ async function renderStatement(box) {
     rowClass: (r) => (r.type === "open" ? "open-row" : ""),
     onOpen: async (r) => {
       if (r.type === 0) return showInvoice(r.rid);
+      if (r.type === 2) return showPartyTransfer(r.rid, load);
       if (r.type === 1) { try { const p = await api("payment_detail", r.rid); if (p.invoice_id) return showInvoice(p.invoice_id);
         alertBox(`التاريخ: ${p.date} ${p.time}\nالنوع: ${p.kind}\nالمبلغ: ${fmt(p.amount)} ج.م` + (p.rep ? `\nالمندوب: ${p.rep}` : "") + `\nملاحظات: ${p.notes || "-"}`, `سند رقم ${p.id}`); } catch (e) { toast(e.message, "err"); } }
     },
@@ -1751,8 +1753,62 @@ async function renderStatement(box) {
         h("button", { class: "btn primary", onclick: load }, "عرض"),
         h("button", { class: "btn gold", onclick: async () => { if (!A.pid) return toast("اختار الاسم الأول"); try { await api("print_statement", A.pid, from.value, to.value); toast("🖨 شاشة الطباعة هتفتح خلال ثواني ...", "ok"); } catch (e) { toast(e.message, "err"); } } }, icon("print", 18), "طباعة"), pdfBtn(() => { if (!A.pid) return toast("اختار الاسم الأول"); pdfExport("print_statement", [A.pid, from.value, to.value], ((parties.find((p) => p.id === A.pid) || {}).name || "")); }))), head),
     h("section", { class: "card anim-up d2" }, h("div", { class: "card-h" }, h("h2", null, "الحركة"), h("span", { class: "hint" }, "ضغطتين على فاتورة أو سند = تفاصيله • موجب = على العميل ، سالب = للمورد"),
-      h("button", { class: "btn", onclick: () => { if (!A.pid) return toast("اختار الاسم الأول"); S.pendingVoucherParty = A.pid; S.voucherEdit = null; go("vch:new", true); } }, icon("cash", 18), "سند للحساب ده")), T.el)));
+      h("button", { class: "btn", onclick: () => { if (!A.pid) return toast("اختار الاسم الأول"); S.pendingVoucherParty = A.pid; S.voucherEdit = null; go("vch:new", true); } }, icon("cash", 18), "سند للحساب ده"),
+      S.me.role === "مندوب" ? null : h("button", { class: "btn", onclick: async () => { if (await partyTransferForm(A.pid)) load(); } }, icon("swap", 18), "تحويل لعميل تاني")), T.el)));
   if (A.pid) await load(); else party.focus();
+}
+
+/* ===================== تحويل رصيد من عميل لعميل ===================== */
+// بينزل المبلغ من رصيد العميل الأول ويتضاف على رصيد التاني (مش بيدخل الخزنة) — بباسوورد المحاسب أو المالك
+async function partyTransferForm(fromId) {
+  const parties = await api("parties_list");
+  const F = { from: parties.find((p) => p.id === fromId) || null, to: null };
+  const pv = h("div", { class: "chips", style: { padding: 0, flexWrap: "wrap" } });
+  const amt = h("input", { class: "in num", inputmode: "decimal", "aria-label": "المبلغ", oninput: () => preview() });
+  const date = dateIn(S.boot.today, "التاريخ"), notes = h("input", { class: "in", "aria-label": "ملاحظات", placeholder: "اختياري" });
+  const pw = h("input", { class: "in", type: "password", autocomplete: "off", "aria-label": "باسوورد المحاسب أو المالك" });
+  const cFrom = combo({ label: "من حساب", placeholder: "العميل اللي هينزل من رصيده ...", items: () => parties, sub: (p) => p.kind, onPick: (p) => { F.from = p; preview(); } });
+  const cTo = combo({ label: "إلى حساب", placeholder: "العميل اللي هيتضاف على رصيده ...", items: () => parties, sub: (p) => p.kind, onPick: (p) => { F.to = p; preview(); } });
+  if (F.from) cFrom.set(F.from);
+  let tm = null;
+  function preview() {
+    clearTimeout(tm);
+    tm = setTimeout(async () => {
+      if (!F.from && !F.to) return pv.replaceChildren();
+      let r; try { r = await api("party_transfer_preview", F.from ? F.from.id : null, F.to ? F.to.id : null, num(amt.value) || 0); } catch (e) { return; }
+      const chip = (t, x) => h("div", { class: "chip " + (x.after > 0 ? "warn" : "info") }, t, ": ", h("b", null, fmt(x.before)), " ← ", h("b", null, fmt(x.after)));
+      pv.replaceChildren(r.from ? chip("رصيد " + F.from.label, r.from) : null, r.to ? chip("رصيد " + F.to.label, r.to) : null);
+    }, 200);
+  }
+  preview();
+  const ok = await modal({ title: "تحويل من عميل لعميل", enter: false,
+    body: [h("div", { class: "form", style: { padding: 0 } },
+      h("div", { class: "fld span2" }, h("label", null, "من حساب (هينزل من رصيده)"), cFrom.el),
+      h("div", { class: "fld span2" }, h("label", null, "إلى حساب (هيتضاف على رصيده)"), cTo.el),
+      h("label", { class: "fld" }, "المبلغ", amt), h("label", { class: "fld" }, "التاريخ", date),
+      h("label", { class: "fld span2" }, "ملاحظات", notes),
+      h("label", { class: "fld span2" }, "🔒 باسوورد المحاسب أو المالك", pw)),
+      h("div", { class: "hint", style: { margin: "8px 0" } }, "التحويل مش بيدخل ولا يطلع من الخزنة • بيظهر في كشف حساب العميلين • الرصيد: موجب = على العميل"), pv],
+    actions: [{ label: "تحويل", cls: "primary", icon: "check", value: async () => {
+      if (!F.from || !F.to) { toast("اختار العميلين", "err"); return false; }
+      if (F.from.id === F.to.id) { toast("مينفعش تحوّل من عميل لنفسه", "err"); return false; }
+      const a = num(amt.value); if (!(a > 0)) { toast("اكتب المبلغ", "err"); amt.focus(); return false; }
+      if (!pw.value) { toast("اكتب باسوورد المحاسب أو المالك", "err"); pw.focus(); return false; }
+      try { await api("party_transfer_save", { from_id: F.from.id, to_id: F.to.id, amount: a, date: date.value, notes: notes.value, pw: pw.value }); return true; }
+      catch (e) { toast(e.message, "err"); return false; } } }, { label: "إلغاء", value: () => null }] });
+  if (ok) toast(`✔ اتحوّل ${fmt(num(amt.value))} من «${F.from.label}» إلى «${F.to.label}»`, "ok");
+  return !!ok;
+}
+
+async function showPartyTransfer(id, after) {
+  let t; try { t = await api("party_transfer_detail", id); } catch (e) { return toast(e.message, "err"); }
+  const rep = S.me.role === "مندوب";
+  const v = await modal({ title: `تحويل رقم ${t.id}`, body: h("div", { class: "msg" },
+      `التاريخ: ${t.date} ${t.time}\nمن حساب: ${t.from}\nإلى حساب: ${t.to}\nالمبلغ: ${fmt(t.amount)} ج.م\nسجّله: ${t.by || "-"} • بباسوورد: ${t.approved_by || "-"}\nملاحظات: ${t.notes || "-"}`),
+    actions: [{ label: "تمام", cls: "primary", ret: "ok" }, rep ? null : { label: "حذف التحويل", cls: "danger", icon: "trash", ret: "del" }] });
+  if (v !== "del") return;
+  const pw = await askDelPw(`تحذف التحويل «${fmt(t.amount)} من ${t.from} إلى ${t.to}»؟\nالرصيد هيرجع زي ما كان في الحسابين.`); if (!pw) return;
+  try { await api("party_transfer_delete", id, pw); toast("✔ التحويل اتحذف", "ok"); if (after) after(); } catch (e) { alertBox(e.message); }
 }
 
 /* ===================== أرصدة الحسابات ===================== */
@@ -1793,6 +1849,7 @@ async function renderBalances(box) {
       h("button", { class: "btn", onclick: () => { const r = T.selected()[0]; if (!r) return toast("حدد حساب الأول"); S.pendingStatement = r.id; go("acc:statement", true); } }, icon("list", 18), "كشف الحساب"),
       h("button", { class: "btn gold", onclick: async () => { const sel = T.selected(); try { await api("print_balances", sel.length > 1 ? sel.map((x) => x.id) : null, sel.length > 1 ? "" : q.value.trim()); toast("🖨 شاشة الطباعة هتفتح خلال ثواني ...", "ok"); } catch (e) { toast(e.message, "err"); } } }, icon("print", 18), "طباعة"),
       pdfBtn(() => { const sel = T.selected(); pdfExport("print_balances", [sel.length > 1 ? sel.map((x) => x.id) : null, sel.length > 1 ? "" : q.value.trim()]); }),
+      c.rep ? null : h("button", { class: "btn", onclick: async () => { const r = T.selected()[0]; if (await partyTransferForm(r ? r.id : null)) go("acc:balances", true); } }, icon("swap", 18), "تحويل من عميل لعميل"),
       h("button", { class: "btn danger", onclick: del }, icon("trash", 18), "حذف")),
       h("div", { class: "hint", style: { padding: "8px 18px 0" } }, "ضغطتين على الاسم = كشف حسابه • موجب = على العميل ، سالب = للمورد"), T.el)));
   fill(); q.focus();

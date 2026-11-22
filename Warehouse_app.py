@@ -834,6 +834,10 @@ def init_db():
                      from_who TEXT NOT NULL, from_method TEXT DEFAULT 'كاش', to_who TEXT NOT NULL, to_method TEXT DEFAULT 'كاش', amount REAL NOT NULL, notes TEXT DEFAULT '')""")
         c.execute("""CREATE TABLE IF NOT EXISTS cash_counts(id INTEGER PRIMARY KEY, c_date TEXT NOT NULL, created_at TEXT, by_user TEXT DEFAULT '',
                      system REAL DEFAULT 0, counted REAL DEFAULT 0, diff REAL DEFAULT 0, data TEXT DEFAULT '')""")
+        # تحويل رصيد من عميل لعميل (بينزل من حساب الأول ويتضاف على التاني — مش بيدخل الخزنة)
+        c.execute("""CREATE TABLE IF NOT EXISTS party_transfers(id INTEGER PRIMARY KEY, t_date TEXT NOT NULL, created_at TEXT, by_user TEXT DEFAULT '',
+                     approved_by TEXT DEFAULT '', from_id INTEGER NOT NULL REFERENCES parties(id), to_id INTEGER NOT NULL REFERENCES parties(id),
+                     amount REAL NOT NULL, notes TEXT DEFAULT '')""")
         # طلبات فواتير المناديب من الموقع (بتستنى موافقة المحاسب أو المالك)
         c.execute("""CREATE TABLE IF NOT EXISTS inv_requests(id INTEGER PRIMARY KEY, created_at TEXT NOT NULL, rep_id INTEGER, by_user TEXT DEFAULT '',
                      party_id INTEGER, kind TEXT, net REAL DEFAULT 0, payload TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
@@ -1243,7 +1247,8 @@ def import_plan(what, path, asof):
         if what == "items":
             others = c.execute("SELECT id,name,(SELECT COUNT(*) FROM invoice_lines WHERE item_id=items.id)+(SELECT COUNT(*) FROM damaged WHERE item_id=items.id)+(SELECT COUNT(*) FROM production_lines WHERE item_id=items.id)+(SELECT COUNT(*) FROM production WHERE flour_item_id=items.id)+(SELECT COUNT(*) FROM bread_sizes WHERE item_id=items.id) used FROM items").fetchall()
         else:
-            others = c.execute("SELECT id,name,(SELECT COUNT(*) FROM invoices WHERE party_id=parties.id)+(SELECT COUNT(*) FROM payments WHERE party_id=parties.id) used FROM parties").fetchall()
+            others = c.execute("SELECT id,name,(SELECT COUNT(*) FROM invoices WHERE party_id=parties.id)+(SELECT COUNT(*) FROM payments WHERE party_id=parties.id)"
+                                 "+(SELECT COUNT(*) FROM party_transfers WHERE from_id=parties.id OR to_id=parties.id) used FROM parties").fetchall()
     others = [r for r in others if r["id"] not in in_file and not (sp and r["id"] in sp["drop"])]
     del_ids = [r["id"] for r in others if not r["used"]]; keep = [r for r in others if r["used"]]
     noun = "صنف" if what == "items" else "عميل/مورد"
@@ -1306,7 +1311,7 @@ def import_apply(ctx, replace, force_no_backup=False):
                     if f: c.execute(f"UPDATE {what} SET {','.join(k + '=?' for k in f)} WHERE id=?", [*f.values(), p["id"]])
             if sp:
                 for i in set(sp["drop"]):     # صناديق/حسابات كانت اتسجلت غلط كعملاء قبل كده
-                    if not c.execute("SELECT (SELECT COUNT(*) FROM invoices WHERE party_id=?)+(SELECT COUNT(*) FROM payments WHERE party_id=?)", (i, i)).fetchone()[0]:
+                    if not c.execute("SELECT (SELECT COUNT(*) FROM invoices WHERE party_id=?)+(SELECT COUNT(*) FROM payments WHERE party_id=?)+(SELECT COUNT(*) FROM party_transfers WHERE from_id=? OR to_id=?)", (i, i, i, i)).fetchone()[0]:
                         c.execute("DELETE FROM parties WHERE id=?", (i,))
                 if sp["cash"]:
                     mv = sum(m[5] - m[6] for m in treasury_moves(c) if m[0] <= asof) if asof else 0.0
@@ -1667,6 +1672,10 @@ def _balance_bulk(c, upto):
         if r[0] in bal: bal[r[0]] += float(r[1] or 0)
     for r in c.execute(f"SELECT party_id, SUM(CASE WHEN kind IN ('تحصيل','خصم مسموح به') THEN -amount ELSE amount END) FROM payments WHERE 1=1{cond_p} GROUP BY party_id", args).fetchall():
         if r[0] in bal: bal[r[0]] += float(r[1] or 0)
+    cond_t = " AND t_date<=?" if upto else ""
+    for r in c.execute(f"SELECT from_id, to_id, amount FROM party_transfers WHERE 1=1{cond_t}", args).fetchall():
+        if r[0] in bal: bal[r[0]] -= float(r[2] or 0)
+        if r[1] in bal: bal[r[1]] += float(r[2] or 0)
     return bal
 
 def _avgcost_bulk(c, upto):
@@ -2018,6 +2027,13 @@ def party_moves(c, pid):
             key = move_key(r["pay_date"], inv_ts[r["invoice_id"]], 0, r["invoice_id"] + 0.5)
         else: key = move_key(r["pay_date"], r["created_at"], 1, r["id"])
         moves.append((r["pay_date"], 1, r["id"], f"سند {r['id']}", label, 0.0 if is_col else amt, amt if is_col else 0.0, key, r["created_at"]))
+    # تحويل من عميل لعميل: بينزل من رصيد «من» (دائن) ويتضاف على رصيد «إلى» (مدين)
+    for r in c.execute("SELECT t.*, a.name fname, b.name tname FROM party_transfers t LEFT JOIN parties a ON a.id=t.from_id "
+                       "LEFT JOIN parties b ON b.id=t.to_id WHERE t.from_id=? OR t.to_id=?", (pid, pid)):
+        amt = float(r["amount"]); out = r["from_id"] == pid
+        label = f"تحويل إلى {r['tname'] or '؟'}" if out else f"تحويل من {r['fname'] or '؟'}"
+        moves.append((r["t_date"], 2, r["id"], f"تحويل {r['id']}", label, 0.0 if out else amt, amt if out else 0.0,
+                      move_key(r["t_date"], r["created_at"], 1, r["id"]), r["created_at"]))
     moves.sort(key=lambda m: m[7])
     return moves
 
