@@ -2140,7 +2140,7 @@ async function renderStock(box) {
     { cat: "مستلزمات", title: "مخزون المستلزمات", icon: "box", hint: "خميرة وملح وأكياس وغيرها — بتزيد بالمشتريات وتقل بالمبيعات أو الهالك", prod: null }];
   const mk = (S_) => {
     const cols = [{ h: "الكود", key: "code", cls: "hint" }, { h: "اسم الصنف", fn: (r) => h("b", null, r.name) }, { h: "الوحدة", key: "unit", cls: "hint" },
-      { h: "شراء", num: true, fn: (r) => h("span", { class: "c-buy" }, fmt(r.buy)) }, { h: "بيع", num: true, fn: (r) => h("span", { class: "c-sell" }, fmt(r.sell)) },
+      { h: "شراء", num: true, fn: (r) => h("span", { title: "تكلفة البضاعة الموجودة دلوقتي (أقدم شراء يتباع الأول) — بتتغير لوحدها مع كل فاتورة شراء وبيع" }, fmt(r.cost)) }, { h: "بيع", num: true, fn: (r) => h("span", { class: "c-sell" }, fmt(r.sell)) },
       { h: "أول المدة", num: true, fn: (r) => fq(r.opening) }, { h: "الوارد", num: true, fn: (r) => fq(r.in) },
       S_.prod ? { h: S_.prod.h, num: true, fn: (r) => (r[S_.prod.k] ? fq(r[S_.prod.k]) : "") } : null,
       { h: "الصادر", num: true, fn: (r) => fq(r.out) }, { h: "هالك", num: true, fn: (r) => (r.dmg ? fq(r.dmg) : "") },
@@ -2164,7 +2164,7 @@ async function renderStock(box) {
       cur.buy = num(pBuy.value); cur.sell = num(pSell.value);
       const T = curT || SECS.find((x) => x.cat === cur.cat).T;
       const rows = T.rows(), i = rows.indexOf(cur), tr = T.el.querySelectorAll("tbody tr")[i];
-      if (tr) { tr.querySelector(".c-buy").textContent = fmt(cur.buy); tr.querySelector(".c-sell").textContent = fmt(cur.sell); tr.classList.add("new"); }
+      if (tr) { tr.querySelector(".c-sell").textContent = fmt(cur.sell); tr.classList.add("new"); }
       toast(r.warn ? `⚠ «${cur.name}»: سعر البيع أقل من سعر الشراء` : r.changed ? `✔ اتحفظ سعر «${cur.name}»` : "مفيش تغيير في السعر", r.warn ? "err" : "ok", 2200);
       const nx = rows[i + 1], ntr = T.el.querySelectorAll("tbody tr")[i + 1];
       if (nx && ntr) { ntr.dispatchEvent(new MouseEvent("mousedown", { bubbles: true })); document.dispatchEvent(new MouseEvent("mouseup")); pick(nx); }
@@ -2178,7 +2178,7 @@ async function renderStock(box) {
     h("section", { class: "card anim-up d1" }, h("div", { class: "card-h" }, h("h2", null, "المخزون لحد النهارده"), h("div", { style: { flex: "1 1 260px" } }, q),
       h("button", { class: "btn gold", onclick: async () => { try { await api("print_stock_count"); toast("🖨 شاشة الطباعة هتفتح خلال ثواني ...", "ok"); } catch (e) { toast(e.message, "err"); } } }, icon("print", 18), "طباعة للجرد"), pdfBtn(() => pdfExport("print_stock_count", []))),
       h("div", { style: { padding: "4px 18px 14px", display: "flex", flexWrap: "wrap", gap: "10px", alignItems: "center" } },
-        h("span", { class: "hint" }, "تعديل سعر الصنف المحدد:"), pName, h("label", { class: "fld", style: { flexDirection: "row", alignItems: "center" } }, "شراء", pBuy),
+        h("span", { class: "hint" }, "تعديل سعر الصنف المحدد:"), pName, h("label", { class: "fld", style: { flexDirection: "row", alignItems: "center" } }, h("span", { title: "السعر اللي في كارت الصنف: بيتكتب تلقائي في فاتورة الشراء الجديدة وبيتحسب بيه رصيد أول المدة" }, "شراء (الكارت)"), pBuy),
         h("label", { class: "fld", style: { flexDirection: "row", alignItems: "center" } }, "بيع", pSell), h("button", { class: "btn primary", onclick: () => savePrice() }, icon("save", 18), "حفظ السعر"),
         h("span", { class: "hint" }, "Enter بيحفظ وينزل على اللي بعده • ضغطتين على صنف = فواتيره • الأحمر = وصل للحد الأدنى"))),
     SECS.map((S_, i) => h("section", { class: "card anim-up d" + (i + 2), "data-cat": S_.cat }, h("div", { class: "card-h" }, h("h2", null, S_.title), h("span", { class: "hint" }, S_.hint)), S_.T.el))));

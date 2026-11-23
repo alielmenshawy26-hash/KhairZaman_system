@@ -1419,6 +1419,7 @@ class Api:
             for r in c.execute(f"SELECT item_id, SUM(CASE WHEN qty>0 THEN qty ELSE 0 END), SUM(CASE WHEN qty<0 THEN -qty ELSE 0 END) FROM ({W.PROD_MOVES_SQL}) pm WHERE m_date<=? GROUP BY item_id", (today,)).fetchall():
                 pin[r[0]] = float(r[1] or 0); pout[r[0]] = float(r[2] or 0)
             after_map = W.stock_map(c, "9999-12-31")
+            fifo = W.fifo_engine(c)                                 # التكلفة الحالية = متوسط تكلفة البضاعة الموجودة فعلًا (FIFO) زي ما الفواتير بتحسبها
             for r in c.execute("SELECT it.*,"
                                "COALESCE(SUM(CASE WHEN i.kind='مشتريات' OR (i.kind='مرتجع مبيعات' AND COALESCE(l.damaged,0)=0) THEN l.qty END),0) inn,"
                                "COALESCE(SUM(CASE WHEN i.kind IN ('مبيعات','مرتجع مشتريات') THEN l.qty END),0) outq,"
@@ -1429,8 +1430,10 @@ class Api:
                 pi, po = pin.get(r["id"], 0.0), pout.get(r["id"], 0.0)
                 st = op + float(r["inn"]) - float(r["outq"]) - d + pi - po; mn = float(r["min_stock"] or 0)
                 after = after_map.get(r["id"], 0.0); res = st - after
+                L = [(q, p) for q, p in fifo["today"].get(r["id"], []) if q > 1e-9]; lq = sum(q for q, _ in L)
+                cost = sum(q * p for q, p in L) / lq if lq > 1e-9 else (fifo["last_in"].get(r["id"]) or float(r["buy_price"] or 0))
                 out.append({"id": r["id"], "code": r["code"] or "", "name": r["name"], "unit": r["unit"] or "", "buy": _r2(r["buy_price"]), "sell": _r2(r["sell_price"]),
-                            "opening": _r2(op), "in": _r2(r["inn"]), "out": _r2(r["outq"]), "dmg": _r2(d + float(r["dret"])), "stock": _r2(st),
+                            "cost": _r2(cost), "opening": _r2(op), "in": _r2(r["inn"]), "out": _r2(r["outq"]), "dmg": _r2(d + float(r["dret"])), "stock": _r2(st),
                             "reserved": _r2(res) if abs(res) > 1e-9 else 0, "after": _r2(after), "low": bool(mn > 0 and st <= mn),
                             "prod_in": _r2(pi), "prod_out": _r2(po), "min": _r2(mn), "cat": (r["category"] or W.item_cat_guess(r["name"]))})
         return out
