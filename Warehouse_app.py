@@ -1831,7 +1831,8 @@ def _fifo_sig(c):
                   "(SELECT COUNT(*) FROM production), (SELECT COALESCE(MAX(id),0) FROM production), (SELECT COALESCE(SUM(loaves*(1+price)),0) FROM production_lines), (SELECT COALESCE(SUM(COALESCE(flour_qty,1)*(1+COALESCE(flour_item_id,0))),0) FROM production), "
                   "(SELECT COUNT(*) FROM production_supplies), (SELECT COALESCE(SUM(qty*(1+item_id)),0) FROM production_supplies), "
                   "(SELECT COALESCE(SUM(COALESCE(opening_qty,0)*(1+COALESCE(buy_price,0))),0) FROM items), (SELECT COALESCE(MAX(id),0) FROM audit_log), (SELECT COUNT(*) FROM items)").fetchone()
-    return (DB_CFG.get("mode"), DB_CFG.get("host"), DB_CFG.get("dbname"), DB_PATH) + tuple(float(x or 0) for x in r)
+    # تاريخ النهارده جزء من البصمة: أول ما اليوم يتغير الحساب بيتعاد (الفاتورة اللي تاريخها بكره بتنزل من المخزون بسعر الشراء بعد ١٢ بالليل على طول)
+    return (DB_CFG.get("mode"), DB_CFG.get("host"), DB_CFG.get("dbname"), DB_PATH, date.today().isoformat()) + tuple(float(x or 0) for x in r)
 
 def fifo_engine(c):
     """بيمشي على كل حركات كل صنف بالترتيب (رصيد أول المدة ← الفواتير والهالك حسب التاريخ) ويرجّع:
