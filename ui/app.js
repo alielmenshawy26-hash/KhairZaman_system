@@ -475,6 +475,7 @@ function renderShell() {
   SCREENS.req.title = S.me.rep ? "طلباتي" : "طلبات المناديب";
   const side = h("nav", { class: "side" + (S.mini ? " mini" : ""), "aria-label": "القايمة الرئيسية" },
     h("div", { class: "brand" }, h("img", { src: S.boot.logo, alt: "" }), h("div", { class: "t" }, h("b", null, S.boot.company))),
+    h("div", { class: "side-clock", id: "side-clock" }, h("b", { class: "tm" }), h("span", { class: "dt" })),
     can("home") ? navBtn("home") : null,
     ...navGroups(),
     h("div", { class: "spacer" }),
@@ -1493,7 +1494,7 @@ function ctxMenu(e, items) {
   document.body.appendChild(m);
   const r = m.getBoundingClientRect();
   m.style.left = Math.min(e.clientX, innerWidth - r.width - 8) + "px"; m.style.top = Math.min(e.clientY, innerHeight - r.height - 8) + "px";
-  const off = (ev) => { if (!m.contains(ev.target) || ev.key === "Escape") { m.remove(); document.removeEventListener("mousedown", off, true); document.removeEventListener("keydown", off, true); document.removeEventListener("touchstart", off, true); } };
+  const off = (ev) => { if (!m.contains(ev.target) || ev.key === "Escape") { if (ev.key === "Escape") ev.preventDefault(); m.remove(); document.removeEventListener("mousedown", off, true); document.removeEventListener("keydown", off, true); document.removeEventListener("touchstart", off, true); } };
   setTimeout(() => { document.addEventListener("mousedown", off, true); document.addEventListener("keydown", off, true); document.addEventListener("touchstart", off, true); }, 0);
 }
 /* الموبايل: الضغط المطوّل على أي حاجة ليها قايمة كليك يمين = يفتح القايمة (آيفون مابيبعتش كليك يمين لوحده) */
@@ -3390,6 +3391,20 @@ document.addEventListener("keydown", (e) => {
   else if (e.altKey && !e.ctrlKey && (k === "ArrowLeft" || k === "ArrowRight")) { e.preventDefault(); navBack(); }
   else if (k === "Escape" && $("#drawer") && $("#drawer").classList.contains("on")) closeDrawer();
   else if ((e.ctrlKey || e.metaKey) && (k === "s" || k === "س") && (S.screen.startsWith("inv:") || S.screen === "vch:new")) { e.preventDefault(); const b = $("#screen"); if (b._save) b._save(false); }
+});
+/* الساعة والتاريخ جنب اللوجو (ماشيين مع ساعة الجهاز) — علشان شريط ويندوز مستخبي وانت ملو الشاشة */
+function tickClock() {
+  const c = document.getElementById("side-clock"); if (!c) return;
+  const n = new Date(), hh = n.getHours(), mm = String(n.getMinutes()).padStart(2, "0");
+  c.querySelector(".tm").replaceChildren(`${String(hh % 12 || 12).padStart(2, "0")}:${mm}`, h("small", { class: "ap" }, hh < 12 ? " ص" : " م"));
+  c.querySelector(".dt").textContent = `${n.toLocaleDateString("ar-EG", { weekday: "long" })} ${n.getFullYear()}-${String(n.getMonth() + 1).padStart(2, "0")}-${String(n.getDate()).padStart(2, "0")}`;
+}
+setInterval(tickClock, 5000); new MutationObserver(() => { const c = document.getElementById("side-clock"); if (c && !c.querySelector(".tm").textContent) tickClock(); }).observe(document.body, { childList: true, subtree: true });
+/* البرنامج على الجهاز بيفتح ملو الشاشة: Esc يخرج لشباك عادي، و F11 يدخل/يخرج */
+document.addEventListener("keydown", (e) => {
+  const api_ = window.pywebview && window.pywebview.api; if (!api_ || !api_.fullscreen) return;
+  if (e.key === "F11") { e.preventDefault(); api_.fullscreen(null); }
+  else if (e.key === "Escape" && !e.defaultPrevented && !MODALS && !document.querySelector(".ctx") && !($("#drawer") && $("#drawer").classList.contains("on"))) api_.fullscreen(false);
 });
 window.addEventListener("beforeunload", (e) => { if (S.dirty) { e.preventDefault(); e.returnValue = ""; } });
 

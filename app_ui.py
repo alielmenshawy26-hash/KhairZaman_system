@@ -3515,6 +3515,19 @@ class Bridge:
     """اللي الـ JavaScript بيشوفه جوه نافذة البرنامج: window.pywebview.api.call(name, args)."""
     def __init__(self): self._ctx = Ctx(web=False); self._api = self._ctx.api
     def call(self, name, args=None): return call_api(self._api, name, args, self._ctx)
+    def fullscreen(self, on=None):
+        """البرنامج بيفتح ملو الشاشة: Esc يخرج لشباك عادي (مكبّر)، و F11 يرجّعه."""
+        w = _WIN.get("w")
+        if not w: return False
+        on = (not _WIN["fs"]) if on is None else bool(on)
+        if on != _WIN["fs"]:
+            try:
+                w.toggle_fullscreen(); _WIN["fs"] = on
+                if not on: w.maximize()
+            except Exception: W.write_error_log("fullscreen: " + traceback.format_exc())
+        return _WIN["fs"]
+
+_WIN = {"w": None, "fs": False}
 
 
 # ---------- الموقع (أكتر من حد في نفس الوقت، كل واحد بجلسته) ----------
@@ -3648,7 +3661,8 @@ def main():
     try:
         import webview
         win = webview.create_window("مخبز خير زمان", os.path.join(UI_DIR, "index.html"), js_api=Bridge(), width=1366, height=840,
-                                    min_size=(1000, 640), background_color="#eef2f7", text_select=True)
+                                    min_size=(1000, 640), background_color="#eef2f7", text_select=True, fullscreen=True)
+        _WIN.update(w=win, fs=True)                # بيفتح ملو الشاشة — Esc يخرج
         W.UI_PRINT = lambda html: win.evaluate_js("printHtml(%s, true)" % json.dumps(html))   # طباعة احتياطية من جوه الشباك
         def _on_closing():                     # آخر تغييرات قبل ما البرنامج يتقفل → على الدرايف
             try: W.cloud_backup()
@@ -3656,7 +3670,7 @@ def main():
         try: win.events.closing += _on_closing
         except Exception: pass
         W.start_cloud_backup()
-        webview.start(lambda: win.maximize(), gui="edgechromium" if os.name == "nt" else None, private_mode=False,
+        webview.start(lambda: None, gui="edgechromium" if os.name == "nt" else None, private_mode=False,
                       storage_path=os.path.join(W.APP_DATA_DIR, "webview"))
     except Exception as e:
         W.write_error_log("new-ui start: " + traceback.format_exc())
