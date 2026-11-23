@@ -3389,7 +3389,7 @@ document.addEventListener("keydown", (e) => {
   else if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && (e.code === "KeyB")) { e.preventDefault(); go("acc:balances"); }
   else if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && (e.code === "KeyI")) { e.preventDefault(); go("itm:stock"); }
   else if (e.altKey && !e.ctrlKey && (k === "ArrowLeft" || k === "ArrowRight")) { e.preventDefault(); navBack(); }
-  else if (k === "Escape" && $("#drawer") && $("#drawer").classList.contains("on")) closeDrawer();
+  else if (k === "Escape" && $("#drawer") && $("#drawer").classList.contains("on")) { e.preventDefault(); closeDrawer(); }
   else if ((e.ctrlKey || e.metaKey) && (k === "s" || k === "س") && (S.screen.startsWith("inv:") || S.screen === "vch:new")) { e.preventDefault(); const b = $("#screen"); if (b._save) b._save(false); }
 });
 /* الساعة والتاريخ جنب اللوجو (ماشيين مع ساعة الجهاز) — علشان شريط ويندوز مستخبي وانت ملو الشاشة */
