@@ -409,6 +409,7 @@ class PgConn:
             cur.execute("SELECT ordinal_position-1, column_name, data_type, CASE WHEN is_nullable='NO' THEN 1 ELSE 0 END, column_default, 0 "
                         "FROM information_schema.columns WHERE table_schema=current_schema() AND table_name=%s ORDER BY ordinal_position", (m.group(1).lower(),))
             return PgCursor(cur)
+        if getattr(_TLS, "trash", None) is not None: _trash_capture(self, sql, params)
         s, ret = pg_sql(sql)
         if self.cache and s[:6].upper() in ("INSERT", "UPDATE", "DELETE", "ALTER ", "CREATE"): self.cache.clear()
         cur = self.raw.cursor()
@@ -474,11 +475,17 @@ def pg_reset_connection():
     if st["con"] is not None: st["con"].close()
     st["con"] = None; st["depth"] = 0
 
+class _SqlCon(sqlite3.Connection):
+    """اتصال SQLite عادي + بيمسك الصفوف قبل الحذف وقت سلة المحذوفات."""
+    def execute(self, sql, params=()):
+        if getattr(_TLS, "trash", None) is not None: _trash_capture(self, sql, params)
+        return super().execute(sql, params)
+
 def raw_db():
     if using_pg():
         try: return PgConn(_pg_connect())
         except Exception as e: raise DBUnavailable(pg_error_text(e)) from e
-    con = sqlite3.connect(getattr(_TLS, "sqlite_path", None) or DB_PATH)
+    con = sqlite3.connect(getattr(_TLS, "sqlite_path", None) or DB_PATH, factory=_SqlCon)
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA foreign_keys=ON")
     con.execute("PRAGMA busy_timeout=5000")
@@ -838,6 +845,9 @@ def init_db():
         c.execute("""CREATE TABLE IF NOT EXISTS party_transfers(id INTEGER PRIMARY KEY, t_date TEXT NOT NULL, created_at TEXT, by_user TEXT DEFAULT '',
                      approved_by TEXT DEFAULT '', from_id INTEGER NOT NULL REFERENCES parties(id), to_id INTEGER NOT NULL REFERENCES parties(id),
                      amount REAL NOT NULL, notes TEXT DEFAULT '')""")
+        # سلة المحذوفات (بتتفضّى مع تقفيل اليوم)
+        c.execute("""CREATE TABLE IF NOT EXISTS recycle_bin(id INTEGER PRIMARY KEY, at TEXT NOT NULL, user TEXT DEFAULT '', method TEXT DEFAULT '',
+                     label TEXT DEFAULT '', data TEXT NOT NULL)""")
         # طلبات فواتير المناديب من الموقع (بتستنى موافقة المحاسب أو المالك)
         c.execute("""CREATE TABLE IF NOT EXISTS inv_requests(id INTEGER PRIMARY KEY, created_at TEXT NOT NULL, rep_id INTEGER, by_user TEXT DEFAULT '',
                      party_id INTEGER, kind TEXT, net REAL DEFAULT 0, payload TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
@@ -1382,6 +1392,155 @@ def log(c, action, details=""):
         c.execute("INSERT INTO audit_log(at,user,action,details) VALUES(?,?,?,?)", (now_ts(), user, action, details))
     except Exception:
         pass
+
+# ---------------- سلة المحذوفات ----------------
+# أي حذف من الشاشات (فاتورة، سند، حساب، صنف، موظف ...) بيتحفظ هنا قبل ما يتمسح، ويترجع بباسوورد المحاسب أو المالك.
+# السلة بتتفضّى مع «تقفيل اليوم». بنمسك أوامر DELETE/UPDATE وقت الحذف بس (_TLS.trash) ونحفظ الصفوف زي ما كانت.
+TRASH_SKIP = {"audit_log", "counters", "recycle_bin", "sessions"}
+TRASH_CASCADE = {"invoices": [("invoice_lines", "invoice_id")]}      # صفوف بتتمسح لوحدها مع الأب (ON DELETE CASCADE)
+TRASH_FK = {"invoice_id": "invoices", "party_id": "parties", "item_id": "items", "employee_id": "employees", "expense_id": "expenses",
+            "vehicle_id": "vehicles", "sample_item_id": "sample_items", "from_id": "parties", "to_id": "parties", "emp_id": "employees", "rep_id": "employees",
+            "production_id": "production", "flour_item_id": "items"}
+TRASH_AR = {"invoices": "فاتورة", "payments": "سند", "expenses": "مصروف", "parties": "حساب", "items": "صنف", "employees": "موظف",
+            "cash_moves": "حركة خزنة", "cash_transfers": "تحويل في الخزنة", "party_transfers": "تحويل من عميل لعميل", "damaged": "هالك",
+            "sample_items": "صنف عينة", "samples": "حركة عينة", "sub_cash": "حركة صندوق فرعي", "emp_deductions": "خصم موظف",
+            "loading_logs": "تشوين", "attendance": "حضور", "vehicle_logs": "حركة عربية", "vehicles": "عربية", "users": "مستخدم",
+            "expense_cats": "بند مصروفات", "production": "بلاغ", "production_lines": "سطر بلاغ", "production_supplies": "مستلزمات بلاغ"}
+_TRASH_DEL_RE = re.compile(r"DELETE\s+FROM\s+(\w+)(?:\s+WHERE\s+(.*))?$", re.I | re.S)
+_TRASH_UPD_RE = re.compile(r"UPDATE\s+(\w+)\s+SET\s+(.*?)\s+WHERE\s+(.*)$", re.I | re.S)
+
+def _row_dict(r): return {k: r[k] for k in r.keys()}
+
+def _trash_capture(c, sql, params):
+    """بيتنادى قبل أي أمر وقت الحذف: لو DELETE أو UPDATE بيحفظ الصفوف قبل ما تتغير."""
+    cap = getattr(_TLS, "trash", None)
+    if cap is None or not isinstance(sql, str): return
+    s = sql.strip().rstrip(";"); params = tuple(params or ())
+    _TLS.trash = None                                       # الـ SELECT جوه مايتمسكش
+    try:
+        m = _TRASH_DEL_RE.match(s)
+        if m and m.group(1).lower() not in TRASH_SKIP:
+            t = m.group(1).lower(); where = m.group(2) or "1=1"
+            rows = [_row_dict(r) for r in c.execute(f"SELECT * FROM {t} WHERE {where}", params).fetchall()]
+            if not rows: return
+            ids = [r["id"] for r in rows if "id" in r]
+            for ct, col in TRASH_CASCADE.get(t, []):
+                if ids:
+                    kids = [_row_dict(r) for r in c.execute(f"SELECT * FROM {ct} WHERE {col} IN ({','.join('?' * len(ids))})", ids).fetchall()]
+                    if kids: cap.append({"op": "D", "t": ct, "rows": kids})
+            cap.append({"op": "D", "t": t, "rows": rows}); return
+        m = _TRASH_UPD_RE.match(s)
+        if m and m.group(1).lower() not in TRASH_SKIP:
+            t, setp, where = m.group(1).lower(), m.group(2), m.group(3)
+            n = len(re.sub(r"'(?:[^']|'')*'", "", setp).split("?")) - 1
+            cols = re.findall(r"(?:^|,)\s*(\w+)\s*=", setp)
+            rows = [_row_dict(r) for r in c.execute(f"SELECT * FROM {t} WHERE {where}", params[n:]).fetchall()]
+            if rows and cols: cap.append({"op": "U", "t": t, "cols": cols, "rows": rows})
+    except Exception as e:
+        write_error_log("trash capture: " + repr(e) + " — " + s[:200])
+    finally:
+        _TLS.trash = cap
+
+def _trash_label(c, entries):
+    """وصف بسيط للي اتحذف (أول صف من آخر جدول اتمسح منه = الحاجة الأساسية)."""
+    main = [e for e in entries if e["op"] == "D"]
+    e = main[-1]; t = e["t"]; r = e["rows"][0]; n = len(e["rows"])
+    def pname(pid):
+        x = c.execute("SELECT name FROM parties WHERE id=?", (pid,)).fetchone() if pid else None
+        return x[0] if x else ""
+    if t == "invoices":
+        tot = sum(float(l.get("qty") or 0) * float(l.get("price") or 0) for x in entries if x["t"] == "invoice_lines" for l in x["rows"]) - float(r.get("discount") or 0)
+        s = f"فاتورة {r.get('kind')} رقم {r.get('number')} — {pname(r.get('party_id'))} — {r.get('inv_date')} — {fmt(tot)}"
+    elif t == "payments":
+        s = f"سند {r.get('kind')} {fmt(r.get('amount') or 0)} — {pname(r.get('party_id'))} — {r.get('pay_date')}"
+    elif t == "expenses":
+        s = f"{r.get('kind')} {r.get('category') or ''} {fmt(r.get('amount') or 0)} — {r.get('exp_date')}"
+    elif t == "production":
+        lv = sum(float(l.get("loaves") or 0) for x in entries if x["t"] == "production_lines" for l in x["rows"])
+        s = f"بلاغ: شيكارة {r.get('sack_no')} — {r.get('p_date')} — {fmt(lv)} رغيف"
+    elif t == "damaged" and r.get("employee_id"):
+        x = c.execute("SELECT name FROM employees WHERE id=?", (r.get("employee_id"),)).fetchone()
+        s = f"صرف عيش: {x[0] if x else ''} — {fmt(r.get('qty') or 0)} رغيف — {r.get('d_date')}"
+    elif t == "damaged" and r.get("period"):
+        x = c.execute("SELECT name FROM items WHERE id=?", (r.get("item_id"),)).fetchone()
+        s = f"استهلاك مستلزمات: {x[0] if x else ''} — {fmt(r.get('qty') or 0)} — {r.get('d_date')}"
+    elif t == "party_transfers":
+        s = f"تحويل {fmt(r.get('amount') or 0)} من «{pname(r.get('from_id'))}» إلى «{pname(r.get('to_id'))}» — {r.get('t_date')}"
+    else:
+        s = TRASH_AR.get(t, t) + ": " + " — ".join(str(r[k]) for k in ("name", "username", "kind", "category", "number") if r.get(k) not in (None, ""))
+        amt = r.get("amount", r.get("qty"))
+        if amt not in (None, ""): s += f" — {fmt(amt)}"
+        d = next((r[k] for k in r if k.endswith("_date") and r[k]), "")
+        if d: s += f" — {d}"
+    if n > 1: s += f" (+{n - 1})"
+    return s
+
+def trash_save(method):
+    """بعد ما أمر الحذف يخلص: الصفوف اللي اتمسحت فعلًا (مش اللي اترجعت بسبب خطأ) تتحفظ في السلة."""
+    entries = getattr(_TLS, "trash", None) or []; _TLS.trash = None
+    if not entries: return
+    try:
+        with db() as c:
+            kept = []
+            for e in entries:
+                if e["op"] == "D":
+                    rows = [r for r in e["rows"] if "id" not in r or not c.execute(f"SELECT 1 FROM {e['t']} WHERE id=?", (r["id"],)).fetchone()]
+                    if rows: kept.append(dict(e, rows=rows))
+                else: kept.append(e)
+            if not any(e["op"] == "D" for e in kept): return
+            c.execute("INSERT INTO recycle_bin(at,user,method,label,data) VALUES(?,?,?,?,?)",
+                      (now_ts(), CURRENT_USER.get("username", ""), method, _trash_label(c, kept), json.dumps(kept, ensure_ascii=False, default=str)))
+    except Exception as e:
+        write_error_log("trash save: " + repr(e))
+
+def trash_list():
+    with db() as c:
+        return [{"id": r["id"], "at": r["at"], "user": r["user"] or "", "label": r["label"] or ""}
+                for r in c.execute("SELECT id,at,user,label FROM recycle_bin ORDER BY id DESC").fetchall()]
+
+def trash_restore(bin_id, who):
+    """يرجّع الحاجة زي ما كانت: الصفوف بنفس الأرقام (ولو الرقم اتاخد بياخد رقم جديد والصفوف التابعة بتتظبط عليه)."""
+    with db() as c:
+        b = c.execute("SELECT * FROM recycle_bin WHERE id=?", (bin_id,)).fetchone()
+        if not b: raise ValueError("الحاجة دي مش موجودة في السلة (يمكن اترجعت أو السلة اتفضّت)")
+        entries = json.loads(b["data"]); idmap = {}; items = set(); notes = []
+        tables = _cols_cache_names(c)
+        for e in reversed([x for x in entries if x["op"] == "D"]):       # الأب الأول وبعدين التابع
+            t = e["t"]
+            if t not in tables: continue
+            cols_now = set(_cols(c, t))
+            for r in e["rows"]:
+                row = {k: v for k, v in r.items() if k in cols_now}
+                for k, v in list(row.items()):
+                    if k in TRASH_FK and v is not None and (TRASH_FK[k], v) in idmap: row[k] = idmap[(TRASH_FK[k], v)]
+                if t == "invoices" and c.execute("SELECT 1 FROM invoices WHERE kind=? AND inv_date=? AND number=? AND id<>?",
+                                                 (row.get("kind"), row.get("inv_date"), row.get("number"), row.get("id") or -1)).fetchone():
+                    old = row["number"]; row["number"] = next_no(row["kind"], row["inv_date"])
+                    notes.append(f"رقم الفاتورة {old} اتاخد، فرجعت برقم {row['number']}")
+                old_id = row.get("id")
+                if old_id is not None and c.execute(f"SELECT 1 FROM {t} WHERE id=?", (old_id,)).fetchone(): row.pop("id")
+                ks = list(row.keys())
+                new_id = c.execute(f"INSERT INTO {t}({','.join(ks)}) VALUES({','.join('?' * len(ks))})", [row[k] for k in ks]).lastrowid
+                if old_id is not None and "id" not in row and new_id: idmap[(t, old_id)] = new_id
+                if row.get("item_id"): items.add(row["item_id"])
+        for e in [x for x in entries if x["op"] == "U"]:                # اللي اتعدّل وقت الحذف يرجع زي ما كان
+            t = e["t"]
+            if t not in tables: continue
+            cols_now = set(_cols(c, t))
+            for r in e["rows"]:
+                cols = [k for k in e["cols"] if k in cols_now and k in r]
+                if not cols or "id" not in r: continue
+                vals = [idmap.get((TRASH_FK[k], r[k]), r[k]) if k in TRASH_FK else r[k] for k in cols]
+                c.execute(f"UPDATE {t} SET {','.join(k + '=?' for k in cols)} WHERE id=?", vals + [idmap.get((t, r["id"]), r["id"])])
+        old_neg = getattr(_TLS, "allow_neg", None); _TLS.allow_neg = who
+        try: check_stock(c, items)
+        finally: _TLS.allow_neg = old_neg
+        c.execute("DELETE FROM recycle_bin WHERE id=?", (bin_id,))
+        log(c, "استرجاع من سلة المحذوفات", f"{b['label']} (بباسوورد {who})" + (" — " + " • ".join(notes) if notes else ""))
+    return {"label": b["label"], "notes": notes}
+
+def trash_purge(c):
+    c.execute("DELETE FROM recycle_bin")
 
 # ---------------- المبلغ بالحروف ----------------
 _ONES = ["", "واحد", "اثنان", "ثلاثة", "أربعة", "خمسة", "ستة", "سبعة", "ثمانية", "تسعة", "عشرة",

@@ -28,7 +28,7 @@ ALL_SCREENS = ["home", "inv:مبيعات", "inv:مشتريات", "inv:مرتجع
                "acc:statement", "acc:balances", "acc:cash", "acc:subcash", "par:list", "itm:list", "itm:stock", "itm:sales", "itm:buys", "itm:damaged",
                "smp:items", "smp:out", "smp:in", "emp:list", "emp:att", "emp:attlog", "emp:attreq", "emp:repreq", "emp:veh",
                "rep:daily", "rep:monthly", "rep:profit", "rep:reps", "rep:targets", "rep:log", "req", "set:main", "acc:assets",
-               "prd:new", "prd:log", "rep:production", "gate:log", "emp:bread", "itm:use"]
+               "prd:new", "prd:log", "rep:production", "gate:log", "emp:bread", "itm:use", "trash"]
 OWNER_ONLY_SCREENS = {"rep:profit", "set:users", "acc:assets", "rep:monthly"}
 DEFAULT_SCREENS = {
     W.ROLE_ACC: [k for k in ALL_SCREENS if k not in OWNER_ONLY_SCREENS],
@@ -76,6 +76,7 @@ for _keys, _methods in [
     (["req"], "req_list req_decide inv_request_get req_counts"),
     (["acc:assets"], "assets_report save_asset assets_adopt"),
     (["rep:monthly"], "monthly_report monthly_print"),
+    (["trash"], "trash_list trash_restore"),
 ]:
     for _m in _methods.split(): METHOD_SCREENS[_m] = set(_keys)
 NO_REP = {"close_day", "expense_cat_log", "quick_setup", "quick_sale", "gate_log", "bread_give_setup", "bread_give", "bread_gives", "delete_bread_give", "consume_setup", "save_consume", "consumes", "delete_consume", "day_unlock", "req_decide", "inv_request_get",
@@ -84,7 +85,7 @@ NO_REP = {"close_day", "expense_cat_log", "quick_setup", "quick_sale", "gate_log
           "delete_invoice", "delete_voucher", "daily_report", "print_daily", "daily_trend",
           "add_expense_cat", "rename_expense_cat", "delete_expense_cat",
           "save_production", "delete_production", "bread_sizes_save", "prod_supplies_save",
-          "party_transfer_preview", "party_transfer_save", "party_transfer_delete"}  # التحويل من عميل لعميل للمحاسب أو المالك بس • المندوب مايقفلش اليوم ومايفتحش أيام مقفولة
+          "party_transfer_preview", "party_transfer_save", "party_transfer_delete", "trash_list", "trash_restore"}  # التحويل من عميل لعميل للمحاسب أو المالك بس • المندوب مايقفلش اليوم ومايفتحش أيام مقفولة
 
 
 def user_screens(r):
@@ -94,7 +95,7 @@ def user_screens(r):
     try: lst = json.loads(raw) if raw else None
     except ValueError: lst = None
     base = DEFAULT_SCREENS.get(r["role"], DEFAULT_SCREENS[W.ROLE_ACC]) if lst is None else lst
-    if r["role"] == W.ROLE_ACC: base = list(base) + ["req"]       # المحاسب دايمًا بيوافق على طلبات المناديب (فواتير وسندات وحضور)
+    if r["role"] == W.ROLE_ACC: base = list(base) + ["req", "trash"]       # المحاسب دايمًا بيوافق على طلبات المناديب (فواتير وسندات وحضور) وبيشوف سلة المحذوفات
     return [k for k in ALL_SCREENS if k in base and k not in OWNER_ONLY_SCREENS]
 
 
@@ -219,6 +220,10 @@ class Api:
             c.execute("UPDATE settings SET day_closed=? WHERE id=1", (day,))
             W.log(c, "تقفيل اليوم", f"يوم {day} — " + " • ".join(("✔ " if s["ok"] else "✖ " if s["ok"] is False else "— ") + s["t"] for s in steps))
         W.DAY_OK["until"] = 0.0
+        try:
+            with W.db() as c: W.trash_purge(c)                     # سلة المحذوفات بتتفضّى مع تقفيل اليوم
+            steps.append({"ok": True, "t": "سلة المحذوفات اتفضّت"})
+        except Exception: pass
         steps.append({"ok": True, "t": f"يوم {day} اتقفل — أي تعديل في فواتيره أو سنداته محتاج باسوورد المحاسب أو المالك"})
         return {"day": day, "steps": steps}
 
@@ -558,6 +563,22 @@ class Api:
         finally:
             W._TLS.allow_neg = None
         return {"ok": True}
+
+    # ---------- سلة المحذوفات ----------
+    def trash_list(self):
+        self._need_login()
+        return W.trash_list()
+
+    def trash_restore(self, bin_id, pw):
+        self._need_login()
+        who = W.verify_day_password(pw)
+        if not who: raise UIError("باسوورد المحاسب أو المالك غلط — مارجعش حاجة" if pw else "الاسترجاع محتاج باسوورد المحاسب أو المالك")
+        try: return W.trash_restore(int(bin_id), who)
+        except ValueError as e: raise UIError(str(e))
+        except Exception as e:
+            if "unique" in str(e).lower() or "integrity" in type(e).__name__.lower():
+                raise UIError("مش هينفع ترجع: فيه حاجة جديدة بنفس الاسم أو الكود. غيّر اسمها الأول وجرب تاني.")
+            raise
 
     # ---------- السندات ----------
     def voucher_setup(self):
@@ -3314,6 +3335,12 @@ WEB_BLOCKED = {"restore_backup", "cloud_set", "export_pdf", "pick_file", "open_b
                "server_get", "server_test", "server_save", "server_settings_boot", "server_save_boot", "open_old_app", "web_get", "web_save", "cash_count_pdf"}
 
 
+TRASH_METHODS = {"delete_invoice", "delete_expense_cat", "delete_voucher", "delete_parties", "party_transfer_delete", "delete_cash_move",
+                 "cash_transfer_delete", "delete_item", "delete_damaged", "delete_sample_item", "delete_sample", "delete_subcash",
+                 "delete_employee", "delete_deduction", "delete_loading", "delete_attendance", "delete_vehicle_log", "delete_vehicle", "delete_user",
+                 "delete_production", "delete_consume", "delete_bread_give"}     # خير زمان: البلاغ وصرف عيش العمال واستهلاك المستلزمات
+
+
 def call_api(api, name, args, ctx=None):
     return _WORKER.submit(_call_api, api, name, args, ctx).result()
 
@@ -3326,7 +3353,10 @@ def _call_api(api, name, args, ctx=None):
         W._TLS.capture_print = [] if ctx.web else None
     try:
         _guard(name, args or [])
-        res = {"result": _scope(name, getattr(api, name)(*(args or [])))}
+        if name in TRASH_METHODS: W._TLS.trash = []             # الحذف بيتحفظ في سلة المحذوفات
+        out = getattr(api, name)(*(args or []))
+        if name in TRASH_METHODS and not (isinstance(out, dict) and out.get("ok") is False): W.trash_save(name)
+        res = {"result": _scope(name, out)}
         cap = getattr(W._TLS, "capture_print", None)
         if cap:
             try:
@@ -3340,6 +3370,7 @@ def _call_api(api, name, args, ctx=None):
         msg = str(e) if isinstance(e, W.DBUnavailable) else (W.pg_error_text(e) if W.using_pg() else repr(e))
         return {"__error": "حصل خطأ: " + msg}
     finally:
+        W._TLS.trash = None
         if ctx is not None:
             ctx.user = dict(W.CURRENT_USER); ctx.day_ok = W.DAY_OK["until"]; ctx.seen = time.time()
             W._TLS.capture_print = None

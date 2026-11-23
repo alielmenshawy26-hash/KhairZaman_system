@@ -365,6 +365,7 @@ const SCREENS = {
   "set:main": { title: "الإعدادات", icon: "edit" },
   "req": { title: "طلبات المناديب", icon: "check" },
   "set:users": { title: "المستخدمين وكلمات السر 🔒", icon: "users" },
+  trash: { title: "سلة المحذوفات", icon: "trash" },
 };
 
 /* ===================== التشغيل ===================== */
@@ -450,7 +451,7 @@ function navGroups() {
     ["العمال", "users", ["emp:list", "emp:bread", "emp:att", "emp:attlog"]],
     ["الحسابات", "calc", ["acc:statement", "acc:balances", "acc:cash", "acc:subcash", "acc:assets"]],
     ["التقارير", "chart", ["rep:daily", "rep:production", S.me.owner ? "rep:monthly" : null, S.me.owner ? "rep:profit" : null, "rep:log"]],
-    ["الإعدادات", "edit", ["set:main", S.me.owner ? "set:users" : null], [["إصدار نسخة احتياطية", "save", backupNow], ...(S.me.owner && S.boot && !S.boot.web ? [["استرجاع نسخة احتياطية", "upload", restoreBackup]] : [])]],
+    ["الإعدادات", "edit", ["set:main", "trash", S.me.owner ? "set:users" : null], [["إصدار نسخة احتياطية", "save", backupNow], ...(S.me.owner && S.boot && !S.boot.web ? [["استرجاع نسخة احتياطية", "upload", restoreBackup]] : [])]],
   ];
   S.openGroups = S.openGroups || new Set();
   const flat = (keys) => keys.flatMap((k) => Array.isArray(k) ? flat(k[2]) : [k]).filter(Boolean);
@@ -604,6 +605,7 @@ async function go(key, force, fromBack) {
     else if (key === "set:main") await renderSettings(box);
     else if (key === "set:users") await renderUsers(box);
     else if (key === "req") await renderReq(box);
+    else if (key === "trash") await renderTrash(box);
     else await renderInvoice(box, key.slice(4));
   } catch (e) { box.replaceChildren(h("div", { class: "page" }, h("div", { class: "card empty" }, e.message))); }
   pinTotals();
@@ -1053,7 +1055,7 @@ async function editInvoice(id) {
   closeModals(); go("inv:" + v.kind, true);
 }
 async function deleteInvoice(id, label) {
-  if (!(await confirmBox(`تحذف ${label} نهائيًا؟\nرصيد المخزون وحساب العميل/المورد هيتغيروا، وأي مبلغ مدفوع مسجّل معاها هيتحذف.`, "حذف فاتورة", "احذف"))) return false;
+  if (!(await confirmBox(`تحذف ${label}؟\n(هتفضل في «سلة المحذوفات» لحد تقفيل اليوم وتقدر ترجعها)\nرصيد المخزون وحساب العميل/المورد هيتغيروا، وأي مبلغ مدفوع مسجّل معاها هيتحذف.`, "حذف فاتورة", "احذف"))) return false;
   let pw = null;
   while (true) {
     let r; try { r = await api("delete_invoice", id, pw); } catch (e) { alertBox(e.message, "مش هينفع تتحذف"); return false; }
@@ -2738,6 +2740,25 @@ async function renderActivity(box) {
   [from, to, act].forEach((x) => x.addEventListener("change", load)); let t = null; q.addEventListener("input", () => { clearTimeout(t); t = setTimeout(load, 300); });
   box.replaceChildren(h("div", { class: "page" }, h("section", { class: "card anim-up d1" }, h("div", { class: "form" }, h("label", { class: "fld" }, "من", from), h("label", { class: "fld" }, "إلى", to), h("label", { class: "fld" }, "العملية", act), h("label", { class: "fld span2" }, "بحث", q))),
     h("section", { class: "card anim-up d2" }, h("div", { class: "card-h" }, h("h2", null, "سجل النشاط (للقراءة بس)")), T.el)));
+  await load();
+}
+/* سلة المحذوفات: أي حاجة اتحذفت النهارده ترجع زي ما كانت بباسوورد المحاسب أو المالك — بتتفضّى مع تقفيل اليوم */
+async function renderTrash(box) {
+  const T = selTable({ cols: [{ h: "وقت الحذف", key: "at", cls: "hint" }, { h: "مين حذف", fn: (r) => h("b", null, r.user) }, { h: "اللي اتحذف", key: "label" }],
+    onOpen: (r) => restore(r), totals: (rs) => [totItem("العدد", rs.length)] });
+  async function load() { let r; try { r = await api("trash_list"); } catch (e) { return toast(e.message, "err"); } T.setRows(r); }
+  async function restore(r) {
+    r = r || T.selected()[0]; if (!r) return toast("حدد الحاجة اللي عايز ترجعها الأول");
+    const pw = await promptBox(`ترجّع:\n${r.label}\n\nهترجع زي ما كانت بالظبط (المخزون والحسابات كمان).\nاكتب باسوورد المحاسب أو المالك:`, "♻️ استرجاع", { password: true });
+    if (!pw) return;
+    try { const x = await api("trash_restore", r.id, pw); toast("✔ رجعت: " + x.label, "ok", 5000); if (x.notes && x.notes.length) alertBox(x.notes.join("\n")); }
+    catch (e) { return alertBox(e.message, "مارجعتش"); }
+    load();
+  }
+  box.replaceChildren(h("div", { class: "page" }, h("section", { class: "card anim-up d1" },
+    h("div", { class: "card-h" }, h("h2", null, "سلة المحذوفات"), h("button", { class: "btn primary", onclick: () => restore() }, icon("upload", 18), "استرجاع")),
+    h("div", { class: "hint", style: { padding: "0 16px 10px" } }, "أي حاجة بتتحذف (فاتورة، سند، حساب، صنف، موظف ...) بتيجي هنا. ضغطتين عليها أو «استرجاع» = ترجع زي ما كانت بباسوورد المحاسب أو المالك. السلة بتتفضّى مع «تقفيل اليوم»."),
+    T.el)));
   await load();
 }
 async function renderSubcash(box) {
