@@ -30,7 +30,9 @@ PAID_LABEL = {"مبيعات": "المحصّل الآن من العميل", "مش
               "مرتجع مبيعات": "المدفوع الآن للعميل (رد نقدي)", "مرتجع مشتريات": "المحصّل الآن من المورد (رد نقدي)"}
 
 # صافي الفاتورة = مجموع البنود - الخصم (يُستخدم مع الاسم المستعار i لجدول invoices)
-NET_SQL = "(COALESCE((SELECT SUM(qty*price) FROM invoice_lines WHERE invoice_id=i.id),0)-COALESCE(i.discount,0))"
+# المشال (فواتير المشتريات): MASHAL_SIGN = -1 بيتخصم من حساب المورد زي الخصم، +1 بيتزود عليه
+MASHAL_SIGN = 1
+NET_SQL = "(COALESCE((SELECT SUM(qty*price) FROM invoice_lines WHERE invoice_id=i.id),0)-COALESCE(i.discount,0)" + ("-" if MASHAL_SIGN < 0 else "+") + "COALESCE(i.mashal,0))"
 SIGNED_SALES_SQL = f"CASE i.kind WHEN 'مبيعات' THEN {NET_SQL} WHEN 'مرتجع مبيعات' THEN -{NET_SQL} ELSE 0 END"
 # المرتجع المعلَّم «هالك» لا يرجع للمخزن
 PAYTYPE_KINDS = ("مبيعات", "مشتريات")   # نقدي / آجل
@@ -774,6 +776,7 @@ def init_db():
         add_col(c, "invoices", "printed_at", "TEXT DEFAULT ''")      # آخر مرة اتطبعت
         add_col(c, "invoices", "print_count", "INTEGER DEFAULT 0")      # وحدة العمولة وقت الفاتورة: شيكارة / طن
         add_col(c, "employees", "comm_unit", "TEXT DEFAULT 'شيكارة'")
+        add_col(c, "invoices", "mashal", "REAL DEFAULT 0")   # المشال في فاتورة المشتريات
         add_col(c, "invoices", "due_date", "TEXT")   # تاريخ الاستحقاق: المخزن بيتأثر فيه
         if add_col(c, "invoices", "pay_type", "TEXT"):
             # الفواتير القديمة: مدفوعة بالكامل = نقدي، غير كده = آجل
@@ -1077,7 +1080,7 @@ def _f(x, default=0.0):
     x = ("" if x is None else str(x)).strip().translate(_AR_DIGITS).replace(",", "")
     return float(x) if x else default
 
-def prepare_invoice(kind, lines, party, number, inv_date, due, discount, paid, pay_type, notes, rep_id, edit_id=None):
+def prepare_invoice(kind, lines, party, number, inv_date, due, discount, paid, pay_type, notes, rep_id, edit_id=None, mashal=0):
     """بيراجع بيانات الفاتورة ويجهزها للحفظ (نفس القواعد للشاشة القديمة والجديدة). بيرمي InvoiceInputError."""
     if not lines: raise InvoiceInputError("أضف صنفًا واحدًا على الأقل", "تنبيه", True)
     if not party: raise InvoiceInputError("اختر العميل أو المورد", "تنبيه", True)
@@ -1085,7 +1088,11 @@ def prepare_invoice(kind, lines, party, number, inv_date, due, discount, paid, p
     try: discount = _f(discount); paid = _f(paid)
     except ValueError: raise InvoiceInputError("الخصم والمدفوع يجب أن يكونا أرقامًا")
     if discount < 0 or discount > total: raise InvoiceInputError("الخصم يجب أن يكون بين صفر وإجمالي الفاتورة")
-    net = total - discount
+    try: mashal = _f(mashal) if kind == "مشتريات" else 0.0
+    except ValueError: raise InvoiceInputError("المشال لازم يكون رقم")
+    if mashal < 0: raise InvoiceInputError("المشال مينفعش يكون بالسالب")
+    net = total - discount + MASHAL_SIGN * mashal
+    if net < -0.005: raise InvoiceInputError("الخصم + المشال أكبر من إجمالي الفاتورة")
     number = (number or "").strip()
     pay_type = pay_type if kind in PAYTYPE_KINDS else None
     if pay_type == "نقدي": paid = net
@@ -1107,7 +1114,7 @@ def prepare_invoice(kind, lines, party, number, inv_date, due, discount, paid, p
     if msg: raise InvoiceInputError(msg, "الشهر مقفول")
     msg = check_day(inv_date, old_date)
     if msg: raise InvoiceInputError(msg, "اليوم مقفول")
-    return dict(kind=kind, lines=[dict(l) for l in lines], party=party, number=number, inv_date=inv_date, due=due or None, discount=discount,
+    return dict(kind=kind, lines=[dict(l) for l in lines], party=party, number=number, inv_date=inv_date, due=due or None, discount=discount, mashal=mashal,
                 paid=paid, net=net, pay_type=pay_type, notes=(notes or "").strip(), rep_id=rep_id if kind == "مبيعات" else None, edit_id=edit_id)
 
 def _q(x):
@@ -1169,15 +1176,15 @@ def persist_invoice(d, override=False, auto_no=False):
             created = old["created_at"]
             if old["party_id"] != party: before_bal = party_balance(c, party, None)
             c.execute("UPDATE invoices SET comm_by_item=? WHERE id=?", (by_item, edit_id))
-            c.execute("UPDATE invoices SET number=?,inv_date=?,party_id=?,notes=?,discount=?,rep_id=?,rep_rate=?,rep_unit=?,pay_type=?,due_date=? WHERE id=?",
-                      (number, inv_date, party, notes, discount, rep_id, rate, runit, pay_type, due, edit_id))
+            c.execute("UPDATE invoices SET number=?,inv_date=?,party_id=?,notes=?,discount=?,mashal=?,rep_id=?,rep_rate=?,rep_unit=?,pay_type=?,due_date=? WHERE id=?",
+                      (number, inv_date, party, notes, discount, d.get("mashal", 0), rep_id, rate, runit, pay_type, due, edit_id))
             c.execute("DELETE FROM invoice_lines WHERE invoice_id=?", (edit_id,))
             c.execute("DELETE FROM payments WHERE invoice_id=?", (edit_id,))
             inv_id = edit_id
         else:
             created = now_ts()
-            cur = c.execute("INSERT INTO invoices(number,kind,inv_date,party_id,notes,discount,rep_id,rep_rate,rep_unit,pay_type,due_date,created_at,comm_by_item) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,1)",
-                            (number, kind, inv_date, party, notes, discount, rep_id, rate, runit, pay_type, due, created))
+            cur = c.execute("INSERT INTO invoices(number,kind,inv_date,party_id,notes,discount,mashal,rep_id,rep_rate,rep_unit,pay_type,due_date,created_at,comm_by_item) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,1)",
+                            (number, kind, inv_date, party, notes, discount, d.get("mashal", 0), rep_id, rate, runit, pay_type, due, created))
             inv_id = cur.lastrowid
         if auto_no or renum: bump_counter(c, kind, number, inv_date)   # الرقم المكتوب باليد مبيحرّكش العدّاد
         for l in lines:
@@ -4953,7 +4960,8 @@ class App(tk.Tk):
                 rep_div += f"<div>التوصيل: <b>{esc(vn[0]) if vn else 'استلام مكتب'}</b></div>"
         pay_div = f"<div>طريقة الدفع: <b>{esc(inv['pay_type'])}</b></div>" if inv["kind"] in PAYTYPE_KINDS and inv["pay_type"] else ""
         total = sum(x["qty"] * x["price"] for x in lines)
-        discount = float(inv["discount"] or 0); net = total - discount
+        discount = float(inv["discount"] or 0); mashal = float(inv["mashal"] or 0) if "mashal" in inv.keys() else 0.0
+        net = total - discount + MASHAL_SIGN * mashal
         prior = float(inv["party_opening"] or 0)
         for m in moves:
             if m[7] < move_key(inv["due_date"] or inv["inv_date"], inv["created_at"], 0, inv_id): prior += m[5] - m[6]
@@ -4967,7 +4975,7 @@ class App(tk.Tk):
           <h2>فاتورة {esc(inv['kind'])}　{esc(inv['number'])}</h2></div>
           <div class="meta"><div>التاريخ: <b>{esc(inv['inv_date'])}</b>　{esc(fmt_time(inv['created_at']))}{f"</div><div>تاريخ الاستحقاق: <b>{esc(inv['due_date'])}</b>" if inv['due_date'] else ""}</div><div>اسم الحساب: <b>{esc(inv['party_name'])}</b></div><div>الهاتف: {esc(inv['party_phone'])}</div>{pay_div}{rep_div}</div>
           <table><thead><tr><th>م</th><th>اسم الصنف</th><th>الكمية</th><th>الوحدة</th><th>السعر</th><th>الإجمالي</th></tr></thead><tbody>{rows}</tbody></table>
-          <div class="sum"><div>الإجمالي: {fmt(total)} ج.م</div><div>الخصم: {fmt(discount)} ج.م</div>{f"<div>الصافي: {fmt(net)} ج.م</div>" if discount else ""}<div>آخر دفع: {f"{fmt(last_pay[1])} ج.م <small>({esc(last_pay[0])})</small>" if last_pay else "—"}</div>{paid_div}</div>
+          <div class="sum"><div>الإجمالي: {fmt(total)} ج.م</div><div>الخصم: {fmt(discount)} ج.م</div>{f"<div>المشال: {fmt(mashal)} ج.م</div>" if mashal else ""}{f"<div>الصافي: {fmt(net)} ج.م</div>" if discount or mashal else ""}<div>آخر دفع: {f"{fmt(last_pay[1])} ج.م <small>({esc(last_pay[0])})</small>" if last_pay else "—"}</div>{paid_div}</div>
           <div class="balance"><div>الرصيد السابق: {fmt(prior)} ج.م</div><div>الرصيد الحالي: {fmt(current)} ج.م</div></div>
           <div class="notes">ملاحظات: {esc(inv['notes'])}</div>
           </div><div class="sign"><span>توقيع المستلم</span><span>توقيع البائع</span></div>

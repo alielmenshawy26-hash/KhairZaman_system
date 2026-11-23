@@ -1039,7 +1039,7 @@ async function newInvoiceFor(pid) {
 /* ===================== الفاتورة ===================== */
 function newDraft(setup) {
   return { kind: setup.kind, number: setup.number, autoNo: setup.number, date: setup.date, due: "", party: null, rep_id: null, notes: "",
-    lines: [], discount: "0", paid: "0", pay_type: "آجل", negPw: null, sel: new Set() };
+    lines: [], discount: "0", mashal: "0", paid: "0", pay_type: "آجل", negPw: null, sel: new Set() };
 }
 function invoiceMenu(r, reload) {
   const label = `فاتورة ${r.kind} رقم ${r.number}`;
@@ -1051,7 +1051,7 @@ async function editInvoice(id) {
   if (S.dirty && !(await confirmBox("فيه فاتورة لسه ماتحفظتش. تسيبها وتفتح الفاتورة دي للتعديل؟"))) return;
   let v; try { v = await api("invoice_for_edit", id); } catch (e) { return alertBox(e.message, "مش هينفع تتعدّل"); }
   S.drafts[v.kind] = { kind: v.kind, edit_id: v.id, number: v.number, autoNo: null, date: v.date, due: v.due, party: { id: v.party_id }, rep_id: v.rep_id, vehicle_id: v.vehicle_id || null,
-    notes: v.notes, lines: v.lines, discount: String(v.discount), paid: String(v.paid), pay_type: v.pay_type, negPw: null, sel: new Set() };
+    notes: v.notes, lines: v.lines, discount: String(v.discount), mashal: String(v.mashal || 0), paid: String(v.paid), pay_type: v.pay_type, negPw: null, sel: new Set() };
   closeModals(); go("inv:" + v.kind, true);
 }
 async function deleteInvoice(id, label) {
@@ -1128,6 +1128,8 @@ async function renderInvoice(box, kind) {
   const tbody = h("tbody");
   const tfoot = h("tfoot");
   const discIn = h("input", { class: "in num", id: "f-disc", value: D.discount, "aria-label": "الخصم", oninput: () => { D.discount = discIn.value; totals(); } });
+  const isBuy = kind === "مشتريات";        // المشال: في فاتورة المشتريات بس، وبيتزود على حساب المورد
+  const mashIn = isBuy ? h("input", { class: "in num", id: "f-mashal", value: D.mashal || "0", "aria-label": "المشال", oninput: () => { D.mashal = mashIn.value; totals(); } }) : null;
   const paidIn = h("input", { class: "in num", id: "f-paid", value: D.paid, "aria-label": setup.paid_label, oninput: () => { D.paid = paidIn.value; totals(); } });
   const tv = { total: h("div", { class: "v" }), net: h("div", { class: "v" }), rest: h("div", { class: "v" }), profit: h("div", { class: "v" }) };
   const seg = setup.paytypes ? h("div", { class: "seg" }, ["نقدي", "آجل"].map((v) => h("button", { class: D.pay_type === v ? "on" : "", "data-v": v, onclick: () => { D.pay_type = v; seg.querySelectorAll("button").forEach((b) => b.classList.toggle("on", b.dataset.v === v)); if (v === "آجل") { paidIn.value = D.paid = "0"; } totals(); } }, v))) : null;
@@ -1135,7 +1137,8 @@ async function renderInvoice(box, kind) {
   const lineAmount = () => D.lines.reduce((s, l) => s + l.qty * l.price, 0);
   let profitTimer = null;
   function totals() {
-    const total = lineAmount(), disc = num(D.discount), net = total - disc;
+    const total = lineAmount(), disc = num(D.discount), mash = isBuy ? num(D.mashal || 0) : 0, net = total - disc + mash;
+    if (mashIn) mashIn.classList.toggle("bad", mash < 0);
     if (setup.paytypes && D.pay_type === "نقدي") { D.paid = net.toFixed(2); paidIn.value = D.paid; paidIn.disabled = true; } else paidIn.disabled = false;
     tv.total.textContent = fmt(total); tv.net.textContent = fmt(net); tv.rest.textContent = fmt(net - num(D.paid)); [tv.total, tv.net, tv.rest].forEach(fitNum);
     discIn.classList.toggle("bad", disc < 0 || disc > total + 0.005);
@@ -1228,7 +1231,7 @@ async function renderInvoice(box, kind) {
     if (saving) return;
     if (!D.party) { party.input.classList.add("bad", "shake"); setTimeout(() => party.input.classList.remove("shake"), 500); party.focus(); return toast("اختار العميل أو المورد", "err"); }
     saving = true; saveBtns.forEach((b) => (b.disabled = true));
-    const p = { kind, edit_id: D.edit_id || null, party_id: D.party.id, number: D.number, auto_no: D.number === D.autoNo, date: D.date, due: D.due, discount: D.discount, paid: D.paid,
+    const p = { kind, edit_id: D.edit_id || null, party_id: D.party.id, number: D.number, auto_no: D.number === D.autoNo, date: D.date, due: D.due, discount: D.discount, mashal: isBuy ? (D.mashal || 0) : 0, paid: D.paid,
       pay_type: setup.paytypes ? D.pay_type : null, notes: D.notes, rep_id: kind === "مبيعات" ? D.rep_id : null, vehicle_id: kind === "مبيعات" ? (D.vehicle_id || null) : null, lines: D.lines, request_id: D.request_id || null };
     let creditPw = null;
     try {
@@ -1274,6 +1277,7 @@ async function renderInvoice(box, kind) {
   const tiles = h("div", { class: "tiles side-tiles" },
     h("div", { class: "tile" }, h("div", { class: "h" }, "الإجمالي"), tv.total),
     h("div", { class: "tile" }, h("div", { class: "h" }, "الخصم"), discIn),
+    mashIn ? h("div", { class: "tile span" }, h("div", { class: "h" }, "المشال (بيتزود على حساب المورد)"), mashIn) : null,
     h("div", { class: "tile net span" }, h("div", { class: "h" }, "الصافي"), tv.net),
     seg ? h("div", { class: "tile span" }, h("div", { class: "h" }, "طريقة الدفع"), seg) : null,
     h("div", { class: "tile" }, h("div", { class: "h" }, setup.paid_label), paidIn),
@@ -1349,6 +1353,7 @@ async function showInvoice(id) {
       h("tfoot", null, h("tr", null, h("td"), h("td", null, `${v.lines.length} صنف`), h("td", { colspan: 3, class: "hint" }, qtyText(v.lines)), h("td", { class: "num" }, fmt(v.total)))))),
     h("div", { class: "tiles" }, h("div", { class: "tile" }, h("div", { class: "h" }, "الإجمالي"), h("div", { class: "v" }, fmt(v.total))),
       h("div", { class: "tile" }, h("div", { class: "h" }, "الخصم"), h("div", { class: "v" }, fmt(v.discount))),
+      v.mashal ? h("div", { class: "tile" }, h("div", { class: "h" }, "المشال"), h("div", { class: "v" }, fmt(v.mashal))) : null,
       h("div", { class: "tile net" }, h("div", { class: "h" }, "الصافي"), h("div", { class: "v" }, fmt(v.net))),
       h("div", { class: "tile" }, h("div", { class: "h" }, "المدفوع مع الفاتورة"), h("div", { class: "v" }, fmt(v.paid))),
       v.profit !== undefined ? h("div", { class: "tile" }, h("div", { class: "h" }, "ربح الفاتورة 🔒"), h("div", { class: "v", style: { color: v.profit < 0 ? "var(--red)" : "var(--green)" } }, fmt(v.profit))) : null),

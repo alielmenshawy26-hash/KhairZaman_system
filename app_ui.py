@@ -426,11 +426,11 @@ class Api:
         if not is_rep: self._day(p.get("date") or _today(), od)
         try:
             d = W.prepare_invoice(p["kind"], lines, p.get("party_id"), p.get("number") or "", p.get("date") or "", p.get("due") or "",
-                                  p.get("discount") or 0, p.get("paid") or 0, p.get("pay_type"), p.get("notes") or "", p.get("rep_id"), p.get("edit_id"))
+                                  p.get("discount") or 0, p.get("paid") or 0, p.get("pay_type"), p.get("notes") or "", p.get("rep_id"), p.get("edit_id"), p.get("mashal") or 0)
         except W.InvoiceInputError as e:
             return {"ok": False, "error": str(e), "title": e.title}
         if is_rep:                                   # المندوب: الفاتورة بتتبعت طلب للمحاسب يوافق عليها
-            pl = {k: p.get(k) for k in ("kind", "party_id", "date", "due", "discount", "paid", "pay_type", "notes", "rep_id", "vehicle_id")}; pl["lines"] = lines
+            pl = {k: p.get(k) for k in ("kind", "party_id", "date", "due", "discount", "mashal", "paid", "pay_type", "notes", "rep_id", "vehicle_id")}; pl["lines"] = lines
             with W.db() as c:
                 rid = c.execute("INSERT INTO inv_requests(created_at,rep_id,by_user,party_id,kind,net,payload) VALUES(?,?,?,?,?,?,?)",
                                 (W.now_ts(), W.CURRENT_USER.get("emp_id"), W.CURRENT_USER.get("username", ""), p.get("party_id"), p["kind"], d["net"], json.dumps(pl, ensure_ascii=False))).lastrowid
@@ -505,7 +505,7 @@ class Api:
         total = sum(float(l["qty"]) * float(l["price"]) for l in lines)
         out = {"id": i["id"], "number": i["number"], "kind": i["kind"], "date": i["inv_date"], "due": i["due_date"] or "", "time": W.fmt_time(i["created_at"]),
                "party": i["party"] or "", "party_id": i["party_id"], "phone": i["phone"] or "", "delivery": (i["vname"] or "استلام مكتب") if i["kind"] == "مبيعات" else "", "rep": i["rep"] or "", "pay": i["pay_type"] or "", "notes": i["notes"] or "",
-               "total": _r2(total), "discount": _r2(i["discount"]), "net": _r2(total - float(i["discount"] or 0)), "paid": _r2(paid),
+               "total": _r2(total), "discount": _r2(i["discount"]), "mashal": _r2(i["mashal"] or 0), "net": _r2(total - float(i["discount"] or 0) + W.MASHAL_SIGN * float(i["mashal"] or 0)), "paid": _r2(paid),
                "printed": i["printed_at"] or "", "print_count": i["print_count"] or 0,
                "lines": [{"name": l["item_name"], "unit": l["unit"] or "", "qty": _r2(l["qty"]), "price": _r2(l["price"]), "total": _r2(float(l["qty"]) * float(l["price"])),
                           "damaged": bool(l["damaged"])} for l in lines]}
@@ -540,7 +540,7 @@ class Api:
         if msg: raise UIError(msg)
         self._day(i["inv_date"])
         return {"id": i["id"], "kind": i["kind"], "number": i["number"], "date": i["inv_date"], "due": i["due_date"] or "", "party_id": i["party_id"],
-                "rep_id": i["rep_id"], "vehicle_id": i["vehicle_id"], "notes": i["notes"] or "", "discount": _r2(i["discount"]), "paid": _r2(paid), "pay_type": i["pay_type"] or "آجل",
+                "rep_id": i["rep_id"], "vehicle_id": i["vehicle_id"], "notes": i["notes"] or "", "discount": _r2(i["discount"]), "mashal": _r2(i["mashal"] or 0), "paid": _r2(paid), "pay_type": i["pay_type"] or "آجل",
                 "lines": [{"item_id": l["item_id"], "name": l["item_name"], "unit": l["unit"] or "", "qty": float(l["qty"]), "price": float(l["price"]),
                            "damaged": int(l["damaged"] or 0)} for l in lines]}
 
