@@ -2001,7 +2001,7 @@ body {{ width: 80mm; padding: 0 4mm; font-family: Tahoma, Arial, sans-serif; fon
 .c {{ text-align: center; }} .co {{ font-size: 20px; font-weight: 800; margin: 1mm 0; }}
 .meta {{ display: flex; justify-content: space-between; font-size: 12px; margin: 1mm 0; }}
 .no {{ font-size: 15px; font-weight: 800; border: 1.5px solid #000; border-radius: 3px; padding: 1mm 0; margin: 2mm 0; }}
-.pt {{ font-size: 14px; font-weight: 800; margin: 1.5mm 0; }}
+.pt {{ font-size: 18px; font-weight: 800; margin: 2mm 0; padding: 1.5mm 2mm; border: 2px solid #000; border-radius: 3px; text-align: center; }}
 table {{ width: 100%; border-collapse: collapse; margin-top: 2mm; }}
 th {{ font-size: 11px; border-bottom: 1.5px solid #000; padding: 1mm 0; text-align: center; }}
 td {{ padding: 1.2mm 0; text-align: center; border-bottom: 1px dashed #999; font-size: 12px; }} td.n, th.n {{ text-align: right; }}
