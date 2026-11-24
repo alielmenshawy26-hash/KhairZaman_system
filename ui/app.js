@@ -116,6 +116,19 @@ function h(tag, attrs, ...kids) {
 const NF = new Intl.NumberFormat("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const fmt = (n) => NF.format(Number(n) || 0);
 const fq = (n) => { const x = Number(n) || 0; return Number.isInteger(x) ? String(x) : NF.format(x); };
+const AR_D = "٠١٢٣٤٥٦٧٨٩", arD = (s) => String(s ?? "").replace(/[0-9]/g, (d) => AR_D[d]);   // خير زمان: أرقام عربي في الكاشير
+function arDigitsLive(root) {          // أي رقم بيظهر جوه root (نص، أو خانة عدد) بيتكتب بالعربي ٠١٢٣ … حتى لو اتغيّر بعدين
+  const fix = (n) => {
+    if (n.nodeType === 3) { if (/[0-9]/.test(n.data)) n.data = arD(n.data); return; }
+    if (n.nodeType !== 1) return;
+    if (n.tagName === "INPUT") { if (/[0-9]/.test(n.value)) n.value = arD(n.value); if (/[0-9]/.test(n.placeholder)) n.placeholder = arD(n.placeholder); return; }
+    const w = document.createTreeWalker(n, NodeFilter.SHOW_TEXT); let t; while ((t = w.nextNode())) if (/[0-9]/.test(t.data)) t.data = arD(t.data);
+    n.querySelectorAll("input").forEach(fix);
+  };
+  fix(root);
+  new MutationObserver((ms) => ms.forEach((m) => (m.type === "characterData" ? fix(m.target) : m.addedNodes.forEach(fix)))).observe(root, { childList: true, subtree: true, characterData: true });
+  root.addEventListener("input", (e) => { const el = e.target; if (el.tagName === "INPUT" && /[0-9]/.test(el.value)) el.value = arD(el.value); }, true);
+}
 const num = (s) => { const t = String(s ?? "").replace(/[٠-٩]/g, (d) => "٠١٢٣٤٥٦٧٨٩".indexOf(d)).replace(/[٫]/g, ".").replace(/,/g, "").trim(); return t === "" ? 0 : Number(t); };
 function norm(s) {
   return String(s || "").toLowerCase().replace(/[أإآٱ]/g, "ا").replace(/ة/g, "ه").replace(/ى/g, "ي").replace(/ؤ/g, "و").replace(/ئ/g, "ي")
@@ -709,9 +722,9 @@ async function renderCashier(box) {
   const clearBtn = h("button", { class: "btn", onclick: () => clearAll() }, icon("x", 18), "مسح");
   let busy = false;
   const tiles = st.sizes.map((z) => {
-    const inp = h("input", { class: "in num qs-in", inputmode: "numeric", placeholder: "0", "aria-label": "عدد " + z.name });
+    const inp = h("input", { class: "in num qs-in", inputmode: "numeric", placeholder: "٠", "aria-label": "عدد " + z.name });
     const stockEl = h("small", { class: "qs-stock" + (z.stock <= 0 ? " neg" : "") }, `المخزن: ${fq(z.stock)}`);
-    const step = (n) => { const v = Math.max(0, Math.round(num(inp.value) + n)); inp.value = v ? String(v) : ""; calc(); };
+    const step = (n) => { const v = Math.max(0, Math.round(num(inp.value) + n)); inp.value = v ? arD(v) : ""; calc(); };
     const el = h("div", { class: "qs-tile" },
       h("button", { class: "qs-head", type: "button", title: "دوسة = رغيف زيادة", onclick: () => { step(1); inp.focus(); } },
         h("b", null, z.name), h("span", { class: "qs-price" }, fmt(z.price) + " ج"), stockEl),
@@ -767,6 +780,7 @@ async function renderCashier(box) {
           modeSeg, h("div", { class: "qs-total" }, h("span", null, "الإجمالي"), totalEl),
           h("div", { class: "qs-foot" }, clearBtn, saveBtn, printBtn))))),
     mBar));
+  arDigitsLive(box.firstChild);
   calc();
   { const tb0 = $("#todaybar"); if (tb0) tb0.hidden = true; }      // عمر: شيل الإجمالي من تحت في الكاشير
   { const tb = $("#todaybar");                       // على الموبايل: شريط «طباعة وحفظ» فوق شريط النهارده الثابت
@@ -1278,7 +1292,7 @@ async function renderInvoice(box, kind) {
   const tiles = h("div", { class: "tiles side-tiles" },
     h("div", { class: "tile" }, h("div", { class: "h" }, "الإجمالي"), tv.total),
     h("div", { class: "tile" }, h("div", { class: "h" }, "الخصم"), discIn),
-    mashIn ? h("div", { class: "tile span" }, h("div", { class: "h" }, "المشال (بيتزود على حساب المورد)"), mashIn) : null,
+    mashIn ? h("div", { class: "tile span" }, h("div", { class: "h" }, "المشال"), mashIn) : null,
     h("div", { class: "tile net span" }, h("div", { class: "h" }, "الصافي"), tv.net),
     seg ? h("div", { class: "tile span" }, h("div", { class: "h" }, "طريقة الدفع"), seg) : null,
     h("div", { class: "tile" }, h("div", { class: "h" }, setup.paid_label), paidIn),
@@ -3400,7 +3414,7 @@ document.addEventListener("keydown", (e) => {
 function tickClock() {
   const c = document.getElementById("side-clock"); if (!c) return;
   const n = new Date(), hh = n.getHours(), mm = String(n.getMinutes()).padStart(2, "0");
-  c.querySelector(".tm").replaceChildren(`${String(hh % 12 || 12).padStart(2, "0")}:${mm}`, h("small", { class: "ap" }, hh < 12 ? " ص" : " م"));
+  c.querySelector(".tm").replaceChildren(arD(`${String(hh % 12 || 12).padStart(2, "0")}:${mm}`), h("small", { class: "ap" }, hh < 12 ? " ص" : " م"));
   c.querySelector(".dt").textContent = `${n.toLocaleDateString("ar-EG", { weekday: "long" })} ${n.getFullYear()}-${String(n.getMonth() + 1).padStart(2, "0")}-${String(n.getDate()).padStart(2, "0")}`;
 }
 setInterval(tickClock, 5000); new MutationObserver(() => { const c = document.getElementById("side-clock"); if (c && !c.querySelector(".tm").textContent) tickClock(); }).observe(document.body, { childList: true, subtree: true });
