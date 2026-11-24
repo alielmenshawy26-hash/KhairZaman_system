@@ -22,6 +22,31 @@ UI_DIR = os.path.join(_base_dir(), "ui")
 
 
 DAYLOCK = "__DAYLOCK__"     # الواجهة بتطلب باسوورد المحاسب/المالك وتعيد المحاولة
+OWNERLOCK = "__OWNERLOCK__"  # تعديل/حذف فاتورة أو سند أو بلاغ: باسوورد المالك (مرة لكل عملية) — عمر 2026-11-24
+OWNER_ONCE = {}              # user_id → وقت انتهاء الإذن (بيتصرف في أول عملية محمية)
+
+
+def _owner_lock_msg(name, args):
+    """لو العملية تعديل أو حذف في الفواتير/السندات/البلاغ: رسالة طلب باسوورد المالك (وإلا None)."""
+    a0 = args[0] if args else None
+    d = a0 if isinstance(a0, dict) else {}
+    if name == "save_invoice" and d.get("edit_id"): return "تعديل الفاتورة محتاج باسوورد المالك"
+    if name == "delete_invoice": return "حذف الفاتورة محتاج باسوورد المالك"
+    if name == "save_voucher" and d.get("edit_id"): return "تعديل السند محتاج باسوورد المالك"
+    if name == "delete_voucher": return "حذف السند محتاج باسوورد المالك"
+    if name == "save_production" and d.get("id"): return "تعديل الشيكارة في البلاغ محتاج باسوورد المالك"
+    if name == "delete_production": return "حذف الشيكارة من البلاغ محتاج باسوورد المالك"
+    return None
+
+
+def _owner_check(name, args):
+    if W.CURRENT_USER.get("role") == W.ROLE_OWNER: return          # المالك نفسه داخل
+    msg = _owner_lock_msg(name, args)
+    if not msg: return
+    if len(args) > 1 and isinstance(args[1], str) and args[1] and W.verify_owner_password(args[1]): return   # اتكتب باسوورد المالك مع الطلب نفسه (زي الرصيد بالسالب)
+    uid = W.CURRENT_USER.get("id")
+    if OWNER_ONCE.get(uid, 0) >= time.time(): OWNER_ONCE.pop(uid, None); return
+    raise UIError(OWNERLOCK + msg)
 
 # ---------- الصلاحيات: كل يوزر ليه الشاشات المسموحله بيها ----------
 ALL_SCREENS = ["home", "inv:مبيعات", "inv:مشتريات", "inv:مرتجع مبيعات", "inv:مرتجع مشتريات", "log", "vch:new", "vch:log",
@@ -29,6 +54,7 @@ ALL_SCREENS = ["home", "inv:مبيعات", "inv:مشتريات", "inv:مرتجع
                "smp:items", "smp:out", "smp:in", "emp:list", "emp:att", "emp:attlog", "emp:attreq", "emp:repreq", "emp:veh",
                "rep:daily", "rep:monthly", "rep:profit", "rep:reps", "rep:targets", "rep:log", "req", "set:main", "acc:assets",
                "prd:new", "prd:log", "rep:production", "gate:log", "emp:bread", "itm:use", "trash"]
+NO_REPS = True        # مخبز خير زمان: مفيش مناديب (عمر 2026-11-24) — مفيش يوزر مندوب جديد، والداتا القديمة زي ما هي
 OWNER_ONLY_SCREENS = {"rep:profit", "set:users", "acc:assets", "rep:monthly"}
 DEFAULT_SCREENS = {
     W.ROLE_ACC: [k for k in ALL_SCREENS if k not in OWNER_ONLY_SCREENS],
@@ -187,6 +213,13 @@ class Api:
     def _day(self, *dates):
         msg = W.check_day(*dates)
         if msg: raise UIError(DAYLOCK + msg)
+
+    def owner_unlock(self, pw):
+        """باسوورد المالك لعملية تعديل/حذف واحدة (في خلال دقيقة)."""
+        self._need_login()
+        if not W.verify_owner_password(pw or ""): raise UIError("كلمة سر المالك غلط")
+        OWNER_ONCE[W.CURRENT_USER.get("id")] = time.time() + 60
+        return True
 
     def day_unlock(self, pw):
         self._need_login()
@@ -1336,10 +1369,16 @@ class Api:
         if limit < 0: raise UIError("الحد الائتماني لا يكون بالسالب")
         kind = p.get("kind") if p.get("kind") in ("عميل", "مورد", "عميل/مورد", ASSET) else "عميل"
         rep_id = p.get("rep_id"); edit = p.get("id")
-        old_limit = 0.0
+        old_limit = old_open = 0.0
         if edit:
-            with W.db() as c: old_limit = float(c.execute("SELECT COALESCE(credit_limit,0) FROM parties WHERE id=?", (edit,)).fetchone()[0])
+            with W.db() as c:
+                o = c.execute("SELECT COALESCE(credit_limit,0), COALESCE(opening,0) FROM parties WHERE id=?", (edit,)).fetchone()
+                if o: old_limit, old_open = float(o[0]), float(o[1])
         limit_who = None
+        if abs(opening - old_open) > 1e-9:            # الرصيد الافتتاحي بباسوورد المالك (عمر 2026-11-24)
+            open_who = W.verify_owner_password(owner_pw) if owner_pw else None
+            if not open_who:
+                return {"ok": False, "need": "owner", "error": f"تغيير الرصيد الافتتاحي لـ«{name}» من {W.fmt(old_open)} إلى {W.fmt(opening)} محتاج كلمة سر المالك." + ("\nكلمة السر غلط." if owner_pw else "")}
         if abs(limit - old_limit) > 1e-9:
             limit_who = W.verify_owner_password(owner_pw) if owner_pw else None
             if not limit_who:
@@ -2189,6 +2228,7 @@ class Api:
         tbl = lambda head, rows: "<table><tr>" + "".join(f"<th>{h}</th>" for h in head) + "</tr>" + "".join("<tr>" + "".join(f"<td{' class=n' if isinstance(v, (int, float)) else ''}>{f(v) if isinstance(v, float) else esc(str(v))}</td>" for v in r) + "</tr>" for r in rows) + "</table>"
         key = [("المبيعات", k["sales"], pk["sales"]), ("المرتجعات", k["ret"], pk["ret"]), ("المشتريات", k["buys"], pk["buys"]), ("التحصيلات", k["collect"], pk["collect"]),
                ("المدفوع للموردين", k["paid"], pk["paid"]), ("إجمالي الربح", k["gross"], pk["gross"]), ("المصروفات", k["exp"], pk["exp"]), ("صافي الربح", k["net"], pk["net"])]
+        reps_html = "" if NO_REPS and not d["reps"] else ("<div><h3>المناديب</h3>" + tbl(["المندوب", "فواتير", "مبيعات", "تحصيل"], [(r['name'], r['n'], float(r['sales']), float(r['collect'])) for r in d['reps']]) + "</div>")
         html = f"""<!doctype html><html lang="ar" dir="rtl"><head><meta charset="utf-8"><title>التقرير الشهري {d['month']}</title><style>
           @page{{size:A4;margin:10mm}} body{{font-family:Tahoma,Arial,sans-serif;font-size:13px;font-weight:bold;color:#000}}
           .hd{{display:flex;justify-content:space-between;align-items:center;border-bottom:2px solid #000;padding-bottom:6px}} .hd img{{height:18mm}}
@@ -2202,7 +2242,7 @@ class Api:
           <h3>آخر الشهر</h3>{tbl(["البند", "المبلغ"], [("خوارج", float(d['end']['recv'])), ("علينا للموردين", float(d['end']['pay'])), ("أرباح اتصرفت للملاك", float(d['end']['owners']))])}</div></div>
           <h3>أكبر العملاء</h3>{tbl(["العميل", "عدد الفواتير", "صافي المبيعات", "اتحصّل منه"], [(r['name'], r['n'], float(r['net']), float(r['collect'])) for r in d['customers']])}
           <h3>أكتر الأصناف ربح</h3>{tbl(["الصنف", "الكمية", "المبيعات", "التكلفة", "الربح"], [(r['name'], float(r['qty']), float(r['rev']), float(r['cost']), float(r['profit'])) for r in d['items']])}
-          <div class="two"><div><h3>المناديب</h3>{tbl(["المندوب", "فواتير", "مبيعات", "تحصيل"], [(r['name'], r['n'], float(r['sales']), float(r['collect'])) for r in d['reps']])}</div>
+          <div class="two">{reps_html}
           <div><h3>المصروفات</h3>{tbl(["البند", "المبلغ"], [(n, float(v)) for n, v in d['exp_cats']] or [("مفيش", 0.0)])}</div></div>
           <h3>الأيام</h3>{tbl(["اليوم", "فواتير", "مبيعات", "مرتجع", "مشتريات", "تحصيل", "مصروفات"], [(x['date'], x['n'], float(x['sales']), float(x['ret']), float(x['buys']), float(x['collect']), float(x['exp'])) for x in d['days']])}
           </body></html>"""
@@ -2941,7 +2981,7 @@ class Api:
         """للشاشة بتاعة الصلاحيات: كل الشاشات والمناديب."""
         self._owner()
         with W.db() as c: reps = [{"id": r[0], "name": r[1]} for r in c.execute("SELECT id,name FROM employees WHERE kind='مندوب' AND COALESCE(active,1)=1 ORDER BY name").fetchall()]
-        return {"screens": ALL_SCREENS, "owner_only": sorted(OWNER_ONLY_SCREENS), "defaults": DEFAULT_SCREENS, "reps": reps, "roles": [W.ROLE_OWNER, W.ROLE_ACC, W.ROLE_REP]}
+        return {"screens": ALL_SCREENS, "owner_only": sorted(OWNER_ONLY_SCREENS), "defaults": DEFAULT_SCREENS, "reps": reps, "roles": [W.ROLE_OWNER, W.ROLE_ACC] + ([] if NO_REPS else [W.ROLE_REP])}
 
     def set_user_access(self, uid, role, screens, emp_id=None):
         self._owner()
@@ -2951,6 +2991,7 @@ class Api:
         with W.db() as c:
             u = c.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
             if not u: raise UIError("اليوزر مش موجود")
+            if role == W.ROLE_REP and NO_REPS and u["role"] != W.ROLE_REP: raise UIError("مفيش مناديب في المخبز — اختار مالك أو محاسب")
             if u["role"] == W.ROLE_OWNER and role != W.ROLE_OWNER and not self._active_owners(c, u["id"]): raise UIError("لازم يفضل مالك واحد شغال على الأقل")
             c.execute("UPDATE users SET role=?, screens=?, emp_id=? WHERE id=?", (role, json.dumps(screens, ensure_ascii=False), int(emp_id) if role == W.ROLE_REP else None, uid))
             W.log(c, "صلاحيات مستخدم", f"{u['username']}: {role} — {len(screens)} شاشة")
@@ -2966,6 +3007,7 @@ class Api:
         if len(p1 or "") < 4: raise UIError("كلمة السر لازم تكون 4 حروف/أرقام على الأقل")
         if p1 != p2: raise UIError("كلمتين السر مش متطابقتين")
         if role not in (W.ROLE_OWNER, W.ROLE_ACC, W.ROLE_REP): raise UIError("اختر الصلاحية")
+        if role == W.ROLE_REP and NO_REPS: raise UIError("مفيش مناديب في المخبز — اختار مالك أو محاسب")
         if role == W.ROLE_REP and not emp_id: raise UIError("اختار المندوب اللي اليوزر ده بتاعه")
         h_, salt = W.hash_pw(p1)
         try:
@@ -3392,6 +3434,7 @@ def _call_api(api, name, args, ctx=None):
         W._TLS.capture_print = [] if ctx.web else None
     try:
         _guard(name, args or [])
+        _owner_check(name, args or [])
         if name in TRASH_METHODS: W._TLS.trash = []             # الحذف بيتحفظ في سلة المحذوفات
         out = getattr(api, name)(*(args or []))
         if name in TRASH_METHODS and not (isinstance(out, dict) and out.get("ok") is False): W.trash_save(name)

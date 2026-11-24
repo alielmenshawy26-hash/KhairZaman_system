@@ -33,6 +33,10 @@ async function api(name, ...args) {
       if (await askDayPassword(msg.slice(DAYLOCK.length))) return api(name, ...args);
       throw new Error("اتلغى — اليوم مقفول");
     }
+    if (msg.startsWith(OWNERLOCK) && name !== "owner_unlock") {      // تعديل/حذف فاتورة أو سند أو بلاغ: باسوورد المالك وبعدين نعيد نفس الطلب
+      if (await askOwnerUnlock(msg.slice(OWNERLOCK.length))) return api(name, ...args);
+      throw new Error("اتلغى — محتاج باسوورد المالك");
+    }
     throw new Error(msg === "unknown" ? "أمر مش معروف: " + name : msg);
   }
   if (/^(save_|delete_|add_|close_day|pay_)/.test(name)) setTimeout(loadTodayBar, 150);
@@ -68,7 +72,14 @@ async function loadTodayBar() {
       h("span", { style: { flex: 1 } }), t.closed ? h("span", { class: "tb-closed" }, icon("lock", 15), "اليوم متقفل") : null);
   } catch (e) { } finally { TB_BUSY = false; }
 }
-const DAYLOCK = "__DAYLOCK__";
+const DAYLOCK = "__DAYLOCK__", OWNERLOCK = "__OWNERLOCK__";
+async function askOwnerUnlock(msg) {
+  while (true) {
+    const pw = await promptBox(msg + "\n\nاكتب كلمة سر المالك علشان تكمّل:", "🔒 باسوورد المالك", { password: true });
+    if (pw === null) return false;
+    try { await api("owner_unlock", pw); return true; } catch (e) { toast(e.message, "err"); }
+  }
+}
 async function askDayPassword(msg) {
   while (true) {
     const pw = await promptBox(msg + "\n\nاكتب باسوورد المحاسب أو المالك علشان تكمّل:", "🔒 اليوم مقفول", { password: true });
@@ -444,6 +455,7 @@ function renderLogin() {
 /* ===================== الهيكل: القايمة الجانبية + الشريط اللي فوق ===================== */
 // الصلاحيات: المالك كله، وغيره الشاشات المسموحله بيها بس
 /* مخفية مؤقتاً في خير زمان (لحد ما نظام المناديب يتحدد) — الكود موجود بس مش ظاهر */
+const NO_REPS = true;   // مخبز خير زمان: مفيش مناديب خالص (عمر 2026-11-24) — الداتا القديمة زي ما هي
 const HIDDEN_SCREENS = new Set(["req", "rep:reps", "rep:targets", "emp:veh", "smp:items", "smp:out", "smp:in", "emp:att", "emp:attlog", "acc:subcash", "acc:assets", "emp:bread"]);   // emp:bread: صرف العيش للعمال اتشال (عمر 2026-11-24) — الصرفيات القديمة زي ما هي
 const can = (k) => !!S.me && !HIDDEN_SCREENS.has(k) && (S.me.owner || (S.me.screens || []).includes(k) || (k === "gate:log" && !S.me.rep && (S.me.screens || []).includes("log")));
 const firstScreen = () => (can("home") ? "home" : (S.me.screens || [])[0] || "home");
@@ -920,7 +932,8 @@ async function renderReq(box) {
 /* ===================== جرد الخزنة المفصّل (مع المناديب / مع الملاك / الدرج) ===================== */
 async function cashCountModal() {
   let st; try { st = await api("cash_count_setup"); } catch (e) { return alertBox(e.message); }
-  const groups = [["rep", "١. مع المناديب", st.reps], ["owner", "٢. مع الملاك", st.owners]];
+  const noRep = NO_REPS && !st.reps.length && !st.lines.some((l) => l.group === "rep");     // خير زمان: مفيش مناديب
+  const groups = noRep ? [["owner", "١. مع الملاك", st.owners]] : [["rep", "١. مع المناديب", st.reps], ["owner", "٢. مع الملاك", st.owners]];
   const rows = { rep: [], owner: [] };
   const sumEl = h("div", { class: "cc-sum" }), drawerIn = h("input", { class: "in num", inputmode: "decimal", "aria-label": "الدرج" });
   let drawerTouched = false;
@@ -947,7 +960,7 @@ async function cashCountModal() {
   const body = h("div", { class: "cc" },
     ...groups.map(([g, title]) => { boxes[g] = h("div", { class: "cc-rows" }); return h("section", { class: "cc-g" }, h("div", { class: "cc-gh" }, h("b", null, title),
       h("button", { class: "btn ghost", type: "button", onclick: () => addRow(g) }, icon("plus", 16), "سطر")), boxes[g]); }),
-    h("section", { class: "cc-g" }, h("div", { class: "cc-gh" }, h("b", null, "٣. الدرج (خزنة المخزن)"), h("span", { class: "hint" }, "بيتحسب لوحده = السيستم − اللي مع الناس، وتقدر تكتب المعدود فعلًا")), drawerIn),
+    h("section", { class: "cc-g" }, h("div", { class: "cc-gh" }, h("b", null, (noRep ? "٢" : "٣") + ". الدرج (خزنة المخزن)"), h("span", { class: "hint" }, "بيتحسب لوحده = السيستم − اللي مع الناس، وتقدر تكتب المعدود فعلًا")), drawerIn),
     h("section", { class: "cc-g" }, h("div", { class: "cc-gh" }, h("b", null, "🔁 التحويلات من آخر جرد"),
       h("button", { class: "btn ghost", type: "button", onclick: () => cashTransferModal(st) }, icon("plus", 16), "تحويل")),
       (st.transfers || []).length ? h("div", { class: "cc-rows" }, st.transfers.map((t) => h("div", { class: "cc-tr" },
@@ -959,7 +972,7 @@ async function cashCountModal() {
         : h("div", { class: "hint" }, "مفيش — مثلًا: سحبت من فودافون كاش بتاع مصطفى للدرج، أو المالك خد من الدرج للبيت")),
     h("label", { class: "fld" }, "ملاحظات", h("input", { class: "in", id: "cc-notes" })), sumEl,
     st.last ? h("div", { class: "hint" }, `آخر جرد: ${st.last.date} ${st.last.at ? st.last.at.slice(11, 16) : ""}`) : null);
-  st.lines.forEach((l) => addRow(l.group, l)); if (!rows.rep.length) addRow("rep"); recalc();
+  st.lines.forEach((l) => addRow(l.group, l)); if (!rows.rep.length && !noRep) addRow("rep"); recalc();
   const collect = () => ({ lines: [...["rep", "owner"].flatMap((g) => rows[g].map((r) => ({ group: g, who: r.who.value, method: r.meth.value, amount: r.amt.value }))),
     { group: "drawer", who: "درج", method: "كاش", amount: drawerIn.value }], notes: $("#cc-notes") ? $("#cc-notes").value : "" });
   let saved = null;
@@ -973,12 +986,12 @@ async function cashCountModal() {
 
 async function cashTransferModal(st) {
   const who = () => h("select", { class: "in" }, h("option", { value: st.drawer }, "الدرج (خزنة المخزن)"),
-    st.reps.length ? h("optgroup", { label: "المناديب" }, st.reps.map((x) => h("option", { value: x }, x))) : null,
+    st.reps.length && !NO_REPS ? h("optgroup", { label: "المناديب" }, st.reps.map((x) => h("option", { value: x }, x))) : null,
     st.owners.length ? h("optgroup", { label: "الملاك والمحاسبين" }, st.owners.map((x) => h("option", { value: x }, x))) : null);
   const meth = () => h("select", { class: "in" }, st.methods.map((m) => h("option", { value: m }, m)));
   const fw = who(), fm = meth(), tw = who(), tm = meth();
   const amt = h("input", { class: "in num", inputmode: "decimal", "aria-label": "المبلغ" }), notes = h("input", { class: "in", "aria-label": "ملاحظات" });
-  if (st.reps.length) fw.value = st.reps[0];
+  if (st.reps.length && !NO_REPS) fw.value = st.reps[0];
   const sync = () => { fm.disabled = fw.value === st.drawer; tm.disabled = tw.value === st.drawer; if (fm.disabled) fm.value = "كاش"; if (tm.disabled) tm.value = "كاش"; };
   fw.onchange = sync; tw.onchange = sync; sync();
   const ok = await modal({ title: "🔁 تحويل فلوس", enter: false, body: h("div", { class: "form", style: { padding: 0 } },
@@ -1109,7 +1122,7 @@ async function renderInvoice(box, kind) {
     onPick: (p, adv) => { D.party = p; if (p && kind === "مبيعات" && repSel) { D.rep_id = p.rep_id || null; repSel.value = String(D.rep_id ?? ""); } refreshInfo(); if (adv) (repSel || notesIn).focus(); } });
   if (D.party) party.set(D.party);
   let repSel = null;
-  if (kind === "مبيعات") {
+  if (kind === "مبيعات" && !NO_REPS) {      // خير زمان: مفيش مناديب (عمر 2026-11-24) — الفواتير القديمة بتفضل بمندوبها
     repSel = h("select", { class: "in", id: "f-rep", "aria-label": "المندوب", onchange: () => { D.rep_id = repSel.value ? +repSel.value : null; } },
       setup.reps.map((r) => h("option", { value: r.id ?? "" }, r.label)));
     repSel.value = String(D.rep_id ?? "");
@@ -1319,11 +1332,11 @@ async function renderLog(box) {
   const from = h("input", { class: "in", type: "date", value: st.from, "aria-label": "من تاريخ" }), to = h("input", { class: "in", type: "date", value: st.to, "aria-label": "إلى تاريخ" });
   const kind = h("select", { class: "in", "aria-label": "النوع" }, h("option", { value: "" }, "كل الأنواع"), ["مبيعات", "مشتريات", "مرتجع مبيعات", "مرتجع مشتريات"].map((k) => h("option", { value: k }, k)));
   kind.value = st.kind;
-  const q = h("input", { class: "in", placeholder: "اسم العميل أو رقم الفاتورة أو المندوب ...", value: st.q, "aria-label": "بحث" });
+  const q = h("input", { class: "in", placeholder: NO_REPS ? "اسم العميل أو رقم الفاتورة ..." : "اسم العميل أو رقم الفاتورة أو المندوب ...", value: st.q, "aria-label": "بحث" });
   let timer = null;
   const T = selTable({ maxH: "calc(100vh - 330px)",
     cols: [{ h: "النوع", key: "kind", fn: (r) => h("span", { class: "pill " + kindClass(r.kind) }, r.kind) }, { h: "رقم", sort: (r) => +r.number || r.number, fn: (r) => h("b", null, r.number) },
-      { h: "التاريخ", key: "date" }, { h: "الوقت", key: "time", cls: "hint", sort: (r) => r.date + " " + (r.created_at || r.time) }, { h: "العميل / المورد", key: "party" }, { h: "المندوب", key: "rep", cls: "hint" }, { h: "التوصيل", key: "delivery", cls: "hint" },
+      { h: "التاريخ", key: "date" }, { h: "الوقت", key: "time", cls: "hint", sort: (r) => r.date + " " + (r.created_at || r.time) }, { h: "العميل / المورد", key: "party" }, NO_REPS ? null : { h: "المندوب", key: "rep", cls: "hint" }, { h: "التوصيل", key: "delivery", cls: "hint" },
       { h: "الدفع", key: "pay", cls: "hint" }, { h: "الصافي", num: true, sort: (r) => r.net, fn: (r) => h("b", null, fmt(r.net)) }, { h: "المدفوع", num: true, cls: "hint", sort: (r) => r.paid, fn: (r) => fmt(r.paid) },
       { h: "طُبعت", sort: (r) => (r.printed ? 1 : 0), fn: (r) => h("span", { title: r.printed ? "اتطبعت" : "لسه ماتطبعتش" }, r.printed ? icon("check", 18) : "") }],
     onOpen: (r) => showInvoice(r.id), empty: "مفيش فواتير في الفترة دي",
@@ -1387,6 +1400,7 @@ const dateIn = (v, label) => h("input", { class: "in", type: "date", value: v, "
 const monthStart = () => S.boot.today.slice(0, 8) + "01";
 /* جدول بتحديد (ضغطة / Ctrl / Shift / سحب)، وضغطتين = فتح، وإجمالي المحدد */
 function selTable({ cols, onOpen, onKey, totals, empty = "مفيش بيانات", maxH = "calc(100vh - 340px)", rowClass, menu }) {
+  cols = cols.filter(Boolean);           // عمود null = مش ظاهر (زي «المندوب» في خير زمان)
   let rows = [], base = [], sel = new Set(), anchor = -1, drag = false, sortCol = -1, sortDir = 0;
   const tbody = h("tbody"), foot = h("div", { class: "tot-bar" });
   // الترتيب: ضغطة = من الأصغر للأكبر • ضغطتين = من الأكبر للأصغر • التالتة = زي ما كان
@@ -1547,7 +1561,7 @@ async function renderVoucher(box) {
   const seg = h("div", { class: "seg" }, VKINDS.filter(([k]) => !S.me.rep || k === "تحصيل").map(([k, lab]) => h("button", { "data-v": k, class: V.kind === k ? "on" : "", disabled: E && E.kind !== k ? true : null,
     onclick: () => { V.kind = k; S.lastVKind = k; seg.querySelectorAll("button").forEach((b) => b.classList.toggle("on", b.dataset.v === k)); layout(); preview(); } }, lab)));
   const party = combo({ id: "v-party", label: "العميل / المورد", placeholder: "اكتب جزء من الاسم ...", items: () => st.parties, sub: (p) => p.kind,
-    onPick: (p, adv) => { V.party = p; if (p && V.kind === "تحصيل") { V.rep_id = p.rep_id || null; repSel.value = String(V.rep_id ?? ""); layout(); } preview(); if (adv) (V.kind === "تحصيل" ? repSel : amountIn).focus(); } });
+    onPick: (p, adv) => { V.party = p; if (p && V.kind === "تحصيل" && !NO_REPS) { V.rep_id = p.rep_id || null; repSel.value = String(V.rep_id ?? ""); layout(); } preview(); if (adv) (V.kind === "تحصيل" && !NO_REPS ? repSel : amountIn).focus(); } });
   if (V.party) party.set(V.party);
   const repSel = h("select", { class: "in", "aria-label": "المندوب", onchange: () => { V.rep_id = repSel.value ? +repSel.value : null; layout(); } }, st.reps.map((r) => h("option", { value: r.id ?? "" }, r.label)));
   // طريقة الدفع + مع مين الفلوس (للجرد)
@@ -1622,7 +1636,7 @@ async function renderVoucher(box) {
   }
   function layout() {
     const exp = V.kind === "مصروف";
-    fParty.style.display = exp ? "none" : ""; fCat.style.display = exp ? "" : "none"; fRep.style.display = V.kind === "تحصيل" ? "" : "none";
+    fParty.style.display = exp ? "none" : ""; fCat.style.display = exp ? "" : "none"; fRep.style.display = V.kind === "تحصيل" && !NO_REPS ? "" : "none";
     fMethod.style.display = V.kind === "تحصيل" ? "" : "none";
     fHolder.style.display = V.kind === "تحصيل" && !S.me.rep ? "" : "none";
     fillHolders();
@@ -1667,14 +1681,14 @@ async function renderVouchers(box) {
   const st = await api("voucher_setup");
   const L = S.vlog || (S.vlog = { from: S.boot.today, to: S.boot.today, type: "الكل", rep: "الكل", q: "" });
   const from = dateIn(L.from, "من"), to = dateIn(L.to, "إلى");
-  const typ = h("select", { class: "in", "aria-label": "النوع" }, ["الكل", "تحصيل من عميل", "دفع لمورد", "خصم مسموح به", "مصروفات", "مرتبات", "سلف", "عمولات"].map((x) => h("option", { value: x }, x)));
+  const typ = h("select", { class: "in", "aria-label": "النوع" }, ["الكل", "تحصيل من عميل", "دفع لمورد", "خصم مسموح به", "مصروفات", "مرتبات", "سلف", "عمولات"].filter((x) => !(NO_REPS && x === "عمولات")).map((x) => h("option", { value: x }, x)));
   typ.value = L.type;
   const rep = h("select", { class: "in", "aria-label": "المندوب" }, h("option", { value: "الكل" }, "كل المناديب"), st.reps.map((r) => h("option", { value: r.id ?? "office" }, r.label)));
-  rep.value = L.rep;
+  rep.value = L.rep; if (NO_REPS) L.rep = rep.value = "الكل";
   const q = h("input", { class: "in", placeholder: "الاسم أو البند أو الملاحظات ...", value: L.q, "aria-label": "بحث" });
   const T = selTable({
     cols: [{ h: "التاريخ", key: "date" }, { h: "الوقت", key: "time", cls: "hint" }, { h: "النوع", fn: (r) => h("span", { class: "pill " + (r.type.startsWith("تحصيل") ? "k-مبيعات" : r.type.startsWith("دفع") ? "k-مشتريات" : "k-مرتجع") }, r.type) },
-      { h: "الاسم / البند", fn: (r) => h("b", null, r.name) }, { h: "المندوب", key: "rep", cls: "hint" }, { h: "المبلغ", num: true, fn: (r) => h("b", null, fmt(r.amount)) },
+      { h: "الاسم / البند", fn: (r) => h("b", null, r.name) }, NO_REPS ? null : { h: "المندوب", key: "rep", cls: "hint" }, { h: "المبلغ", num: true, fn: (r) => h("b", null, fmt(r.amount)) },
       { h: "ملاحظات", fn: (r) => [r.notes, r.invoice ? h("span", { class: "pill k-مشتريات", style: { marginInlineStart: "6px" } }, "مع فاتورة " + r.invoice) : null], cls: "hint" }],
     onOpen: (r) => openVoucher(r),
     onKey: (e) => { if (e.key === "Delete") del(); },
@@ -1698,7 +1712,7 @@ async function renderVouchers(box) {
     if (r.invoice_id) return showInvoice(r.invoice_id);
     const row = (k, v) => v ? h("div", { class: "chip" }, k + ": ", h("b", null, v)) : null;
     modal({ title: `سند ${r.type}`, enter: false, body: h("div", { class: "chips", style: { padding: 0, flexWrap: "wrap" } },
-        row("التاريخ", `${r.date} ${r.time || ""}`), r.party_id ? h("div", { class: "chip" }, "الاسم: ", partyLink(r.name, r.party_id)) : row("الاسم / البند", r.name), row("المبلغ", fmt(r.amount)), row("المندوب", r.rep), row("ملاحظات", r.notes)),
+        row("التاريخ", `${r.date} ${r.time || ""}`), r.party_id ? h("div", { class: "chip" }, "الاسم: ", partyLink(r.name, r.party_id)) : row("الاسم / البند", r.name), row("المبلغ", fmt(r.amount)), NO_REPS && !r.rep ? null : row("المندوب", r.rep), row("ملاحظات", r.notes)),
       actions: [r.key.startsWith("p-") ? { label: "طباعة إيصال", cls: "gold", icon: "print", value: async () => { try { await api("print_receipt", r.id); toast("🖨 شاشة الطباعة هتفتح خلال ثواني ...", "ok"); } catch (e) { toast(e.message, "err"); } return true; } } : null,
         r.key.startsWith("p-") && !S.boot.web ? { label: "PDF", icon: "save", value: async () => { await pdfExport("print_receipt", [r.id], `${r.id} ${r.name || ""}`); return false; } } : null,
         { label: "تعديل", icon: "edit", value: () => { openVoucher(r); return true; } }, { label: "قفل", ret: true }].filter(Boolean) });
@@ -1725,7 +1739,7 @@ async function renderVouchers(box) {
   let t = null; q.addEventListener("input", () => { clearTimeout(t); t = setTimeout(load, 250); });
   box.replaceChildren(h("div", { class: "page" },
     h("section", { class: "card anim-up d1" }, h("div", { class: "form" }, h("label", { class: "fld" }, "من", from), h("label", { class: "fld" }, "إلى", to),
-      h("label", { class: "fld" }, "النوع", typ), h("label", { class: "fld" }, "المندوب (التحصيل)", rep), h("label", { class: "fld span2" }, "بحث", q))),
+      h("label", { class: "fld" }, "النوع", typ), NO_REPS ? null : h("label", { class: "fld" }, "المندوب (التحصيل)", rep), h("label", { class: "fld span2" }, "بحث", q))),
     h("section", { class: "card anim-up d2" }, h("div", { class: "card-h" }, h("h2", null, "السندات"),
       h("button", { class: "btn primary", onclick: () => { S.voucherEdit = null; go("vch:new", true); } }, icon("plus", 18), "سند جديد"),
       h("button", { class: "btn", onclick: () => { const r = T.selected()[0]; if (!r) return toast("حدد سند الأول"); openVoucher(r); } }, icon("edit", 18), "تعديل"),
@@ -1978,19 +1992,19 @@ async function partyForm(id) {
   await formModal(id ? `تعديل «${p.name}»` : "إضافة عميل / مورد", [
     { key: "name", label: "الاسم", value: p.name, wide: true }, { key: "kind", label: "النوع", value: p.kind, options: ["عميل", "مورد", "عميل/مورد"].concat(S.me.owner ? ["أصول"] : []) },
     ...[0, 1, 2].map((i) => ({ key: "phone" + (i || ""), label: "رقم تليفون " + (i + 1), value: ph[i] || "" })), { key: "address", label: "العنوان", value: p.address, wide: true },
-    { key: "rep_id", label: "المندوب (للعملاء)", value: p.rep_id ?? "", options: reps.map((r) => ({ value: r.id ?? "", label: r.label })) },
+    ...(NO_REPS ? [] : [{ key: "rep_id", label: "المندوب (للعملاء)", value: p.rep_id ?? "", options: reps.map((r) => ({ value: r.id ?? "", label: r.label })) }]),
     { key: "opening", label: "الرصيد الافتتاحي", value: p.opening, num: true, hint: "موجب = على العميل ، سالب = للمورد" },
     { key: "limit", label: "الحد الائتماني 🔒 (0 = بدون)", value: p.limit, num: true, hint: "بيتغيّر بكلمة سر المالك" }],
-    { onSave: async (v) => { const r = await ownerRetry((pw) => api("save_party", { ...v, phone: [v.phone, v.phone1, v.phone2].map((x) => String(x || "").trim()).filter(Boolean).join(" / "), id: p.id, rep_id: v.rep_id ? +v.rep_id : null }, pw)); if (!r) return false; saved = true; toast(`✔ اتحفظ «${v.name}»`, "ok"); } });
+    { onSave: async (v) => { const r = await ownerRetry((pw) => api("save_party", { rep_id: p.rep_id ?? null, ...v, phone: [v.phone, v.phone1, v.phone2].map((x) => String(x || "").trim()).filter(Boolean).join(" / "), id: p.id, rep_id: v.rep_id ? +v.rep_id : null }, pw)); if (!r) return false; saved = true; toast(`✔ اتحفظ «${v.name}»`, "ok"); } });
   return saved;
 }
 async function renderParties(box) {
   const P = S.parSt || (S.parSt = { kf: "الكل", q: "" });
   const kf = h("div", { class: "seg wrap" }, ["الكل", "عملاء", "موردين"].concat(S.me.owner ? ["أصول"] : [], ["عليهم فلوس", "ليهم فلوس", "عدّوا الحد الائتماني"]).map((k) => h("button", { "data-v": k, class: P.kf === k ? "on" : "",
     onclick: () => { P.kf = k; kf.querySelectorAll("button").forEach((b) => b.classList.toggle("on", b.dataset.v === k)); load(); } }, k)));
-  const q = h("input", { class: "in", placeholder: "الاسم أو التليفون أو المندوب أو العنوان ...", value: P.q, "aria-label": "بحث" });
+  const q = h("input", { class: "in", placeholder: NO_REPS ? "الاسم أو التليفون أو العنوان ..." : "الاسم أو التليفون أو المندوب أو العنوان ...", value: P.q, "aria-label": "بحث" });
   const T = selTable({
-    cols: [{ h: "ID", key: "id", cls: "hint" }, { h: "الاسم", fn: (r) => h("b", null, r.name) }, { h: "النوع", key: "kind", cls: "hint" }, { h: "المندوب", key: "rep", cls: "hint" },
+    cols: [{ h: "ID", key: "id", cls: "hint" }, { h: "الاسم", fn: (r) => h("b", null, r.name) }, { h: "النوع", key: "kind", cls: "hint" }, NO_REPS ? null : { h: "المندوب", key: "rep", cls: "hint" },
       { h: "الهاتف", key: "phone" }, { h: "العنوان", key: "address", cls: "hint" }, { h: "الرصيد", num: true, fn: (r) => h("b", { style: { color: r.balance > 0.005 ? "var(--red)" : r.balance < -0.005 ? "var(--green)" : "" } }, fmt(r.balance)) },
       { h: "الحد الائتماني", num: true, fn: (r) => (r.limit ? h("span", { class: r.over ? "pill k-مرتجع" : "" }, fmt(r.limit)) : "—") }, { h: "آخر تحصيل", key: "lc", cls: "hint" }, { h: "آخر دفع", key: "lp", cls: "hint" }],
     onOpen: async (r) => { if (await partyForm(r.id)) load(); },
@@ -2016,7 +2030,7 @@ async function renderParties(box) {
       h("button", { class: "btn", onclick: one((r) => { S.pendingStatement = r.id; go("acc:statement", true); }) }, icon("list", 18), "كشف الحساب"),
       h("button", { class: "btn", onclick: one((r) => { S.pendingVoucherParty = r.id; S.voucherEdit = null; go("vch:new", true); }) }, icon("cash", 18), "سند"),
       h("button", { class: "btn", onclick: one((r) => newInvoiceFor(r.id)) }, icon("sale", 18), "فاتورة مبيعات"),
-      !S.me.rep ? h("button", { class: "btn gold", title: "اسم العميل وأرقامه (عملاء بس من غير موردين) — حدد كذا عميل أو اكتب اسم المندوب في البحث علشان تطبع عملاؤه بس",
+      !S.me.rep ? h("button", { class: "btn gold", title: "اسم العميل وأرقامه (عملاء بس من غير موردين) — حدد كذا عميل أو اكتب جزء من الاسم في البحث علشان تطبع اللي ظاهرين بس",
         onclick: async () => { const sel = T.selected(); try { await api("print_phones", sel.length > 1 ? sel.map((x) => x.id) : null, sel.length > 1 ? "" : q.value.trim()); toast("🖨 شاشة الطباعة هتفتح خلال ثواني ...", "ok"); } catch (e) { toast(e.message, "err"); } } }, icon("print", 18), "طباعة الأرقام") : null,
       S.me.owner ? h("button", { class: "btn", onclick: () => importExcel("parties") }, "استيراد من Excel") : null,
       h("button", { class: "btn danger", onclick: del }, icon("trash", 18), "حذف")), T.el)));
@@ -2117,15 +2131,15 @@ async function itemForm(it) {
     { key: "code", label: "الكود", value: it.code }, { key: "unit", label: "الوحدة", value: it.unit, ph: "شيكارة / رغيف / كيلو / قطعة" },
     { key: "buy", label: "سعر الشراء", value: it.buy, num: true }, { key: "sell", label: "سعر البيع", value: it.sell, num: true },
     { key: "min", label: "حد أدنى للتنبيه", value: it.min, num: true }, { key: "opening", label: "رصيد أول المدة", value: it.opening, num: true, hint: "الكمية اللي كانت موجودة قبل البرنامج" },
-    { key: "comm", label: "عمولة المندوب (جنيه على الوحدة)", value: it.comm ?? 1, num: true, hint: "بتتحسب على الفواتير الجديدة بس" }],
-    { onSave: async (v) => { const r = await ownerRetry((pw) => api("save_item", { ...v, id: it.id }, pw)); if (!r) return false; saved = true; toast(`✔ اتحفظ «${v.name}»`, "ok"); } });
+    ...(NO_REPS ? [] : [{ key: "comm", label: "عمولة المندوب (جنيه على الوحدة)", value: it.comm ?? 1, num: true, hint: "بتتحسب على الفواتير الجديدة بس" }])],
+    { onSave: async (v) => { const r = await ownerRetry((pw) => api("save_item", { comm: it.comm ?? 1, ...v, id: it.id }, pw)); if (!r) return false; saved = true; toast(`✔ اتحفظ «${v.name}»`, "ok"); } });
   return saved;
 }
 async function renderItems(box) {
   const q = h("input", { class: "in", placeholder: "الكود أو الاسم ...", "aria-label": "بحث" });
   const T = selTable({
     cols: [{ h: "ID", key: "id", cls: "hint" }, { h: "الكود", key: "code" }, { h: "اسم الصنف", fn: (r) => h("b", null, r.name) }, { h: "الوحدة", key: "unit", cls: "hint" },
-      { h: "القسم", key: "cat", cls: "hint" }, { h: "سعر الشراء", num: true, fn: (r) => fmt(r.buy) }, { h: "سعر البيع", num: true, fn: (r) => fmt(r.sell) }, { h: "عمولة المندوب", num: true, fn: (r) => fmt(r.comm) }, { h: "حد أدنى", num: true, fn: (r) => fq(r.min) },
+      { h: "القسم", key: "cat", cls: "hint" }, { h: "سعر الشراء", num: true, fn: (r) => fmt(r.buy) }, { h: "سعر البيع", num: true, fn: (r) => fmt(r.sell) }, NO_REPS ? null : { h: "عمولة المندوب", num: true, fn: (r) => fmt(r.comm) }, { h: "حد أدنى", num: true, fn: (r) => fq(r.min) },
       { h: "أول المدة", num: true, fn: (r) => fq(r.opening) }, { h: "الرصيد", num: true, fn: (r) => h("b", { style: { color: r.low ? "var(--red)" : "" } }, fq(r.stock)) }],
     onOpen: (r) => showItemInvoices(r.id), onKey: (e) => { if (e.key === "Delete") del(); },
     menu: (r) => [{ label: "👁 عرض (فواتير الصنف)", fn: () => showItemInvoices(r.id) }, { label: "🗑 حذف", danger: true, fn: () => del() }, { label: "✏️ تعديل", fn: async () => { if (await itemForm(r)) load(); } }],
@@ -2619,7 +2633,7 @@ async function renderMonthly(box) {
         sec("الأرباح بالتفصيل", kv(d.metrics.map(([l, v]) => [l, v, l === "صافي الربح" || l.includes("Total")]))),
         sec("الخزنة والأرصدة", kv([["رصيد الخزنة أول الشهر", d.cash.open], ["دخل الخزنة", d.cash.in], ["خرج من الخزنة", d.cash.out], ["رصيد الخزنة آخر الشهر", d.cash.close, true],
           ["خوارج آخر الشهر", d.end.recv], ["علينا للموردين آخر الشهر", d.end.pay], ["أرباح اتصرفت للملاك", d.end.owners], ["عدد فواتير المبيعات", k.n_sales, "n"]])),
-        sec("المناديب", tbl([{ h: "المندوب", fn: (r) => h("b", null, r.name) }, { h: "فواتير", num: true, key: "n" }, { h: "مبيعات", num: true, fn: (r) => fmt(r.sales) }, { h: "تحصيل", num: true, fn: (r) => fmt(r.collect) }], d.reps)),
+        NO_REPS ? null : sec("المناديب", tbl([{ h: "المندوب", fn: (r) => h("b", null, r.name) }, { h: "فواتير", num: true, key: "n" }, { h: "مبيعات", num: true, fn: (r) => fmt(r.sales) }, { h: "تحصيل", num: true, fn: (r) => fmt(r.collect) }], d.reps)),
         sec("المصروفات", d.exp_cats.length ? tbl([{ h: "البند", fn: (r) => r[0] }, { h: "المبلغ", num: true, fn: (r) => fmt(r[1]) }], d.exp_cats) : h("div", { class: "hint", style: { padding: "14px 18px" } }, "مفيش مصروفات عامة الشهر ده"))),
       sec("أكبر العملاء (صافي المبيعات)", tbl([{ h: "العميل", fn: (r) => h("b", null, r.name) }, { h: "فواتير", num: true, key: "n" }, { h: "صافي المبيعات", num: true, fn: (r) => fmt(r.net) }, { h: "اتحصّل منه", num: true, fn: (r) => fmt(r.collect) }], d.customers,
         { onOpen: (r) => { S.pendingStatement = r.id; go("acc:statement", true); } })),
@@ -2927,7 +2941,7 @@ async function renderEmployees(box) {
   }
   async function del() { const r = sel(); if (!r) return toast("حدد عامل الأول"); const pw = await askDelPw(`حذف «${r.name}»؟`); if (!pw) return; try { await api("delete_employee", r.id, pw); toast("✔ اتحذف", "ok"); load(); } catch (e) { alertBox(e.message, "مينفعش يتحذف"); } }
   async function toggle() { const r = sel(); if (!r) return toast("حدد عامل الأول");
-    const msg = r.left ? `«${r.name}» رجع الشغل تاني؟` : `«${r.name}» ساب الشغل؟\nهيختفي من الحضور والمناديب، وسجله كله هيفضل زي ما هو.` + (r.adv ? `\n• عليه سلف لسه: ${fmt(r.adv)}` : "") + (r.is_rep && r.due ? `\n• ليه عمولة لسه: ${fmt(r.due)}` : "");
+    const msg = r.left ? `«${r.name}» رجع الشغل تاني؟` : `«${r.name}» ساب الشغل؟\nهيختفي من القوايم، وسجله كله هيفضل زي ما هو.` + (r.adv ? `\n• عليه سلف لسه: ${fmt(r.adv)}` : "") + (r.is_rep && r.due ? `\n• ليه عمولة لسه: ${fmt(r.due)}` : "");
     if (!(await confirmBox(msg))) return; await api("toggle_employee", r.id); load(); }
   const bar = h("div", { class: "card-h" });
   function acts() {
@@ -3184,7 +3198,7 @@ async function renderSettings(box) {
       st.owner && !S.boot.web ? h("button", { class: "btn gold", onclick: restoreBackup }, icon("upload", 18), "استرجاع نسخة احتياطية") : null)),
     S.boot.web ? null : sec("☁️ نسخة على Google Drive (أوتوماتيك)", "d4", cloudBox(st.owner)),
     sec("كلمة السر بتاعتي", "d5", h("div", { style: { padding: "14px 18px" } }, h("button", { class: "btn", onclick: () => changePw(null, S.me.username) }, icon("edit", 18), "غيّر كلمة السر"))),
-    st.owner ? sec("📍 مكان المخزن (حضور المناديب بالموقع)", "d6", h("div", { style: { padding: "14px 18px", display: "flex", gap: "10px", flexWrap: "wrap", alignItems: "center" } },
+    st.owner && !NO_REPS ? sec("📍 مكان المخزن (حضور المناديب بالموقع)", "d6", h("div", { style: { padding: "14px 18px", display: "flex", gap: "10px", flexWrap: "wrap", alignItems: "center" } },
       h("span", { class: "hint" }, "المندوب بيدوس «تسجيل حضور» من الموبايل: لو جوه المسافة دي من المخزن حضوره يتسجل على طول"), h("button", { class: "btn", onclick: placeSettings }, icon("edit", 18), "تظبيط المكان والمسافة"))) : null,
     st.owner && !S.boot.web ? sec("📥 الاستيراد من Excel", "d6", h("div", { style: { padding: "14px 18px", display: "flex", gap: "10px", flexWrap: "wrap", alignItems: "center" } },
       h("span", { class: "hint" }, "بياخد نسخة احتياطية قبل أي تغيير"), h("button", { class: "btn", onclick: () => importExcel("items") }, icon("box", 18), "استيراد أصناف"),
@@ -3219,7 +3233,7 @@ async function changePw(uid, name) {
 }
 // شاشة الصلاحيات: المالك بيعلّم على الشاشات اللي كل يوزر يفتحها
 async function accessModal(u, setup) {
-  const role = h("select", { class: "in", "aria-label": "الصلاحية" }, setup.roles.map((r) => h("option", { value: r }, r)));
+  const role = h("select", { class: "in", "aria-label": "الصلاحية" }, setup.roles.filter((r) => !(NO_REPS && r === "مندوب") || (u && u.role === r)).map((r) => h("option", { value: r }, r)));
   role.value = u ? u.role : "محاسب";
   const emp = h("select", { class: "in", "aria-label": "المندوب" }, h("option", { value: "" }, "— اختار المندوب —"), setup.reps.map((r) => h("option", { value: r.id }, r.name)));
   emp.value = u && u.emp_id ? String(u.emp_id) : "";
@@ -3253,7 +3267,7 @@ async function renderUsers(box) {
   async function access(u) {
     const A = await accessModal(u, setup);
     const ok = await modal({ title: `صلاحيات «${u.username}»`, wide: true, body: [h("div", { class: "form", style: { padding: 0 } }, h("label", { class: "fld" }, "الصلاحية", A.role), A.fEmp),
-      h("div", { class: "hint" }, "علّم على الشاشات اللي اليوزر ده يفتحها (من البرنامج ومن الموقع). المندوب بيشوف عملاءه وفواتيره وسنداته بس."), A.tools, A.grid],
+      h("div", { class: "hint" }, "علّم على الشاشات اللي اليوزر ده يفتحها (من البرنامج ومن الموقع)."), A.tools, A.grid],
       actions: [{ label: "حفظ", cls: "primary", value: async () => { try { await api("set_user_access", u.id, A.role.value, A.screens(), A.emp.value || null); return true; } catch (e) { toast(e.message, "err"); return false; } } }, { label: "إلغاء", value: () => null }] });
     if (ok) { toast("✔ اتحفظت الصلاحيات — بتسري على طول", "ok"); load(); }
   }
@@ -3346,7 +3360,7 @@ async function onlineSettings() {
   const showKey = () => { keyLbl.textContent = c.gs_email ? "✔ ملف المفتاح متحط. شارك الشيت (Editor) مع الإيميل ده:" : "لسه مفيش ملف مفتاح Google (JSON)"; keyEmail.value = c.gs_email || ""; };
   const roleSel = (u, emps, reps) => {
     const sel = h("select", { class: "in", style: { maxWidth: "260px" } }, h("option", { value: "" }, "— اختار الصفة —"), h("option", { value: "manager" }, "مدير (تقارير وتنبيهات وموافقات)"),
-      h("optgroup", { label: "محاسب" }, emps.map((e) => h("option", { value: "acct:" + e.id }, "محاسب: " + e.name))), h("optgroup", { label: "مندوب" }, reps.map((e) => h("option", { value: "rep:" + e.id }, "مندوب: " + e.name))),
+      h("optgroup", { label: "محاسب" }, emps.map((e) => h("option", { value: "acct:" + e.id }, "محاسب: " + e.name))), NO_REPS ? null : h("optgroup", { label: "مندوب" }, reps.map((e) => h("option", { value: "rep:" + e.id }, "مندوب: " + e.name))),
       h("option", { value: "remove" }, "❌ إلغاء الربط"));
     sel.addEventListener("change", async () => { if (!sel.value) return; const [r, id] = sel.value.split(":");
       try { c.users = await api("tg_assign", u.cid, r, id ? +id : null); drawUsers(); toast("✔ تم", "ok"); } catch (e) { alertBox(e.message); } });
@@ -3369,7 +3383,7 @@ async function onlineSettings() {
         tgMsg.style.color = "var(--green)"; tgMsg.textContent = r.pending.length ? `البوت @${r.bot} شغال ✔ — فيه ${r.pending.length} موبايل مستني ربط: اختار صفة كل واحد من الجدول.` : `البوت @${r.bot} شغال ✔ — بس لسه موصلتلوش رسالة جديدة. ابعتله رسالة من الموبايل واستنى 5 ثواني ودوس تاني.`;
       } catch (e) { tgMsg.style.color = "var(--red)"; tgMsg.textContent = e.message; } } }, icon("phone", 18), "ربط الموبايل"),
       h("button", { class: "btn", onclick: async () => { try { await api("tg_test"); tgMsg.style.color = "var(--green)"; tgMsg.textContent = "✔ الرسالة اتبعتت"; } catch (e) { tgMsg.style.color = "var(--red)"; tgMsg.textContent = e.message; } } }, "رسالة تجربة"),
-      h("button", { class: "btn danger", onclick: async () => { if (!(await confirmBox("تلغي ربط كل الموبايلات (المديرين والمناديب)؟"))) return; await api("tg_unlink_all"); c.users = []; drawUsers(); } }, "إلغاء ربط الكل")),
+      h("button", { class: "btn danger", onclick: async () => { if (!(await confirmBox("تلغي ربط كل الموبايلات؟"))) return; await api("tg_unlink_all"); c.users = []; drawUsers(); } }, "إلغاء ربط الكل")),
     tgMsg, c.status_tg ? h("div", { class: "hint" }, c.status_tg) : null, usersBox,
     h("div", { class: "form", style: { padding: 0 } }, B("tg_daily", "تقرير آخر اليوم"), T("tg_time", "ساعة التقرير (مثال 21:00)", "21:00"), B("tg_commands", "البوت يرد على الأسئلة (اليوم، امبارح، خزنة، حضور، طلبات، شيت)")),
     h("b", { style: { color: "var(--navy)" } }, "التنبيهات الفورية"),
