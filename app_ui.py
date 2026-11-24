@@ -5,7 +5,7 @@
 التشغيل:  python app_ui.py            → نافذة البرنامج
           python app_ui.py --serve 8765 → للتجربة من المتصفح (http://127.0.0.1:8765)
 """
-import os, sys, json, threading, traceback, subprocess, time
+import os, re, sys, json, threading, traceback, subprocess, time
 from datetime import date, timedelta
 
 import Warehouse_app as W
@@ -50,7 +50,7 @@ for _keys, _methods in [
     (["acc:statement", "acc:balances"], "party_transfer_preview party_transfer_save party_transfer_detail party_transfer_delete"),
     (["acc:cash"], "cash add_cash_move delete_cash_move cash_count cash_count_setup cash_count_save cash_count_print cash_count_pdf cash_transfer_add cash_transfer_delete"),
     (["acc:subcash"], "subcash save_subcash delete_subcash"),
-    (["par:list"], "parties_full party_get save_party"),
+    (["par:list"], "parties_full party_get save_party print_phones"),
     (["itm:list", "itm:stock", "itm:sales", "itm:buys"], "item_invoices"),
     (["itm:list"], "items_full save_item delete_item"),
     (["itm:stock"], "stock save_price print_stock_count"),
@@ -953,6 +953,37 @@ class Api:
         W.print_page(hp)
         return True
 
+    def print_phones(self, ids=None, q=""):
+        """شاشة العملاء ← «طباعة الأرقام»: اسم العميل وأرقامه (للمندوب يكلمهم). عملاء بس — من غير موردين ولا أصول ولا البوابة."""
+        self._need_login()
+        qn = W._norm((q or "").strip()); keep = set(int(x) for x in ids) if ids else None
+        with W.db() as c:
+            st = c.execute("SELECT * FROM settings WHERE id=1").fetchone()
+            rows = [r for r in c.execute("SELECT p.id,p.name,p.phone,p.address,m.name rname FROM parties p LEFT JOIN employees m ON m.id=p.rep_id "
+                                         "WHERE COALESCE(p.kind,'') NOT IN ('مورد', ?) AND p.name<>? ORDER BY p.name", (ASSET, W.GATE_PARTY)).fetchall()
+                    if (r["id"] in keep if keep else (not qn or qn in W._norm(f"{r['name'] or ''} {r['phone'] or ''} {r['rname'] or ''} {r['address'] or ''}")))]
+        if not rows: raise UIError("مفيش عملاء")
+        esc = W.esc
+        phones = lambda v: "<br>".join(esc(x) for x in re.split(r"\s*[/،,]\s*", v or "") if x.strip())
+        body = "".join(f"<tr><td>{n}</td><td class='nm'>{esc(r['name'])}</td><td class='ph'>{phones(r['phone'])}</td></tr>" for n, r in enumerate(rows, 1))
+        sub = f"بتاريخ {_today()}  •  {len(rows)} عميل" + (f"  •  بحث: {esc(q)}" if (q and not keep) else "") + ("  •  العملاء المحددين بس" if keep else "")
+        html = f"""<!doctype html><html lang="ar" dir="rtl"><meta charset="utf-8"><title>أرقام العملاء</title><style>
+        @page{{size:A4;margin:10mm}}*{{box-sizing:border-box}}body{{font-family:Tahoma,Arial,sans-serif;font-size:14px;color:#111;margin:0}}
+        .hd{{display:flex;align-items:center;justify-content:space-between;border-bottom:2px solid #4a2d17;padding-bottom:6px}}.hd img{{height:58px}}
+        h1{{margin:0;font-size:21px;color:#4a2d17}}h2{{text-align:center;margin:10px 0 2px}}.sub{{text-align:center;color:#444;margin-bottom:8px}}
+        table{{width:100%;border-collapse:collapse}}th,td{{border:1px solid #444;padding:6px 6px;text-align:center}}td.nm{{text-align:right;font-weight:bold}}
+        td.ph{{direction:ltr;font-size:15px;letter-spacing:.5px;line-height:1.6}}th{{background:#f1e6d2}}thead{{display:table-header-group}}tr{{break-inside:avoid}}
+        .ft{{margin-top:8px;color:#555;font-size:11px}}</style>
+        <div class="hd"><div><h1>{esc(st['company']) or W.DEFAULT_COMPANY}</h1></div><img src="{W.logo_data_uri()}"></div>
+        <h2>أرقام العملاء</h2><div class="sub">{sub}</div>
+        <table><colgroup><col style="width:7%"><col style="width:53%"><col style="width:40%"></colgroup>
+        <thead><tr><th>م</th><th>اسم العميل</th><th>التليفون</th></tr></thead><tbody>{body}</tbody></table>
+        <div class="ft">طُبع في {_today()} — {W.fmt_time(W.now_ts())}</div></html>"""
+        hp = os.path.join(W.PRINT_DIR, "customer_phones.html")
+        with open(hp, "w", encoding="utf-8") as f: f.write(html)
+        W.print_page(hp)
+        return True
+
     # ---------- الخزنة ----------
     def cash(self, d_from=None, d_to=None):
         self._need_login()
@@ -1196,7 +1227,7 @@ class Api:
 
     PDF_OK = {"print_statement": "كشف حساب", "print_balances": "أرصدة الحسابات", "print_stock_count": "أرصدة الأصناف للجرد", "print_daily": "التقرير اليومي",
               "monthly_print": "التقرير الشهري", "print_invoice": "فاتورة", "print_receipt": "إيصال سند", "print_trust_form": "إيصال أمانة",
-              "print_production": "البلاغ"}
+              "print_production": "البلاغ", "print_phones": "أرقام العملاء"}
 
     @staticmethod
     def _desktop():
@@ -3437,7 +3468,7 @@ def _guard(name, args):
         elif name in ("statement", "print_statement", "voucher_preview"):
             pid = args[1] if name == "voucher_preview" else args[0]
             if pid and int(pid) not in mine: raise UIError("المندوب بيشوف حسابات العملاء بس")
-        elif name in ("delete_parties", "print_balances"):
+        elif name in ("delete_parties", "print_balances", "print_phones"):
             raise UIError("الأمر ده للمحاسب أو المالك بس")
         elif name == "party_info":
             if args and args[0] and int(args[0]) not in mine: raise UIError("المندوب بيشوف حسابات العملاء بس")

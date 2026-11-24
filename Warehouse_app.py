@@ -1877,6 +1877,10 @@ def item_cat_guess(name):
     if "عيش" in n or "خبز" in n: return CAT_BREAD
     return CAT_SUPPLY
 
+KZ_CUSTOMERS_1 = [("مكاوى", "01120346348"), ("السعدني", "01033366541"), ("ابو علاء", "01093443342"), ("حدوته", "01003808811"), ("جنه الحضرى", "01006330345"),
+                  ("الحضرى", ""), ("ابو دريع", "01146495284"), ("ابو يوسف", "01116445245"), ("تلوث", ""), ("حسن", "01006289908"), ("أبو ايه", ""),
+                  ("شعبان", "01092681352")]
+
 def init_production(c):
     c.execute("""CREATE TABLE IF NOT EXISTS bread_sizes(id INTEGER PRIMARY KEY, name TEXT NOT NULL, per_table REAL NOT NULL DEFAULT 0, price REAL NOT NULL DEFAULT 0,
                  item_id INTEGER, sort INTEGER DEFAULT 0, active INTEGER DEFAULT 1)""")
@@ -1920,6 +1924,16 @@ def init_production(c):
             if not c.execute("SELECT 1 FROM items WHERE name=?", (nm,)).fetchone():
                 c.execute("INSERT INTO items(name,unit,buy_price,sell_price,category) VALUES(?,?,?,?,?)", (nm, unit, 0, 0, CAT_SUPPLY))
         c.execute("UPDATE settings SET kz_setup_v=1 WHERE id=1")
+    # عملاء عمر (2026-11-24) — مرة واحدة: اللي موجود بنفس الاسم مش بيتكرر (لو مالوش رقم بنحطّله الرقم بس)، ومن غير أي رصيد
+    if add_col(c, "settings", "kz_cust_v", "INTEGER DEFAULT 0") or not (c.execute("SELECT kz_cust_v FROM settings WHERE id=1").fetchone() or [0])[0]:
+        have = {_norm(r[1]): r for r in c.execute("SELECT id, name, phone FROM parties").fetchall()}
+        for nm, ph in KZ_CUSTOMERS_1:
+            ex = have.get(_norm(nm))
+            if ex:
+                if ph and not (ex[2] or "").strip(): c.execute("UPDATE parties SET phone=? WHERE id=?", (ph, ex[0]))
+                continue
+            c.execute("INSERT INTO parties(name,kind,phone,address,opening) VALUES(?,?,?,?,?)", (nm, "عميل", ph, "", 0))
+        c.execute("UPDATE settings SET kz_cust_v=1 WHERE id=1")
 
 GATE_PARTY = "البوابة"
 

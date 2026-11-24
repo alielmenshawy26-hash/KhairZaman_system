@@ -1959,13 +1959,15 @@ async function partyForm(id) {
   let p = { id: null, name: "", kind: "عميل", phone: "", address: "", opening: 0, rep_id: null, limit: 0 }, reps;
   try { if (id) { p = await api("party_get", id); reps = p.reps; } else reps = await api("party_reps"); } catch (e) { return alertBox(e.message); }
   let saved = false;
+  const ph = String(p.phone || "").split(/\s*[\/،,]\s*/).filter(Boolean);   // لحد ٣ أرقام، بتتحفظ في خانة الهاتف بينهم « / »
+  if (ph.length > 3) ph.splice(2, ph.length, ph.slice(2).join(" / "));
   await formModal(id ? `تعديل «${p.name}»` : "إضافة عميل / مورد", [
     { key: "name", label: "الاسم", value: p.name, wide: true }, { key: "kind", label: "النوع", value: p.kind, options: ["عميل", "مورد", "عميل/مورد"].concat(S.me.owner ? ["أصول"] : []) },
-    { key: "phone", label: "الهاتف", value: p.phone }, { key: "address", label: "العنوان", value: p.address, wide: true },
+    ...[0, 1, 2].map((i) => ({ key: "phone" + (i || ""), label: "رقم تليفون " + (i + 1), value: ph[i] || "" })), { key: "address", label: "العنوان", value: p.address, wide: true },
     { key: "rep_id", label: "المندوب (للعملاء)", value: p.rep_id ?? "", options: reps.map((r) => ({ value: r.id ?? "", label: r.label })) },
     { key: "opening", label: "الرصيد الافتتاحي", value: p.opening, num: true, hint: "موجب = على العميل ، سالب = للمورد" },
     { key: "limit", label: "الحد الائتماني 🔒 (0 = بدون)", value: p.limit, num: true, hint: "بيتغيّر بكلمة سر المالك" }],
-    { onSave: async (v) => { const r = await ownerRetry((pw) => api("save_party", { ...v, id: p.id, rep_id: v.rep_id ? +v.rep_id : null }, pw)); if (!r) return false; saved = true; toast(`✔ اتحفظ «${v.name}»`, "ok"); } });
+    { onSave: async (v) => { const r = await ownerRetry((pw) => api("save_party", { ...v, phone: [v.phone, v.phone1, v.phone2].map((x) => String(x || "").trim()).filter(Boolean).join(" / "), id: p.id, rep_id: v.rep_id ? +v.rep_id : null }, pw)); if (!r) return false; saved = true; toast(`✔ اتحفظ «${v.name}»`, "ok"); } });
   return saved;
 }
 async function renderParties(box) {
@@ -2000,6 +2002,8 @@ async function renderParties(box) {
       h("button", { class: "btn", onclick: one((r) => { S.pendingStatement = r.id; go("acc:statement", true); }) }, icon("list", 18), "كشف الحساب"),
       h("button", { class: "btn", onclick: one((r) => { S.pendingVoucherParty = r.id; S.voucherEdit = null; go("vch:new", true); }) }, icon("cash", 18), "سند"),
       h("button", { class: "btn", onclick: one((r) => newInvoiceFor(r.id)) }, icon("sale", 18), "فاتورة مبيعات"),
+      !S.me.rep ? h("button", { class: "btn gold", title: "اسم العميل وأرقامه (عملاء بس من غير موردين) — حدد كذا عميل أو اكتب اسم المندوب في البحث علشان تطبع عملاؤه بس",
+        onclick: async () => { const sel = T.selected(); try { await api("print_phones", sel.length > 1 ? sel.map((x) => x.id) : null, sel.length > 1 ? "" : q.value.trim()); toast("🖨 شاشة الطباعة هتفتح خلال ثواني ...", "ok"); } catch (e) { toast(e.message, "err"); } } }, icon("print", 18), "طباعة الأرقام") : null,
       S.me.owner ? h("button", { class: "btn", onclick: () => importExcel("parties") }, "استيراد من Excel") : null,
       h("button", { class: "btn danger", onclick: del }, icon("trash", 18), "حذف")), T.el)));
   await load(); q.focus();
