@@ -268,7 +268,7 @@ function combo({ items, placeholder = "", label, sub, onPick, id }) {
       if (nm.startsWith(q)) return 3;
       return i >= 0 ? 4 : 5;
     };
-    shown = items().filter((it) => { const n = norm(it.label); return words.every((w) => n.includes(w)); });
+    shown = items().filter((it) => { const n = norm(it.label + (it.find ? " " + it.find : "")); return words.every((w) => n.includes(w)); });
     if (q) shown = shown.map((it) => [score(it), it.label.length, it]).sort((a, b) => a[0] - b[0] || a[1] - b[1]).map((x) => x[2]);
     shown = shown.slice(0, 80);
     act = 0; close();
@@ -1103,7 +1103,7 @@ async function renderInvoice(box, kind) {
   let vehSel = null;                    // التوصيل: العربية اللي هتوصّل أو استلام مكتب
   if (setup.delivery) {
     vehSel = h("select", { class: "in", id: "f-veh", "aria-label": "التوصيل", onchange: () => { D.vehicle_id = vehSel.value ? +vehSel.value : null; } },
-      h("option", { value: "" }, "🏢 استلام مكتب"), (setup.vehicles || []).map((v) => h("option", { value: v.id }, "🚚 " + v.label)));
+      h("option", { value: "" }, "🏪 بوابة"), (setup.vehicles || []).map((v) => h("option", { value: v.id }, "🛵 " + v.label)));
     if (D.vehicle_id && !(setup.vehicles || []).some((v) => v.id === D.vehicle_id)) vehSel.appendChild(h("option", { value: D.vehicle_id }, "🚚 عربية (مش نشطة)"));
     vehSel.value = String(D.vehicle_id ?? "");
   }

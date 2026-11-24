@@ -1356,8 +1356,7 @@ def party_label(p):
     """اسم العميل/المورد في القوائم: يضم الفرع/العنوان والهاتف عشان نفرّق بين الأسماء المتشابهة."""
     s = f'{p["id"]} - {p["name"]}'
     if p["address"]: s += f' — {p["address"]}'
-    if p["phone"]: s += f' — {p["phone"]}'
-    return s
+    return s                                  # خير زمان (عمر 2026-11-24): رقم التليفون مايظهرش جنب الاسم — البحث بالرقم لسه شغال (خانة find)
 
 def item_label(it):
     s = f'{it["id"]} - {it["name"]}'
@@ -1924,6 +1923,9 @@ def init_production(c):
             if not c.execute("SELECT 1 FROM items WHERE name=?", (nm,)).fetchone():
                 c.execute("INSERT INTO items(name,unit,buy_price,sell_price,category) VALUES(?,?,?,?,?)", (nm, unit, 0, 0, CAT_SUPPLY))
         c.execute("UPDATE settings SET kz_setup_v=1 WHERE id=1")
+    # التوصيل في فاتورة المبيعات: «بوابة» (فاضي) أو «دليفري» (عربية باسم دليفري) — عمر 2026-11-24
+    if not c.execute("SELECT 1 FROM vehicles WHERE name=?", ("دليفري",)).fetchone():
+        c.execute("INSERT INTO vehicles(name,active,created_at) VALUES(?,1,?)", ("دليفري", now_ts()))
     # عملاء عمر (2026-11-24) — مرة واحدة: اللي موجود بنفس الاسم مش بيتكرر (لو مالوش رقم بنحطّله الرقم بس)، ومن غير أي رصيد
     if add_col(c, "settings", "kz_cust_v", "INTEGER DEFAULT 0") or not (c.execute("SELECT kz_cust_v FROM settings WHERE id=1").fetchone() or [0])[0]:
         have = {_norm(r[1]): r for r in c.execute("SELECT id, name, phone FROM parties").fetchall()}
@@ -5013,7 +5015,7 @@ class App(tk.Tk):
             rep_div = f"<div>المندوب: <b>{esc(rep_name_of(c, inv['rep_id']))}</b></div>" if inv["kind"] == "مبيعات" else ""
             if inv["kind"] == "مبيعات":
                 vn = c.execute("SELECT name FROM vehicles WHERE id=?", (inv["vehicle_id"],)).fetchone() if ("vehicle_id" in inv.keys() and inv["vehicle_id"]) else None
-                rep_div += f"<div>التوصيل: <b>{esc(vn[0]) if vn else 'استلام مكتب'}</b></div>"
+                rep_div += f"<div>التوصيل: <b>{esc(vn[0]) if vn else 'بوابة'}</b></div>"
         pay_div = f"<div>طريقة الدفع: <b>{esc(inv['pay_type'])}</b></div>" if inv["kind"] in PAYTYPE_KINDS and inv["pay_type"] else ""
         total = sum(x["qty"] * x["price"] for x in lines)
         discount = float(inv["discount"] or 0); mashal = float(inv["mashal"] or 0) if "mashal" in inv.keys() else 0.0

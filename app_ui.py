@@ -359,7 +359,7 @@ class Api:
             vehicles = [{"id": v[0], "label": v[1] + (f" — {v[2]}" if v[2] else "")} for v in c.execute("SELECT id,name,COALESCE(driver,'') FROM vehicles WHERE COALESCE(active,1)=1 ORDER BY name").fetchall()] if kind == "مبيعات" else []
         return {"vehicles": vehicles, "delivery": kind == "مبيعات",
             "kind": kind, "number": W.next_no(kind, day), "date": day, "paytypes": kind in W.PAYTYPE_KINDS, "paid_label": W.PAID_LABEL[kind],
-            "parties": [{"id": p["id"], "label": W.party_label(p), "rep_id": p["rep_id"], "kind": p["kind"] or ""} for p in parties],
+            "parties": [{"id": p["id"], "label": W.party_label(p), "find": p["phone"] or "", "rep_id": p["rep_id"], "kind": p["kind"] or ""} for p in parties],
             "items": [{"id": it["id"], "label": W.item_label(it), "name": it["name"], "unit": it["unit"] or "", "code": it["code"] or "",
                        "price": _r2(it["sell_price"] if sale_side else it["buy_price"]), "stock": _r2(stock.get(it["id"], 0))} for it in items],
             "reps": [{"id": v, "label": k} for k, v in reps.items()],
@@ -490,7 +490,7 @@ class Api:
             if qn and qn not in W._norm(f"{r['party'] or ''} {r['number']} {r['rep'] or ''}"): continue
             out.append({"id": r["id"], "number": r["number"], "kind": r["kind"], "date": r["inv_date"], "due": r["due_date"] or "", "time": W.fmt_time(r["created_at"]), "created_at": r["created_at"] or "",
                         "pay": r["pay_type"] or "", "party": r["party"] or "", "rep": r["rep"] or "", "net": _r2(r["net"]), "paid": _r2(r["paid"]), "printed": bool(r["printed_at"]),
-                        "delivery": (r["vname"] or "استلام مكتب") if r["kind"] == "مبيعات" else ""})
+                        "delivery": (r["vname"] or "بوابة") if r["kind"] == "مبيعات" else ""})
         return out
 
     def invoice(self, inv_id):
@@ -504,7 +504,7 @@ class Api:
             costs = W.fifo_engine(c)["line"] if (i["kind"] == "مبيعات" and W.is_owner()) else None
         total = sum(float(l["qty"]) * float(l["price"]) for l in lines)
         out = {"id": i["id"], "number": i["number"], "kind": i["kind"], "date": i["inv_date"], "due": i["due_date"] or "", "time": W.fmt_time(i["created_at"]),
-               "party": i["party"] or "", "party_id": i["party_id"], "phone": i["phone"] or "", "delivery": (i["vname"] or "استلام مكتب") if i["kind"] == "مبيعات" else "", "rep": i["rep"] or "", "pay": i["pay_type"] or "", "notes": i["notes"] or "",
+               "party": i["party"] or "", "party_id": i["party_id"], "phone": i["phone"] or "", "delivery": (i["vname"] or "بوابة") if i["kind"] == "مبيعات" else "", "rep": i["rep"] or "", "pay": i["pay_type"] or "", "notes": i["notes"] or "",
                "total": _r2(total), "discount": _r2(i["discount"]), "mashal": _r2(i["mashal"] or 0), "net": _r2(total - float(i["discount"] or 0) + W.MASHAL_SIGN * float(i["mashal"] or 0)), "paid": _r2(paid),
                "printed": i["printed_at"] or "", "print_count": i["print_count"] or 0,
                "lines": [{"name": l["item_name"], "unit": l["unit"] or "", "qty": _r2(l["qty"]), "price": _r2(l["price"]), "total": _r2(float(l["qty"]) * float(l["price"])),
@@ -589,7 +589,7 @@ class Api:
             reps = W.rep_lookup(c)
         with W.db() as c: hs = holders_setup(c)
         return {"today": _today(), "cats": cats, "methods": PAY_METHODS, "holders": hs, "reps": [{"id": v, "label": k} for k, v in reps.items()],
-                "parties": [{"id": p["id"], "label": W.party_label(p), "rep_id": p["rep_id"], "kind": p["kind"] or ""} for p in parties]}
+                "parties": [{"id": p["id"], "label": W.party_label(p), "find": p["phone"] or "", "rep_id": p["rep_id"], "kind": p["kind"] or ""} for p in parties]}
 
     def add_expense_cat(self, name):
         self._need_login()
@@ -783,7 +783,7 @@ class Api:
     def parties_list(self):
         self._need_login()
         with W.db() as c: parties = c.execute("SELECT id,name,address,phone,rep_id,kind FROM parties ORDER BY name").fetchall()
-        return [{"id": p["id"], "label": W.party_label(p), "kind": p["kind"] or ""} for p in parties]
+        return [{"id": p["id"], "label": W.party_label(p), "find": p["phone"] or "", "kind": p["kind"] or ""} for p in parties]
 
     def statement(self, pid, d_from, d_to):
         self._need_login()
