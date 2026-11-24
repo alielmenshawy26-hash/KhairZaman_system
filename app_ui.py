@@ -1834,6 +1834,10 @@ class Api:
             with W.db() as c:
                 fl = c.execute("SELECT id,name FROM items WHERE id=?", (fid,)).fetchone()
                 if not fl: raise UIError("صنف الدقيق مش موجود")
+                o = c.execute("SELECT p_date, sack_no FROM production WHERE id=?", (pid,)).fetchone() if pid else None
+                same = o and o["p_date"] == d and int(o["sack_no"] or 0) == no          # تعديل شيكارة من غير ما رقمها يتغير: مفيش منع (حتى لو فيه تكرار قديم)
+                dup = None if same else c.execute("SELECT 1 FROM production WHERE p_date=? AND sack_no=? AND id<>?", (d, no, int(pid or 0))).fetchone()
+                if dup: raise UIError(f"الشيكارة رقم {no} متسجلة بالفعل يوم {d} — غيّر الرقم أو عدّل الشيكارة القديمة من سجل البلاغ")
                 sizes = {z["id"]: z for z in W.bread_sizes(c, active_only=False)}
                 touched = {fl["id"]}
                 if pid:
@@ -1977,6 +1981,7 @@ class Api:
         with W.db() as c:
             st = c.execute("SELECT * FROM settings WHERE id=1").fetchone()
             a = W.check_date(d_from); b = W.check_date(d_to or d_from)
+            if b < a: a, b = b, a
             sh = self._prod_sheet(c, a, b)
         rp = self.production_report(a, b)
         sizes = sh["sizes"]

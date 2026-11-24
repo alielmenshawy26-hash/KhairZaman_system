@@ -829,7 +829,7 @@ function cloudBox(owner) {
         owner ? h("button", { class: "btn", onclick: async () => { try { const d = await api("pick_file", "folder"); if (d) set([d, false]); } catch (e) { alertBox(e.message); } } }, "اختار فولدر الدرايف بإيدك") : null,
         owner && c.custom ? h("button", { class: "btn ghost", onclick: () => set(["", null]) }, "رجّعه أوتوماتيك") : null,
         owner ? h("button", { class: c.off ? "btn gold" : "btn ghost", onclick: () => set([null, !c.off]) }, c.off ? "▶ شغّلها" : "⏸ اقفلها") : null),
-      h("div", { class: "hint" }, c.dir || c.off ? "النسخة بتتحفظ باسم khairzaman_latest.db (آخر نسخة) + نسخة لكل يوم (آخر 30 يوم). لو الكمبيوتر باظ: سطّب البرنامج على الجهاز الجديد، اعمل يوزر مالك مؤقت، ونزّل zalat_latest.db من الدرايف واعمل منها «استرجاع نسخة احتياطية»."
+      h("div", { class: "hint" }, c.dir || c.off ? "النسخة بتتحفظ باسم khairzaman_latest.db (آخر نسخة) + نسخة لكل يوم (آخر 30 يوم). لو الكمبيوتر باظ: سطّب البرنامج على الجهاز الجديد، اعمل يوزر مالك مؤقت، ونزّل khairzaman_latest.db من الدرايف واعمل منها «استرجاع نسخة احتياطية»."
         : "علشان تشتغل: نزّل برنامج «Google Drive للكمبيوتر» (Google Drive for desktop) وسجّل دخول بإيميل الشركة — البرنامج هيلاقيه لوحده ويبدأ يرفع."));
   }
   draw();
