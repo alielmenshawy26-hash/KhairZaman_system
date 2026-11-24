@@ -2821,7 +2821,7 @@ async function renderEmployees(box) {
   const T = selTable({
     cols: [{ h: "ID", key: "id", cls: "hint" }, { h: "الاسم", fn: (r) => h("b", null, r.name) }, { h: "الوظيفة", fn: (r) => r.role + (r.left ? ` — ساب ${r.left_date}` : "") },
       { h: "الهاتف", key: "phone" }, { h: "الحساب", num: true, sort: (r) => (r.per_sack ? r.sack_rate : r.salary), fn: (r) => (r.per_sack ? [fmt(r.sack_rate), h("span", { class: "hint", style: { marginInlineStart: "6px" } }, "على الشيكارة")] : [fmt(r.salary), h("span", { class: "hint", style: { marginInlineStart: "6px" } }, "يومية")]) },
-      { h: "رصيد السلف", num: true, fn: (r) => (r.adv ? h("b", { style: { color: "var(--orange)" } }, fmt(r.adv)) : fmt(0)) }, { h: "ميعاد الحضور", fn: (r) => (r.att_start ? `${r.att_start} – ${r.att_grace}` : ""), cls: "hint" }],
+      { h: "رصيد السلف", num: true, fn: (r) => (r.adv ? h("b", { style: { color: "var(--orange)" } }, fmt(r.adv)) : fmt(0)) }],
     onOpen: (r) => statement(r), onKey: (e) => { if (e.key === "Delete") del(); },
     menu: (r) => [{ label: "👁 عرض (كشف الموظف)", fn: () => statement(r) }, { label: "🗑 حذف", danger: true, fn: () => del() }, { label: "✏️ تعديل", fn: () => form(r) }],
     totals: (rs) => { acts(); return [totItem("العدد", rs.length), totItem("اليوميات", fmt(rs.filter((r) => !r.per_sack).reduce((a, r) => a + r.salary, 0))),
@@ -2837,9 +2837,8 @@ async function renderEmployees(box) {
     await formModal(r.id ? `تعديل «${r.name}»` : "عامل جديد", [{ key: "name", label: "الاسم", value: r.name, wide: true },
       { key: "kind", label: "الوظيفة", value: meta.kinds.includes(r.role) ? r.role : meta.kinds[0], options: meta.kinds }, { key: "phone", label: "الهاتف", value: r.phone },
       { key: "salary", label: "اليومية (للتستنجي والسحلجي والمبيع والديليفري)", value: r.salary, num: true },
-      { key: "sack_rate", label: "سعر الشيكارة (للفران والخراط)", value: r.sack_rate, num: true, hint: "الفران والخراط بياخدوا حساب شكاير اليوم + شيكارة زيادة إكرامية" },
-      { key: "t_start", label: "ميعاد الحضور", value: r.t_start, type: "time" }, { key: "t_grace", label: "آخر ميعاد من غير تأخير", value: r.t_grace, type: "time" }],
-      { onSave: async (v) => { await api("save_employee", { ...v, id: r.id }); ok = true; toast(`✔ اتحفظ «${v.name}»`, "ok"); } });
+      { key: "sack_rate", label: "سعر الشيكارة (للفران والخراط)", value: r.sack_rate, num: true, hint: "الفران والخراط بياخدوا حساب شكاير اليوم + شيكارة زيادة إكرامية" }],     // مفيش حضور في المخبز (عمر 2026-11-24): ميعاد الحضور اتشال من الشاشة
+      { onSave: async (v) => { await api("save_employee", { ...v, t_start: r.t_start, t_grace: r.t_grace, id: r.id }); ok = true; toast(`✔ اتحفظ «${v.name}»`, "ok"); } });
     if (ok) load();
   }
   async function money(title, msg, fields, call) {
