@@ -4971,9 +4971,9 @@ class App(tk.Tk):
         company = esc(settings["company"]) or "اسم الشركة"
         paid_div = f"<div>{esc(PAID_LABEL[inv['kind']])}: {fmt(paid)} ج.م</div>" if paid > 0 else ""
         copy = f"""<section class="copy"><div class="content">
-          <div class="head">{logo_img_tag("height:20mm;float:left;margin:0 2mm")}<div class="brand"><h1>{company}</h1><div>{esc(settings['english'])}</div><div>{esc(settings['address'])}　 {esc(settings['phone'])}</div></div>
+          <div class="head">{logo_img_tag("height:20mm;float:left;margin:0 2mm")}<div class="brand"><h1>{company}</h1><div>{esc(settings['english'])}</div></div>
           <h2>فاتورة {esc(inv['kind'])}　{esc(inv['number'])}</h2></div>
-          <div class="meta"><div>التاريخ: <b>{esc(inv['inv_date'])}</b>　{esc(fmt_time(inv['created_at']))}{f"</div><div>تاريخ الاستحقاق: <b>{esc(inv['due_date'])}</b>" if inv['due_date'] else ""}</div><div>اسم الحساب: <b>{esc(inv['party_name'])}</b></div><div>الهاتف: {esc(inv['party_phone'])}</div>{pay_div}{rep_div}</div>
+          <div class="meta"><div>التاريخ: <b>{esc(inv['inv_date'])}</b>　{esc(fmt_time(inv['created_at']))}{f"</div><div>تاريخ الاستحقاق: <b>{esc(inv['due_date'])}</b>" if inv['due_date'] else ""}</div><div>اسم الحساب: <b>{esc(inv['party_name'])}</b></div>{pay_div}{rep_div}</div>
           <table><thead><tr><th>م</th><th>اسم الصنف</th><th>الكمية</th><th>الوحدة</th><th>السعر</th><th>الإجمالي</th></tr></thead><tbody>{rows}</tbody></table>
           <div class="sum"><div>الإجمالي: {fmt(total)} ج.م</div><div>الخصم: {fmt(discount)} ج.م</div>{f"<div>المشال: {fmt(mashal)} ج.م</div>" if mashal else ""}{f"<div>الصافي: {fmt(net)} ج.م</div>" if discount or mashal else ""}<div>آخر دفع: {f"{fmt(last_pay[1])} ج.م <small>({esc(last_pay[0])})</small>" if last_pay else "—"}</div>{paid_div}</div>
           <div class="balance"><div>الرصيد السابق: {fmt(prior)} ج.م</div><div>الرصيد الحالي: {fmt(current)} ج.م</div></div>
@@ -5454,7 +5454,7 @@ class App(tk.Tk):
         company = esc(st["company"]) or DEFAULT_COMPANY
         extra = (f"<div>المندوب: <b>{esc(rep)}</b></div>" if col else "") + (f"<div>مرتبط بفاتورة رقم: <b>{esc(inv_no['number'])}</b></div>" if inv_no else "")
         copy = f"""<section class="copy">
-          <div class="head">{logo_img_tag("height:20mm;float:left;margin:0 2mm")}<h1>{company}</h1><div>{esc(st['tagline'] or '')}</div><div>{esc(st['address'])}　 {esc(st['phone'])}</div>
+          <div class="head">{logo_img_tag("height:20mm;float:left;margin:0 2mm")}<h1>{company}</h1><div>{esc(st['tagline'] or '')}</div>
           <h2>{title}</h2></div>
           <div class="meta"><div>رقم السند: <b>{pay_id}</b></div><div>التاريخ: <b>{esc(p['pay_date'])}</b>　{esc(fmt_time(p['created_at']))}</div>{extra}</div>
           <div class="line">{verb}: <b>{esc(p['pname'])}</b></div>
