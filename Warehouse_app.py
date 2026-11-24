@@ -1982,6 +1982,45 @@ td {{ padding: 1.2mm 0; text-align: center; border-bottom: 1px dashed #999; font
 <div class="c ft">شكرًا لزيارتكم 🌾</div>
 </body></html>"""
 
+def invoice_bon_html(inv, lines, total, discount, mashal, net, paid, prior, current):
+    """فواتير خير زمان (مبيعات المطاعم/العملاء والمشتريات والمرتجعات) بتتطبع بون حراري 80 مم بدل الفاتورة الكبيرة."""
+    q = lambda v: (f"{float(v):g}")
+    rows = "".join(f"<tr><td class='n'>{esc(l['item_name'])}</td><td>{q(l['qty'])}</td><td>{fmt(l['price'])}</td><td><b>{fmt(float(l['qty']) * float(l['price']))}</b></td></tr>" for l in lines)
+    extra = [("الخصم", discount)] if discount else []
+    if mashal: extra.append(("المشال", mashal))
+    sums = "".join(f'<div class="meta"><span>{k}</span><b>{fmt(v)}</b></div>' for k, v in extra)
+    paid_row = f'<div class="meta"><span>{esc(PAID_LABEL[inv["kind"]])}</span><b>{fmt(paid)}</b></div>' if paid > 0 else ""
+    notes = f'<div class="ft">ملاحظات: {esc(inv["notes"])}</div>' if (inv["notes"] or "").strip() else ""
+    h_mm = 100 + 7 * len(lines) + 6 * (len(extra) + (1 if paid > 0 else 0) + (2 if notes else 0))
+    return f"""<!doctype html><html lang="ar" dir="rtl"><head><meta charset="utf-8"><title>بون {esc(inv['number'])}</title><style>
+@page {{ size: 80mm {h_mm}mm; margin: 0; }}
+* {{ box-sizing: border-box; }}
+html, body {{ margin: 0; padding: 0; background: #fff; color: #000; }}
+body {{ width: 80mm; padding: 4mm 4mm 3mm; font-family: Tahoma, Arial, sans-serif; font-size: 12px; }}
+.c {{ text-align: center; }} .co {{ font-size: 20px; font-weight: 800; margin: 1mm 0; }}
+.meta {{ display: flex; justify-content: space-between; font-size: 12px; margin: 1mm 0; }}
+.no {{ font-size: 15px; font-weight: 800; border: 1.5px solid #000; border-radius: 3px; padding: 1mm 0; margin: 2mm 0; }}
+.pt {{ font-size: 14px; font-weight: 800; margin: 1.5mm 0; }}
+table {{ width: 100%; border-collapse: collapse; margin-top: 2mm; }}
+th {{ font-size: 11px; border-bottom: 1.5px solid #000; padding: 1mm 0; text-align: center; }}
+td {{ padding: 1.2mm 0; text-align: center; border-bottom: 1px dashed #999; font-size: 12px; }} td.n, th.n {{ text-align: right; }}
+.tot {{ display: flex; justify-content: space-between; font-size: 18px; font-weight: 800; border-top: 2px solid #000; margin-top: 2mm; padding-top: 2mm; }}
+.bal {{ border: 1px solid #000; border-radius: 3px; padding: 1mm 2mm; margin-top: 2mm; }}
+.ft {{ font-size: 11px; margin-top: 2mm; }}
+</style></head><body>
+<div class="c co">{esc(LICENSED_COMPANY)}</div>
+<div class="c no">بون {esc(inv['kind'])} رقم {esc(inv['number'])}</div>
+<div class="meta"><span>{esc(inv['inv_date'])}</span><span>{esc(fmt_time(inv['created_at']))}</span></div>
+<div class="pt">{"المورد" if inv["kind"] in ("مشتريات", "مرتجع مشتريات") else "العميل"}: {esc(inv['party_name'])}</div>
+<table><thead><tr><th class="n">الصنف</th><th>العدد</th><th>السعر</th><th>الإجمالي</th></tr></thead><tbody>{rows}</tbody></table>
+{sums}
+<div class="tot"><span>{"الصافي" if extra else "الإجمالي"}</span><span>{fmt(net)} ج</span></div>
+{paid_row}
+<div class="bal"><div class="meta"><span>الرصيد السابق</span><b>{fmt(prior)}</b></div><div class="meta"><span>الرصيد الحالي</span><b>{fmt(current)}</b></div></div>
+{notes}
+<div class="c ft">شكرًا لتعاملكم 🌾</div>
+</body></html>"""
+
 def sack_wage_rate(c):
     """مجموع سعر الشيكارة للفرانين والخراطين الشغالين."""
     return float(c.execute("SELECT COALESCE(SUM(sack_rate),0) FROM employees WHERE COALESCE(active,1)=1 AND job IN (%s)" % ",".join("?" * len(PER_SACK_ROLES)), PER_SACK_ROLES).fetchone()[0] or 0)
@@ -4954,7 +4993,7 @@ class App(tk.Tk):
             if who: return who
             messagebox.showerror("خطأ", "كلمة السر غير صحيحة", parent=self)
 
-    def invoice_html(self, inv_id):
+    def invoice_html(self, inv_id, bon=False):
         with db() as c:
             inv = c.execute("SELECT i.*,p.name party_name,p.phone party_phone,p.address party_address,p.opening party_opening FROM invoices i LEFT JOIN parties p ON p.id=i.party_id WHERE i.id=?", (inv_id,)).fetchone()
             lines = c.execute("SELECT * FROM invoice_lines WHERE invoice_id=?", (inv_id,)).fetchall()
@@ -4984,6 +5023,7 @@ class App(tk.Tk):
         rows = "".join(f"<tr><td>{n}</td><td>{esc(l['item_name'])}</td><td>{fmt(l['qty'])}</td><td>{esc(l['unit'])}</td><td>{fmt(l['price'])}</td><td>{fmt(l['qty']*l['price'])}</td></tr>" for n, l in enumerate(lines, 1))
         company = esc(settings["company"]) or "اسم الشركة"
         paid_div = f"<div>{esc(PAID_LABEL[inv['kind']])}: {fmt(paid)} ج.م</div>" if paid > 0 else ""
+        if bon: return invoice_bon_html(inv, lines, total, discount, mashal, net, paid, prior, current)
         copy = f"""<section class="copy"><div class="content">
           <div class="head">{logo_img_tag("height:20mm;float:left;margin:0 2mm")}<div class="brand"><h1>{company}</h1><div>{esc(settings['english'])}</div></div>
           <h2>فاتورة {esc(inv['kind'])}　{esc(inv['number'])}</h2></div>

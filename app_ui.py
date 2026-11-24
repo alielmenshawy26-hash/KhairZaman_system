@@ -521,7 +521,7 @@ class Api:
             if i and i["kind"] == "مبيعات" and i["party_id"] == W.gate_party_id(c): raise UIError("بون البوابة مابيتطبعش تاني — بيتطبع مرة واحدة بس من الكاشير")
         os.makedirs(W.PRINT_DIR, exist_ok=True)
         path = os.path.join(W.PRINT_DIR, f"invoice_{inv_id}.html")
-        with open(path, "w", encoding="utf-8") as f: f.write(W.App.invoice_html(None, inv_id))
+        with open(path, "w", encoding="utf-8") as f: f.write(W.App.invoice_html(None, inv_id, bon=True))   # خير زمان: كل الفواتير بون 80 مم
         W.print_page(path)
         try:
             with W.db() as c: c.execute("UPDATE invoices SET printed_at=?, print_count=COALESCE(print_count,0)+1 WHERE id=?", (W.now_ts(), inv_id))
