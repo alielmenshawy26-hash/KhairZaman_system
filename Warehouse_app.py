@@ -1032,10 +1032,23 @@ def _clean_print_dir(max_age=86400):
                 except OSError: pass
     except Exception: pass
 
+_EN2AR = str.maketrans("0123456789", "٠١٢٣٤٥٦٧٨٩")
+_HTML_SPLIT = re.compile(r"(<style\b.*?</style>|<script\b.*?</script>|<[^>]*>)", re.S | re.I)
+
+def ar_digits_html(html):
+    """خير زمان (عمر 2026-11-24): الأرقام في أي طباعة بالعربي ٠١٢٣ — الكلام بس (مش الـ CSS ولا الوسوم)."""
+    return "".join(part if i % 2 else part.translate(_EN2AR) for i, part in enumerate(_HTML_SPLIT.split(html)))
+
 def print_page(html_path, on_done=None):
     """الطباعة: بيعمل PDF على قد الورقة، وبيفتح شاشة الطباعة بتاعة ويندوز على طول (من غير المتصفح).
     لو مفيش SumatraPDF: بيفتح الـ PDF، ولو مفيش Edge/Chrome: بيفتح الصفحة في المتصفح. بيشتغل في الخلفية علشان البرنامج ميهنّجش."""
     import subprocess
+    try:
+        with open(html_path, encoding="utf-8") as f: _h = f.read()
+        _a = ar_digits_html(_h)
+        if _a != _h:
+            with open(html_path, "w", encoding="utf-8") as f: f.write(_a)
+    except Exception: write_error_log("ar digits print: " + str(html_path))
     pdf_cap = getattr(_TLS, "pdf_out", None)
     if pdf_cap is not None:                   # زرار «PDF»: مش بنطبع، بنرجّع الصفحة علشان تتحول PDF على سطح المكتب
         pdf_cap.append(html_path)

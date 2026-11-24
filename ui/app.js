@@ -128,17 +128,22 @@ const NF = new Intl.NumberFormat("en-US", { minimumFractionDigits: 2, maximumFra
 const fmt = (n) => NF.format(Number(n) || 0);
 const fq = (n) => { const x = Number(n) || 0; return Number.isInteger(x) ? String(x) : NF.format(x); };
 const AR_D = "٠١٢٣٤٥٦٧٨٩", arD = (s) => String(s ?? "").replace(/[0-9]/g, (d) => AR_D[d]);   // خير زمان: أرقام عربي في الكاشير
-function arDigitsLive(root) {          // أي رقم بيظهر جوه root (نص، أو خانة عدد) بيتكتب بالعربي ٠١٢٣ … حتى لو اتغيّر بعدين
+// خانات الأرقام (الكميات والمبالغ) بس — الأسماء والتليفونات والتاريخ وكلمة السر بتفضل زي ما هي
+const isNumIn = (el) => el.tagName === "INPUT" && !/^(date|time|password|email|url|file|checkbox|radio)$/.test(el.type) && (el.classList.contains("num") || /^(decimal|numeric)$/.test(el.inputMode || ""));
+function arDigitsLive(root, allInputs) {          // أي رقم بيظهر جوه root (نص، أو خانة عدد) بيتكتب بالعربي ٠١٢٣ … حتى لو اتغيّر بعدين
+  const okIn = (el) => (allInputs ? el.tagName === "INPUT" && !/^(date|time|password|checkbox|radio)$/.test(el.type) : isNumIn(el));
   const fix = (n) => {
-    if (n.nodeType === 3) { if (/[0-9]/.test(n.data)) n.data = arD(n.data); return; }
+    if (n.nodeType === 3) { if (/[0-9]/.test(n.data) && !(n.parentNode && /^(STYLE|SCRIPT)$/.test(n.parentNode.nodeName))) n.data = arD(n.data); return; }
     if (n.nodeType !== 1) return;
-    if (n.tagName === "INPUT") { if (/[0-9]/.test(n.value)) n.value = arD(n.value); if (/[0-9]/.test(n.placeholder)) n.placeholder = arD(n.placeholder); return; }
-    const w = document.createTreeWalker(n, NodeFilter.SHOW_TEXT); let t; while ((t = w.nextNode())) if (/[0-9]/.test(t.data)) t.data = arD(t.data);
+    if (n.tagName === "INPUT") { if (okIn(n) && /[0-9]/.test(n.value)) n.value = arD(n.value); if (/[0-9]/.test(n.placeholder || "")) n.placeholder = arD(n.placeholder); return; }
+    if (/^(STYLE|SCRIPT|TEXTAREA)$/.test(n.tagName)) return;
+    const w = document.createTreeWalker(n, NodeFilter.SHOW_TEXT, { acceptNode: (t) => (/^(STYLE|SCRIPT|TEXTAREA)$/.test(t.parentNode.nodeName) ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT) });
+    let t; while ((t = w.nextNode())) if (/[0-9]/.test(t.data)) t.data = arD(t.data);
     n.querySelectorAll("input").forEach(fix);
   };
   fix(root);
   new MutationObserver((ms) => ms.forEach((m) => (m.type === "characterData" ? fix(m.target) : m.addedNodes.forEach(fix)))).observe(root, { childList: true, subtree: true, characterData: true });
-  root.addEventListener("input", (e) => { const el = e.target; if (el.tagName === "INPUT" && /[0-9]/.test(el.value)) el.value = arD(el.value); }, true);
+  root.addEventListener("input", (e) => { const el = e.target; if (okIn(el) && /[0-9]/.test(el.value)) el.value = arD(el.value); }, true);
 }
 const num = (s) => { const t = String(s ?? "").replace(/[٠-٩]/g, (d) => "٠١٢٣٤٥٦٧٨٩".indexOf(d)).replace(/[٫]/g, ".").replace(/,/g, "").trim(); return t === "" ? 0 : Number(t); };
 function norm(s) {
@@ -792,7 +797,7 @@ async function renderCashier(box) {
           modeSeg, h("div", { class: "qs-total" }, h("span", null, "الإجمالي"), totalEl),
           h("div", { class: "qs-foot" }, clearBtn, saveBtn, printBtn))))),
     mBar));
-  arDigitsLive(box.firstChild);
+  arDigitsLive(box.firstChild, true);
   calc();
   { const tb0 = $("#todaybar"); if (tb0) tb0.hidden = true; }      // عمر: شيل الإجمالي من تحت في الكاشير
   { const tb = $("#todaybar");                       // على الموبايل: شريط «طباعة وحفظ» فوق شريط النهارده الثابت
@@ -3440,3 +3445,7 @@ document.addEventListener("keydown", (e) => {
 window.addEventListener("beforeunload", (e) => { if (S.dirty) { e.preventDefault(); e.returnValue = ""; } });
 
 start();
+
+/* خير زمان (عمر 2026-11-24): كل الأرقام في البرنامج بالعربي ٠١٢٣ — الكلام اللي بيظهر بس، الداتا والحسابات زي ما هي */
+arDigitsLive(document.body);
+setInterval(() => document.querySelectorAll("input").forEach((el) => { if (isNumIn(el) && /[0-9]/.test(el.value) && document.activeElement !== el) el.value = arD(el.value); }), 400);
