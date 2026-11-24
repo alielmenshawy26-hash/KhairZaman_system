@@ -444,7 +444,7 @@ function renderLogin() {
 /* ===================== الهيكل: القايمة الجانبية + الشريط اللي فوق ===================== */
 // الصلاحيات: المالك كله، وغيره الشاشات المسموحله بيها بس
 /* مخفية مؤقتاً في خير زمان (لحد ما نظام المناديب يتحدد) — الكود موجود بس مش ظاهر */
-const HIDDEN_SCREENS = new Set(["req", "rep:reps", "rep:targets", "emp:veh", "smp:items", "smp:out", "smp:in", "emp:att", "emp:attlog", "acc:subcash", "acc:assets"]);
+const HIDDEN_SCREENS = new Set(["req", "rep:reps", "rep:targets", "emp:veh", "smp:items", "smp:out", "smp:in", "emp:att", "emp:attlog", "acc:subcash", "acc:assets", "emp:bread"]);   // emp:bread: صرف العيش للعمال اتشال (عمر 2026-11-24) — الصرفيات القديمة زي ما هي
 const can = (k) => !!S.me && !HIDDEN_SCREENS.has(k) && (S.me.owner || (S.me.screens || []).includes(k) || (k === "gate:log" && !S.me.rep && (S.me.screens || []).includes("log")));
 const firstScreen = () => (can("home") ? "home" : (S.me.screens || [])[0] || "home");
 function navBtn(key) {
