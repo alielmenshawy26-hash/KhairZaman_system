@@ -1991,12 +1991,13 @@ def invoice_bon_html(inv, lines, total, discount, mashal, net, paid, prior, curr
     sums = "".join(f'<div class="meta"><span>{k}</span><b>{fmt(v)}</b></div>' for k, v in extra)
     paid_row = f'<div class="meta"><span>{esc(PAID_LABEL[inv["kind"]])}</span><b>{fmt(paid)}</b></div>' if paid > 0 else ""
     notes = f'<div class="ft">ملاحظات: {esc(inv["notes"])}</div>' if (inv["notes"] or "").strip() else ""
-    h_mm = 100 + 7 * len(lines) + 6 * (len(extra) + (1 if paid > 0 else 0) + (2 if notes else 0))
+    h_mm = 110 + 7 * len(lines) + 6 * (len(extra) + (1 if paid > 0 else 0) + (2 if notes else 0))
+    copies = ["نسخة العميل", "نسخة الفرن"] if inv["kind"] == "مبيعات" else [""]   # فاتورة المبيعات: نسختين (كل نسخة صفحة لوحدها علشان الطابعة تقصّ بينهم)
     return f"""<!doctype html><html lang="ar" dir="rtl"><head><meta charset="utf-8"><title>بون {esc(inv['number'])}</title><style>
 @page {{ size: 80mm {h_mm}mm; margin: 0; }}
 * {{ box-sizing: border-box; }}
 html, body {{ margin: 0; padding: 0; background: #fff; color: #000; }}
-body {{ width: 80mm; padding: 4mm 4mm 3mm; font-family: Tahoma, Arial, sans-serif; font-size: 12px; }}
+body {{ width: 80mm; padding: 0 4mm; font-family: Tahoma, Arial, sans-serif; font-size: 12px; }}
 .c {{ text-align: center; }} .co {{ font-size: 20px; font-weight: 800; margin: 1mm 0; }}
 .meta {{ display: flex; justify-content: space-between; font-size: 12px; margin: 1mm 0; }}
 .no {{ font-size: 15px; font-weight: 800; border: 1.5px solid #000; border-radius: 3px; padding: 1mm 0; margin: 2mm 0; }}
@@ -2007,7 +2008,9 @@ td {{ padding: 1.2mm 0; text-align: center; border-bottom: 1px dashed #999; font
 .tot {{ display: flex; justify-content: space-between; font-size: 18px; font-weight: 800; border-top: 2px solid #000; margin-top: 2mm; padding-top: 2mm; }}
 .bal {{ border: 1px solid #000; border-radius: 3px; padding: 1mm 2mm; margin-top: 2mm; }}
 .ft {{ font-size: 11px; margin-top: 2mm; }}
-</style></head><body>
+.cp {{ font-size: 13px; font-weight: 800; border: 1px dashed #000; padding: 1mm; margin-bottom: 1mm; }}
+.pg {{ height: {h_mm}mm; overflow: hidden; padding-top: 4mm; }} .pg + .pg {{ break-before: page; page-break-before: always; }}
+</style></head><body>{"".join(f'''<div class="pg">{f'<div class="c cp">{cp}</div>' if cp else ""}
 <div class="c co">{esc(LICENSED_COMPANY)}</div>
 <div class="c no">بون {esc(inv['kind'])} رقم {esc(inv['number'])}</div>
 <div class="meta"><span>{esc(inv['inv_date'])}</span><span>{esc(fmt_time(inv['created_at']))}</span></div>
@@ -2018,7 +2021,7 @@ td {{ padding: 1.2mm 0; text-align: center; border-bottom: 1px dashed #999; font
 {paid_row}
 <div class="bal"><div class="meta"><span>الرصيد السابق</span><b>{fmt(prior)}</b></div><div class="meta"><span>الرصيد الحالي</span><b>{fmt(current)}</b></div></div>
 {notes}
-<div class="c ft">شكرًا لتعاملكم 🌾</div>
+<div class="c ft">شكرًا لتعاملكم 🌾</div></div>''' for cp in copies)}
 </body></html>"""
 
 def sack_wage_rate(c):
